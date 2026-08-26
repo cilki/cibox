@@ -508,7 +508,7 @@ fn highlight_yaml_line_owned(line: String, bg_color: Option<Color>) -> Line<'sta
                 spans.push(Span::styled(value.to_string(), value_style));
             }
         }
-    } else if trimmed_start.starts_with("- ") {
+    } else if let Some(list_text) = trimmed_start.strip_prefix("- ") {
         // List item
         let mut bullet_style = Style::default().fg(Color::Yellow);
         if let Some(bg) = bg_color {
@@ -520,7 +520,7 @@ fn highlight_yaml_line_owned(line: String, bg_color: Option<Color>) -> Line<'sta
         if let Some(bg) = bg_color {
             text_style = text_style.bg(bg);
         }
-        spans.push(Span::styled(trimmed_start[2..].to_string(), text_style));
+        spans.push(Span::styled(list_text.to_string(), text_style));
     } else {
         // Other lines
         let mut style = Style::default();
@@ -607,13 +607,13 @@ fn highlight_yaml(yaml: &str) -> Vec<Line<'_>> {
                     spans.push(Span::raw(value.to_string()));
                 }
             }
-        } else if trimmed.starts_with("- ") {
+        } else if let Some(list_text) = trimmed.strip_prefix("- ") {
             // List item
             spans.push(Span::styled(
                 "- ".to_string(),
                 Style::default().fg(Color::Yellow),
             ));
-            spans.push(Span::raw(trimmed[2..].to_string()));
+            spans.push(Span::raw(list_text.to_string()));
         } else {
             // Other lines
             spans.push(Span::raw(trimmed.to_string()));

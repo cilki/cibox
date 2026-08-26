@@ -513,7 +513,7 @@ impl EditorState {
         let mut preset_configs = HashMap::new();
 
         for preset_choice in &ron_config.presets {
-            let (preset_id, config) = preset_choice_to_config(&preset_choice);
+            let (preset_id, config) = preset_choice_to_config(preset_choice);
             preset_configs.insert(preset_id, config);
         }
 
@@ -650,7 +650,7 @@ mod tests {
         assert!(rust_config.values.contains_key("enable_coverage"));
 
         let python_config = state.preset_configs.get("PythonApp").unwrap();
-        assert_eq!(python_config.get_bool("enable_type_check"), false);
+        assert!(!python_config.get_bool("enable_type_check"));
     }
 
     #[test]
@@ -669,7 +669,7 @@ mod tests {
         assert!(rust_config.values.contains_key("enable_linter"));
 
         let python_config = state.preset_configs.get("PythonApp").unwrap();
-        assert_eq!(python_config.get_bool("enable_type_check"), false);
+        assert!(!python_config.get_bool("enable_type_check"));
     }
 
     #[test]
@@ -685,7 +685,7 @@ mod tests {
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
         let rust_config = state.preset_configs.get("Rust").unwrap();
-        assert_eq!(rust_config.get_bool("enable_coverage"), false);
+        assert!(!rust_config.get_bool("enable_coverage"));
 
         // Python detected, so its bool defaults apply
         let python_config = state.preset_configs.get("PythonApp").unwrap();
@@ -705,8 +705,8 @@ mod tests {
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
         let go_config = state.preset_configs.get("GoApp").unwrap();
-        assert_eq!(go_config.get_bool("enable_linter"), true);
-        assert_eq!(go_config.get_bool("enable_security_scan"), true);
+        assert!(go_config.get_bool("enable_linter"));
+        assert!(go_config.get_bool("enable_security_scan"));
     }
 
     #[test]
@@ -753,7 +753,7 @@ mod tests {
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
         let docker_config = state.preset_configs.get("Docker").unwrap();
-        assert_eq!(docker_config.get_bool("enable_cache"), true);
+        assert!(docker_config.get_bool("enable_cache"));
     }
 
     #[test]
@@ -770,7 +770,7 @@ mod tests {
 
         let docker_config = state.preset_configs.get("Docker").unwrap();
         // Docker preset is available but not enabled by default for non-Docker projects
-        assert_eq!(docker_config.get_bool("enable_cache"), false);
+        assert!(!docker_config.get_bool("enable_cache"));
     }
 
     #[test]
@@ -790,7 +790,7 @@ mod tests {
         assert!(docker_config.is_some(), "Docker preset should be available");
 
         // But not enabled by default
-        assert_eq!(docker_config.unwrap().get_bool("enable_cache"), false);
+        assert!(!docker_config.unwrap().get_bool("enable_cache"));
     }
 
     #[test]
