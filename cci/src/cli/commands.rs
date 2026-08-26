@@ -28,10 +28,15 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
         bail!("No presets defined in configuration file");
     }
 
-    // 3. Detect project and determine platform
+    // 3. Detect project and determine platform.
+    //
+    // Detection only supplies a fallback language/toolchain version; the presets
+    // themselves come from the RON file. Failing to recognize the working
+    // directory (e.g. generating into an empty dir, or a project type the
+    // detector doesn't know) must not abort generation — fall back to "stable".
     let working_dir = std::path::PathBuf::from(".");
     let detector_registry = DetectorRegistry::new();
-    let detection = detector_registry.detect(&working_dir)?;
+    let detection = detector_registry.detect(&working_dir).ok();
 
     let platform = if let Some(p) = platform_arg {
         match p.to_lowercase().as_str() {
@@ -66,7 +71,7 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
     // 5. Generate outputs
     println!("\n{}", "Generating CI configurations...".cyan().bold());
     let language_version = detection
-        .language_version
+        .and_then(|d| d.language_version)
         .unwrap_or_else(|| "stable".to_string());
 
     let generator = MultiPresetGenerator::new(preset_configs, registry, platform, language_version);
