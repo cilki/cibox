@@ -73,7 +73,7 @@ impl ToCircleCI for PythonApp {
 
         let mut jobs = BTreeMap::new();
         jobs.insert(
-            "python/test".to_string(),
+            "python-test".to_string(),
             CircleCIJob {
                 docker: vec![CircleCIDocker {
                     image: format!("python:{}", self.python_version),
@@ -90,7 +90,7 @@ impl ToCircleCI for PythonApp {
             workflows: BTreeMap::from([(
                 "main".to_string(),
                 CircleCIWorkflow {
-                    jobs: vec![CircleCIWorkflowJob::Simple("python/test".to_string())],
+                    jobs: vec![CircleCIWorkflowJob::Simple("python-test".to_string())],
                 },
             )]),
         })

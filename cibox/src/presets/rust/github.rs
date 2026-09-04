@@ -81,7 +81,7 @@ impl ToGitHub for Rust {
         }
 
         jobs.insert(
-            "rust/test".to_string(),
+            "rust-test".to_string(),
             GitHubJob {
                 runs_on: "ubuntu-latest".to_string(),
                 steps: test_steps,
@@ -94,7 +94,7 @@ impl ToGitHub for Rust {
         // Lint job (optional)
         if self.enable_linter {
             jobs.insert(
-                "rust/lint".to_string(),
+                "rust-lint".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
                     steps: vec![
@@ -139,7 +139,7 @@ impl ToGitHub for Rust {
         // Format check job (optional)
         if self.enable_format_check {
             jobs.insert(
-                "rust/format".to_string(),
+                "rust-format".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
                     steps: vec![
@@ -184,7 +184,7 @@ impl ToGitHub for Rust {
         // Security scan job (optional)
         if self.enable_security_scan {
             jobs.insert(
-                "rust/security".to_string(),
+                "rust-security".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
                     steps: vec![

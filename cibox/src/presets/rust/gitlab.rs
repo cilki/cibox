@@ -31,7 +31,7 @@ impl ToGitLab for Rust {
         }
 
         jobs.insert(
-            "rust/test".to_string(),
+            "rust-test".to_string(),
             GitLabJob {
                 stage: "test".to_string(),
                 image: Some("rust:latest".to_string()),
@@ -65,7 +65,7 @@ impl ToGitLab for Rust {
         // Build job (optional)
         if self.build_release {
             jobs.insert(
-                "rust/build".to_string(),
+                "rust-build".to_string(),
                 GitLabJob {
                     stage: "build".to_string(),
                     image: Some(format!("rust:{}", self.rust_version)),
@@ -93,7 +93,7 @@ impl ToGitLab for Rust {
                 stages.push("lint".to_string());
             }
             jobs.insert(
-                "rust/lint".to_string(),
+                "rust-lint".to_string(),
                 GitLabJob {
                     stage: "lint".to_string(),
                     image: Some("rust:latest".to_string()),
@@ -124,7 +124,7 @@ impl ToGitLab for Rust {
                 stages.push("lint".to_string());
             }
             jobs.insert(
-                "rust/format".to_string(),
+                "rust-format".to_string(),
                 GitLabJob {
                     stage: "lint".to_string(),
                     image: Some("rust:latest".to_string()),
@@ -152,7 +152,7 @@ impl ToGitLab for Rust {
                 stages.push("security".to_string());
             }
             jobs.insert(
-                "rust/security".to_string(),
+                "rust-security".to_string(),
                 GitLabJob {
                     stage: "security".to_string(),
                     image: Some("rust:latest".to_string()),

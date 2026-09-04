@@ -47,7 +47,7 @@ impl ToGitHub for PythonApp {
         ];
 
         jobs.insert(
-            "python/test".to_string(),
+            "python-test".to_string(),
             GitHubJob {
                 runs_on: "ubuntu-latest".to_string(),
                 steps: test_steps,
@@ -63,7 +63,7 @@ impl ToGitHub for PythonApp {
             let linter_cmd = linter.check_command();
 
             jobs.insert(
-                "python/lint".to_string(),
+                "python-lint".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
                     steps: vec![
@@ -109,7 +109,7 @@ impl ToGitHub for PythonApp {
         // Type check job (optional)
         if self.enable_type_check {
             jobs.insert(
-                "python/type-check".to_string(),
+                "python-type-check".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
                     steps: vec![

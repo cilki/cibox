@@ -32,7 +32,7 @@ impl ToGitLab for PythonApp {
         }
 
         jobs.insert(
-            "python/test".to_string(),
+            "python-test".to_string(),
             GitLabJob {
                 stage: "test".to_string(),
                 image: Some(format!("python:{}", self.python_version)),

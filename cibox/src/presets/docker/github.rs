@@ -150,7 +150,7 @@ impl ToGitHub for Docker {
         });
 
         jobs.insert(
-            "docker/build".to_string(),
+            "docker-build".to_string(),
             GitHubJob {
                 runs_on: "ubuntu-latest".to_string(),
                 steps: build_steps,

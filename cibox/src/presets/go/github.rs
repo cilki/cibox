@@ -54,7 +54,7 @@ impl ToGitHub for GoApp {
         ];
 
         jobs.insert(
-            "go/test".to_string(),
+            "go-test".to_string(),
             GitHubJob {
                 runs_on: "ubuntu-latest".to_string(),
                 steps: test_steps,
@@ -67,7 +67,7 @@ impl ToGitHub for GoApp {
         // Lint job (optional)
         if self.enable_linter {
             jobs.insert(
-                "go/lint".to_string(),
+                "go-lint".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
                     steps: vec![
@@ -109,7 +109,7 @@ impl ToGitHub for GoApp {
         // Security scan job (optional)
         if self.enable_security_scan {
             jobs.insert(
-                "go/security".to_string(),
+                "go-security".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
                     steps: vec![

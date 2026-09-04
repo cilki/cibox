@@ -38,7 +38,7 @@ impl ToCircleCI for GoApp {
 
         let mut jobs = BTreeMap::new();
         jobs.insert(
-            "go/test".to_string(),
+            "go-test".to_string(),
             CircleCIJob {
                 docker: vec![CircleCIDocker {
                     image: format!("golang:{}", self.go_version),
@@ -55,7 +55,7 @@ impl ToCircleCI for GoApp {
             workflows: BTreeMap::from([(
                 "main".to_string(),
                 CircleCIWorkflow {
-                    jobs: vec![CircleCIWorkflowJob::Simple("go/test".to_string())],
+                    jobs: vec![CircleCIWorkflowJob::Simple("go-test".to_string())],
                 },
             )]),
         })

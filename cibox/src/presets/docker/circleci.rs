@@ -64,7 +64,7 @@ impl ToCircleCI for Docker {
 
         let mut jobs = BTreeMap::new();
         jobs.insert(
-            "docker/build".to_string(),
+            "docker-build".to_string(),
             CircleCIJob {
                 docker: vec![CircleCIDocker {
                     image: "cimg/base:stable".to_string(),
@@ -81,7 +81,7 @@ impl ToCircleCI for Docker {
             workflows: BTreeMap::from([(
                 "main".to_string(),
                 CircleCIWorkflow {
-                    jobs: vec![CircleCIWorkflowJob::Simple("docker/build".to_string())],
+                    jobs: vec![CircleCIWorkflowJob::Simple("docker-build".to_string())],
                 },
             )]),
         })

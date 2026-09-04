@@ -22,7 +22,7 @@ impl ToGitLab for GoApp {
         }
 
         jobs.insert(
-            "go/test".to_string(),
+            "go-test".to_string(),
             GitLabJob {
                 stage: "test".to_string(),
                 image: Some(format!("golang:{}", self.go_version)),

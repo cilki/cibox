@@ -106,8 +106,8 @@ mod tests {
         let workflow = preset.to_github().unwrap();
 
         assert_eq!(workflow.name, "CI");
-        assert!(workflow.jobs.contains_key("rust/test"));
-        assert!(!workflow.jobs.contains_key("rust/lint"));
+        assert!(workflow.jobs.contains_key("rust-test"));
+        assert!(!workflow.jobs.contains_key("rust-lint"));
     }
 
     #[test]
@@ -122,8 +122,8 @@ mod tests {
         };
         let workflow = preset.to_github().unwrap();
 
-        assert!(workflow.jobs.contains_key("rust/test"));
-        assert!(workflow.jobs.contains_key("rust/lint"));
+        assert!(workflow.jobs.contains_key("rust-test"));
+        assert!(workflow.jobs.contains_key("rust-lint"));
     }
 
     #[test]

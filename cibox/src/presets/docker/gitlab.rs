@@ -32,7 +32,7 @@ impl ToGitLab for Docker {
         }
 
         jobs.insert(
-            "docker/build".to_string(),
+            "docker-build".to_string(),
             GitLabJob {
                 stage: "build".to_string(),
                 image: Some("docker:latest".to_string()),

@@ -72,7 +72,7 @@ impl ToCircleCI for Rust {
         });
 
         jobs.insert(
-            "rust/test".to_string(),
+            "rust-test".to_string(),
             CircleCIJob {
                 docker: vec![CircleCIDocker {
                     image: "rust:latest".to_string(),
@@ -82,12 +82,12 @@ impl ToCircleCI for Rust {
             },
         );
 
-        workflow_jobs.push(CircleCIWorkflowJob::Simple("rust/test".to_string()));
+        workflow_jobs.push(CircleCIWorkflowJob::Simple("rust-test".to_string()));
 
         // Lint job (optional)
         if self.enable_linter {
             jobs.insert(
-                "rust/lint".to_string(),
+                "rust-lint".to_string(),
                 CircleCIJob {
                     docker: vec![CircleCIDocker {
                         image: "rust:latest".to_string(),
@@ -116,13 +116,13 @@ impl ToCircleCI for Rust {
                     environment: None,
                 },
             );
-            workflow_jobs.push(CircleCIWorkflowJob::Simple("rust/lint".to_string()));
+            workflow_jobs.push(CircleCIWorkflowJob::Simple("rust-lint".to_string()));
         }
 
         // Format check job (optional)
         if self.enable_format_check {
             jobs.insert(
-                "rust/format".to_string(),
+                "rust-format".to_string(),
                 CircleCIJob {
                     docker: vec![CircleCIDocker {
                         image: "rust:latest".to_string(),
@@ -151,7 +151,7 @@ impl ToCircleCI for Rust {
                     environment: None,
                 },
             );
-            workflow_jobs.push(CircleCIWorkflowJob::Simple("rust/format".to_string()));
+            workflow_jobs.push(CircleCIWorkflowJob::Simple("rust-format".to_string()));
         }
 
         Ok(CircleCIConfig {
