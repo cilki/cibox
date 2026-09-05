@@ -1,8 +1,6 @@
-use crate::traits::PresetInfo;
 use cibox_macros::Preset;
 
 mod circleci;
-mod detectable;
 mod gitea;
 mod github;
 mod gitlab;
@@ -50,20 +48,10 @@ impl Default for Rust {
     }
 }
 
-impl PresetInfo for Rust {
-    fn name(&self) -> &str {
-        "Rust"
-    }
-
-    fn description(&self) -> &str {
-        "CI pipeline for Rust projects (binaries, libraries, and workspaces)"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{PresetInfo, ToGitHub};
+    use crate::traits::ToGitHub;
 
     #[test]
     fn test_default() {
@@ -124,12 +112,5 @@ mod tests {
 
         assert!(workflow.jobs.contains_key("rust/test"));
         assert!(workflow.jobs.contains_key("rust/lint"));
-    }
-
-    #[test]
-    fn test_preset_info() {
-        let preset = Rust::default();
-        assert_eq!(preset.name(), "Rust");
-        assert!(!preset.description().is_empty());
     }
 }

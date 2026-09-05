@@ -1,8 +1,6 @@
-use crate::traits::PresetInfo;
 use cibox_macros::Preset;
 
 mod circleci;
-mod detectable;
 mod gitea;
 mod github;
 mod gitlab;
@@ -74,16 +72,6 @@ impl Default for Docker {
             enable_cache: true,
             push_on_tags_only: false,
         }
-    }
-}
-
-impl PresetInfo for Docker {
-    fn name(&self) -> &str {
-        "Docker"
-    }
-
-    fn description(&self) -> &str {
-        "CI pipeline for building and pushing Docker images to registries"
     }
 }
 

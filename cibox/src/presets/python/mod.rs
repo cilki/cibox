@@ -1,8 +1,6 @@
-use crate::traits::PresetInfo;
 use cibox_macros::Preset;
 
 mod circleci;
-mod detectable;
 mod gitea;
 mod github;
 mod gitlab;
@@ -129,15 +127,5 @@ impl Default for PythonApp {
             enable_type_check: false,
             formatter: None,
         }
-    }
-}
-
-impl PresetInfo for PythonApp {
-    fn name(&self) -> &str {
-        "PythonApp"
-    }
-
-    fn description(&self) -> &str {
-        "CI pipeline for Python applications with pytest, linting, and type checking"
     }
 }

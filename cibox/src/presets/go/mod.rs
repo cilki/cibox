@@ -1,8 +1,6 @@
-use crate::traits::PresetInfo;
 use cibox_macros::Preset;
 
 mod circleci;
-mod detectable;
 mod gitea;
 mod github;
 mod gitlab;
@@ -32,15 +30,5 @@ impl Default for GoApp {
             enable_linter: true,
             enable_security_scan: true,
         }
-    }
-}
-
-impl PresetInfo for GoApp {
-    fn name(&self) -> &str {
-        "GoApp"
-    }
-
-    fn description(&self) -> &str {
-        "CI pipeline for Go applications with testing and linting"
     }
 }
