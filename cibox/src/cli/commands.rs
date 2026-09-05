@@ -57,7 +57,7 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
     let mut preset_configs = Vec::new();
 
     for preset_choice in &config.presets {
-        let (preset_id, preset_config) = preset_choice_to_config(&preset_choice);
+        let (preset_id, preset_config) = preset_choice_to_config(preset_choice);
         println!("  {} {}", "•".blue(), preset_id);
         preset_configs.push((preset_id, preset_config));
     }

@@ -86,9 +86,3 @@ impl PresetInfo for Docker {
         "CI pipeline for building and pushing Docker images to registries"
     }
 }
-
-#[cfg(test)]
-#[cfg(disabled)]
-mod tests {
-    // Tests temporarily disabled - need to be updated after macro migration
-}

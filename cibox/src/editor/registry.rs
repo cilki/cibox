@@ -9,6 +9,12 @@ pub struct PresetRegistry {
     presets: Vec<Arc<dyn EditorPreset>>,
 }
 
+impl Default for PresetRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PresetRegistry {
     pub fn new() -> Self {
         Self {
