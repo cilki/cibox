@@ -81,8 +81,9 @@ fn render_info_bar(f: &mut Frame, area: Rect, state: &EditorState) {
 
 fn render_platform_bar(f: &mut Frame, area: Rect, state: &EditorState) {
     let text = format!(
-        "Platform: {} (press 'p' to change)",
-        state.target_platform.name()
+        "Pipeline: {} ({} configured, press 'p' to change)",
+        state.target_platform().name(),
+        state.persisted_pipeline_count()
     );
 
     let paragraph = Paragraph::new(text)
@@ -130,7 +131,7 @@ fn render_presets_panel(f: &mut Frame, area: Rect, state: &EditorState) {
                     None => continue,
                 };
 
-                let config = state.preset_configs.get(preset_id.as_str());
+                let config = state.preset_configs().get(preset_id.as_str());
                 let is_expanded = state.expanded_presets.contains(preset_id);
                 let has_options_enabled = config
                     .map(|c| {
@@ -190,7 +191,7 @@ fn render_presets_panel(f: &mut Frame, area: Rect, state: &EditorState) {
                     None => continue,
                 };
 
-                let config = match state.preset_configs.get(preset_id.as_str()) {
+                let config = match state.preset_configs().get(preset_id.as_str()) {
                     Some(c) => c,
                     None => continue,
                 };
@@ -274,7 +275,7 @@ fn render_preview_panel(f: &mut Frame, area: Rect, state: &EditorState) {
             .scroll((state.preview_scroll, 0))
     };
 
-    let output_path = state.target_platform.output_path();
+    let output_path = state.target_platform().output_path();
     let filename = output_path.to_str().unwrap_or("config.yml");
 
     let block = Block::default()
@@ -310,17 +311,20 @@ fn render_platform_menu(f: &mut Frame, state: &EditorState) {
         .enumerate()
         .map(|(i, platform)| {
             let is_selected = i == state.platform_menu_cursor;
-            let is_current = *platform == state.target_platform;
+            let is_current = *platform == state.target_platform();
+            let is_configured = state.has_pipeline(*platform);
 
             let style = if is_selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default().fg(Color::Cyan)
             } else {
                 Style::default()
             };
 
-            let marker = if is_current { "● " } else { "  " };
+            let marker = if is_configured { "● " } else { "○ " };
             let prefix = if is_selected { "> " } else { "  " };
 
             ListItem::new(format!("{}{}{}", prefix, marker, platform.name())).style(style)
@@ -329,7 +333,7 @@ fn render_platform_menu(f: &mut Frame, state: &EditorState) {
 
     let list = List::new(items).block(
         Block::default()
-            .title(" Select Platform ")
+            .title(" Select Pipeline ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .style(Style::default().bg(Color::Black)),

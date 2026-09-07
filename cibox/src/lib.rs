@@ -5,5 +5,5 @@ pub mod editor;
 pub mod error;
 pub mod generator;
 pub mod platforms;
+pub mod ir;
 pub mod presets;
-pub mod traits;

@@ -1,47 +1,30 @@
-use crate::editor::state::Platform;
 use crate::error::Result;
+use crate::platforms::circleci::models::CircleCIConfig;
+use crate::platforms::gitea::models::GiteaWorkflow;
+use crate::platforms::github::models::GitHubWorkflow;
+use crate::platforms::gitlab::models::GitLabCI;
 use crate::platforms::jenkins::models::JenkinsConfig;
-use crate::traits::{ToCircleCI, ToGitHub, ToGitLab, ToGitea, ToJenkins};
 
-/// Generate CI configuration for the specified platform
-///
-/// This helper function eliminates code duplication across preset implementations
-/// by providing a unified way to generate platform-specific configurations.
-///
-/// # Type Parameters
-/// * `T` - Any type that implements all platform conversion traits
-///
-/// # Arguments
-/// * `preset` - The preset instance to convert
-/// * `platform` - The target CI platform
-///
-/// # Returns
-/// * `Ok(String)` - The generated YAML/Groovy configuration as a string
-/// * `Err` - If generation or serialization fails
-pub fn generate_for_platform<T>(preset: &T, platform: Platform) -> Result<String>
-where
-    T: ToGitHub + ToGitea + ToGitLab + ToCircleCI + ToJenkins,
-{
-    match platform {
-        Platform::GitHub => {
-            let workflow = preset.to_github()?;
-            Ok(serde_yaml::to_string(&workflow)?)
-        }
-        Platform::Gitea => {
-            let workflow = preset.to_gitea()?;
-            Ok(serde_yaml::to_string(&workflow)?)
-        }
-        Platform::GitLab => {
-            let config = preset.to_gitlab()?;
-            Ok(serde_yaml::to_string(&config)?)
-        }
-        Platform::CircleCI => {
-            let config = preset.to_circleci()?;
-            Ok(serde_yaml::to_string(&config)?)
-        }
-        Platform::Jenkins => {
-            let config = preset.to_jenkins()?;
-            Ok(jenkins_to_string(&config))
+/// A platform-specific CI configuration before serialization, so multiple
+/// presets can be merged into one document for single-file platforms
+#[derive(Debug, Clone)]
+pub enum PlatformConfig {
+    GitHub(GitHubWorkflow),
+    Gitea(GiteaWorkflow),
+    GitLab(GitLabCI),
+    CircleCI(CircleCIConfig),
+    Jenkins(JenkinsConfig),
+}
+
+impl PlatformConfig {
+    /// Serialize to the platform's file format (YAML, or Groovy for Jenkins)
+    pub fn render(&self) -> Result<String> {
+        match self {
+            PlatformConfig::GitHub(workflow) => Ok(serde_yaml::to_string(workflow)?),
+            PlatformConfig::Gitea(workflow) => Ok(serde_yaml::to_string(workflow)?),
+            PlatformConfig::GitLab(config) => Ok(serde_yaml::to_string(config)?),
+            PlatformConfig::CircleCI(config) => Ok(serde_yaml::to_string(config)?),
+            PlatformConfig::Jenkins(config) => Ok(jenkins_to_string(config)),
         }
     }
 }

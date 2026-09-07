@@ -29,6 +29,10 @@ pub struct GitHubTriggerConfig {
 pub struct GitHubJob {
     #[serde(rename = "runs-on")]
     pub runs_on: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
     pub steps: Vec<GitHubStep>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs: Option<Vec<String>>,
@@ -66,6 +70,8 @@ mod tests {
                 "test".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
+                    container: None,
+                    env: None,
                     steps: vec![GitHubStep {
                         name: Some("Checkout".to_string()),
                         uses: Some("actions/checkout@v4".to_string()),

@@ -6,49 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
-    GitHub,
-    Gitea,
-    GitLab,
-    CircleCI,
-    Jenkins,
-}
-
-impl Platform {
-    pub fn all() -> Vec<Platform> {
-        vec![
-            Platform::GitHub,
-            Platform::Gitea,
-            Platform::GitLab,
-            Platform::CircleCI,
-            Platform::Jenkins,
-        ]
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            Platform::GitHub => "GitHub Actions",
-            Platform::Gitea => "Gitea Actions",
-            Platform::GitLab => "GitLab CI",
-            Platform::CircleCI => "CircleCI",
-            Platform::Jenkins => "Jenkins",
-        }
-    }
-
-    pub fn output_path(&self) -> PathBuf {
-        match self {
-            Platform::GitHub => PathBuf::from(".github/workflows/ci.yml"),
-            Platform::Gitea => PathBuf::from(".gitea/workflows/ci.yml"),
-            Platform::GitLab => PathBuf::from(".gitlab-ci.yml"),
-            Platform::CircleCI => PathBuf::from(".circleci/config.yml"),
-            Platform::Jenkins => PathBuf::from("Jenkinsfile"),
-        }
-    }
-}
+pub use crate::config::Platform;
 
 /// Fixed category display order
-const CATEGORY_ORDER: &[&str] = &["Languages", "Packaging", "Documentation"];
+const CATEGORY_ORDER: &[&str] = &["Languages", "Packaging", "Documentation", "Security"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TreeItem {
@@ -57,18 +18,27 @@ pub enum TreeItem {
     Field(String, String),      // (preset_id, field_id)
 }
 
+/// One CI pipeline being edited: a target platform and its own preset settings
+pub struct PipelineState {
+    pub platform: Platform,
+    pub preset_configs: HashMap<String, PresetConfig>,
+    /// Whether this pipeline is saved to cibox.ron and written as a CI file.
+    /// Pipelines created by browsing platforms stay transient until modified.
+    pub persist: bool,
+}
+
 pub struct EditorState {
     // Project context
     pub project_type: ProjectType,
     pub language_version: String,
     pub working_dir: PathBuf,
 
-    // User selections
-    pub target_platform: Platform,
+    // Pipelines being edited, one per platform
+    pub pipelines: Vec<PipelineState>,
+    pub active_pipeline: usize,
 
     // Dynamic preset configuration
     pub registry: Arc<PresetRegistry>,
-    pub preset_configs: HashMap<String, PresetConfig>,
 
     // UI state - tree structure
     pub expanded_categories: HashSet<String>,
@@ -102,6 +72,8 @@ impl EditorState {
         platform: Option<String>,
         working_dir: PathBuf,
     ) -> Result<Self> {
+        use std::str::FromStr;
+
         let project_type = detection.project_type.clone();
         let language_version = detection
             .language_version
@@ -109,14 +81,7 @@ impl EditorState {
             .unwrap_or_else(|| "stable".to_string());
 
         let target_platform = if let Some(p) = platform {
-            match p.to_lowercase().as_str() {
-                "github" => Platform::GitHub,
-                "gitea" => Platform::Gitea,
-                "gitlab" => Platform::GitLab,
-                "circleci" => Platform::CircleCI,
-                "jenkins" => Platform::Jenkins,
-                _ => Platform::GitHub,
-            }
+            Platform::from_str(&p).map_err(|_| crate::error::unsupported_platform_error(&p))?
         } else {
             Platform::GitHub
         };
@@ -152,9 +117,13 @@ impl EditorState {
             project_type,
             language_version,
             working_dir,
-            target_platform,
+            pipelines: vec![PipelineState {
+                platform: target_platform,
+                preset_configs,
+                persist: true,
+            }],
+            active_pipeline: 0,
             registry,
-            preset_configs,
             expanded_categories,
             expanded_presets,
             tree_items: Vec::new(),
@@ -177,6 +146,36 @@ impl EditorState {
         state.regenerate_yaml();
         state.update_current_item_description();
         Ok(state)
+    }
+
+    /// Platform of the pipeline currently being edited
+    pub fn target_platform(&self) -> Platform {
+        self.pipelines[self.active_pipeline].platform
+    }
+
+    /// Preset settings of the pipeline currently being edited
+    pub fn preset_configs(&self) -> &HashMap<String, PresetConfig> {
+        &self.pipelines[self.active_pipeline].preset_configs
+    }
+
+    pub fn preset_configs_mut(&mut self) -> &mut HashMap<String, PresetConfig> {
+        &mut self.pipelines[self.active_pipeline].preset_configs
+    }
+
+    /// Whether a persisted pipeline exists for the given platform
+    pub fn has_pipeline(&self, platform: Platform) -> bool {
+        self.pipelines
+            .iter()
+            .any(|p| p.platform == platform && p.persist)
+    }
+
+    /// Number of pipelines that will be saved
+    pub fn persisted_pipeline_count(&self) -> usize {
+        self.pipelines.iter().filter(|p| p.persist).count()
+    }
+
+    fn mark_active_persist(&mut self) {
+        self.pipelines[self.active_pipeline].persist = true;
     }
 
     pub fn rebuild_tree(&mut self) {
@@ -249,7 +248,7 @@ impl EditorState {
 
         // Find the first preset that has any options enabled
         let active_preset = self.registry.all().into_iter().find(|preset| {
-            if let Some(config) = self.preset_configs.get(preset.preset_id()) {
+            if let Some(config) = self.preset_configs().get(preset.preset_id()) {
                 self.has_any_options_enabled(config)
             } else {
                 false
@@ -263,7 +262,7 @@ impl EditorState {
         };
 
         let preset_id = preset.preset_id();
-        let config = match self.preset_configs.get(preset_id) {
+        let config = match self.preset_configs().get(preset_id) {
             Some(c) => c,
             None => {
                 self.generation_error = Some(format!("Config not found for preset: {}", preset_id));
@@ -271,7 +270,7 @@ impl EditorState {
             }
         };
 
-        let result = preset.generate(config, self.target_platform, &self.language_version);
+        let result = preset.generate(config, self.target_platform(), &self.language_version);
 
         match result {
             Ok(yaml) => {
@@ -292,19 +291,20 @@ impl EditorState {
     }
 
     pub fn get_option_value(&self, preset_id: &str, option_id: &str) -> Option<&OptionValue> {
-        self.preset_configs
+        self.preset_configs()
             .get(preset_id)
             .and_then(|config| config.get(option_id))
     }
 
     pub fn set_option_value(&mut self, preset_id: &str, option_id: &str, value: OptionValue) {
-        if let Some(config) = self.preset_configs.get_mut(preset_id) {
+        if let Some(config) = self.preset_configs_mut().get_mut(preset_id) {
             config.set(option_id.to_string(), value);
+            self.mark_active_persist();
         }
     }
 
     pub fn toggle_option(&mut self, preset_id: &str, option_id: &str) {
-        if let Some(config) = self.preset_configs.get_mut(preset_id) {
+        if let Some(config) = self.preset_configs_mut().get_mut(preset_id) {
             if let Some(value) = config.get(option_id) {
                 let new_value = match value {
                     OptionValue::Bool(b) => OptionValue::Bool(!b),
@@ -321,6 +321,7 @@ impl EditorState {
                     other => other.clone(),
                 };
                 config.set(option_id.to_string(), new_value);
+                self.mark_active_persist();
             }
         }
         self.regenerate_yaml();
@@ -331,13 +332,29 @@ impl EditorState {
         let platforms = Platform::all();
         let current_index = platforms
             .iter()
-            .position(|&p| p == self.target_platform)
+            .position(|&p| p == self.target_platform())
             .unwrap_or(0);
         let next_index = (current_index + 1) % platforms.len();
-        self.target_platform = platforms[next_index];
+        self.switch_to_platform(platforms[next_index]);
+    }
+
+    /// Make the pipeline for the given platform active, lazily creating a
+    /// transient one (copied from the active pipeline) if none exists yet
+    pub fn switch_to_platform(&mut self, platform: Platform) {
+        if let Some(index) = self.pipelines.iter().position(|p| p.platform == platform) {
+            self.active_pipeline = index;
+        } else {
+            let preset_configs = self.preset_configs().clone();
+            self.pipelines.push(PipelineState {
+                platform,
+                preset_configs,
+                persist: false,
+            });
+            self.active_pipeline = self.pipelines.len() - 1;
+        }
 
         // Reload existing YAML for the new platform
-        let output_path = self.working_dir.join(self.target_platform.output_path());
+        let output_path = self.working_dir.join(platform.output_path());
         self.existing_yaml = std::fs::read_to_string(&output_path).ok();
 
         self.regenerate_yaml();
@@ -346,7 +363,7 @@ impl EditorState {
 
     pub fn toggle_preset(&mut self, preset_id: &str) {
         // Check if any options are currently enabled
-        let config = match self.preset_configs.get(preset_id) {
+        let config = match self.preset_configs().get(preset_id) {
             Some(c) => c,
             None => return,
         };
@@ -381,14 +398,7 @@ impl EditorState {
     pub fn select_platform_from_menu(&mut self) {
         let platforms = Platform::all();
         if let Some(&platform) = platforms.get(self.platform_menu_cursor) {
-            self.target_platform = platform;
-
-            // Reload existing YAML for the new platform
-            let output_path = self.working_dir.join(self.target_platform.output_path());
-            self.existing_yaml = std::fs::read_to_string(&output_path).ok();
-
-            self.regenerate_yaml();
-            self.auto_save_ron();
+            self.switch_to_platform(platform);
         }
         self.platform_menu_open = false;
     }
@@ -488,13 +498,13 @@ impl EditorState {
 
     /// Load RON configuration into TUI state
     pub fn from_ron_file(path: &std::path::Path) -> Result<Self> {
-        use crate::config::{preset_choice_to_config, CiboxConfig};
+        use crate::config::{parse_config, preset_choice_to_config};
         use anyhow::Context;
 
         let ron_str = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read RON file: {}", path.display()))?;
 
-        let ron_config: CiboxConfig = match crate::config::ron_options().from_str(&ron_str) {
+        let ron_config = match parse_config(&ron_str) {
             Ok(config) => config,
             Err(e) => {
                 eprintln!("Warning: Failed to parse RON configuration: {}", e);
@@ -505,20 +515,47 @@ impl EditorState {
                 return Err(anyhow::anyhow!("Failed to parse RON configuration: {}", e));
             }
         };
+        ron_config.validate()?;
 
         let registry = Arc::new(build_registry());
-        let mut preset_configs = HashMap::new();
 
-        for preset_choice in &ron_config.presets {
-            let (preset_id, config) = preset_choice_to_config(&preset_choice);
-            preset_configs.insert(preset_id, config);
+        // Every registered preset must have a config entry per pipeline; the
+        // tree UI and toggles index into the map for all preset ids.
+        let default_configs = |registry: &PresetRegistry| -> HashMap<String, PresetConfig> {
+            registry
+                .all()
+                .into_iter()
+                .map(|p| (p.preset_id().to_string(), p.default_config(false)))
+                .collect()
+        };
+
+        let mut pipelines = Vec::new();
+        for pipeline in &ron_config.0 {
+            let mut preset_configs = default_configs(&registry);
+            for preset_choice in &pipeline.presets {
+                let (preset_id, config) = preset_choice_to_config(preset_choice);
+                preset_configs.insert(preset_id, config);
+            }
+            pipelines.push(PipelineState {
+                platform: pipeline.platform,
+                preset_configs,
+                persist: true,
+            });
+        }
+
+        if pipelines.is_empty() {
+            pipelines.push(PipelineState {
+                platform: Platform::GitHub,
+                preset_configs: default_configs(&registry),
+                persist: false,
+            });
         }
 
         let working_dir = path
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        let target_platform = Platform::GitHub; // Default platform
+        let target_platform = pipelines[0].platform;
 
         // Try to load existing YAML file
         let output_path = working_dir.join(target_platform.output_path());
@@ -528,15 +565,18 @@ impl EditorState {
             project_type: ProjectType::PythonApp, // Default, doesn't affect RON-loaded config
             language_version: "stable".to_string(),
             working_dir,
-            target_platform,
+            pipelines,
+            active_pipeline: 0,
             registry,
-            preset_configs,
             expanded_categories: HashSet::new(),
             expanded_presets: HashSet::new(),
             tree_items: Vec::new(),
             tree_cursor: 0,
             platform_menu_open: false,
-            platform_menu_cursor: 0,
+            platform_menu_cursor: Platform::all()
+                .iter()
+                .position(|&p| p == target_platform)
+                .unwrap_or(0),
             preview_scroll: 0,
             yaml_preview: String::new(),
             generation_error: None,
@@ -552,26 +592,51 @@ impl EditorState {
         Ok(state)
     }
 
+    /// Enabled presets of a pipeline in registry order, for deterministic output
+    pub fn enabled_preset_configs(&self, pipeline: &PipelineState) -> Vec<(String, PresetConfig)> {
+        self.registry
+            .all()
+            .into_iter()
+            .filter_map(|preset| {
+                let preset_id = preset.preset_id();
+                pipeline
+                    .preset_configs
+                    .get(preset_id)
+                    .filter(|config| self.has_any_options_enabled(config))
+                    .map(|config| (preset_id.to_string(), config.clone()))
+            })
+            .collect()
+    }
+
     /// Export current TUI state to RON configuration
     pub fn export_to_ron(&self) -> Result<String> {
-        use crate::config::{preset_config_to_choice, CiboxConfig};
+        use crate::config::{preset_config_to_choice, CiboxConfig, Pipeline};
 
-        let mut presets = Vec::new();
+        let mut pipelines = Vec::new();
+        for platform in Platform::all() {
+            let Some(pipeline) = self
+                .pipelines
+                .iter()
+                .find(|p| p.platform == platform && p.persist)
+            else {
+                continue;
+            };
 
-        for (preset_id, config) in &self.preset_configs {
-            if self.has_any_options_enabled(config) {
-                let preset_choice = preset_config_to_choice(preset_id, config);
-                presets.push(preset_choice);
+            let presets: Vec<_> = self
+                .enabled_preset_configs(pipeline)
+                .iter()
+                .map(|(preset_id, config)| preset_config_to_choice(preset_id, config))
+                .collect();
+
+            if !presets.is_empty() {
+                pipelines.push(Pipeline { platform, presets });
             }
         }
 
-        let ron_config = CiboxConfig {
-            version: "1".to_string(),
-            presets,
-        };
+        let ron_config = CiboxConfig(pipelines);
 
         let pretty_config = ron::ser::PrettyConfig::new()
-            .depth_limit(4)
+            .depth_limit(5)
             .separate_tuple_members(true)
             .enumerate_arrays(false);
 
@@ -643,12 +708,12 @@ mod tests {
         assert!(preset_items.contains(&"Rust"));
 
         // Rust options should be enabled by default when detected
-        let rust_config = state.preset_configs.get("Rust").unwrap();
+        let rust_config = state.preset_configs().get("Rust").unwrap();
         // Defaults are false per preset_field, but set via default_config(detected=true)
         assert!(rust_config.values.contains_key("enable_coverage"));
 
-        let python_config = state.preset_configs.get("PythonApp").unwrap();
-        assert_eq!(python_config.get_bool("enable_type_check"), false);
+        let python_config = state.preset_configs().get("PythonApp").unwrap();
+        assert!(!python_config.get_bool("enable_type_check"));
     }
 
     #[test]
@@ -663,11 +728,11 @@ mod tests {
 
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
-        let rust_config = state.preset_configs.get("Rust").unwrap();
+        let rust_config = state.preset_configs().get("Rust").unwrap();
         assert!(rust_config.values.contains_key("enable_linter"));
 
-        let python_config = state.preset_configs.get("PythonApp").unwrap();
-        assert_eq!(python_config.get_bool("enable_type_check"), false);
+        let python_config = state.preset_configs().get("PythonApp").unwrap();
+        assert!(!python_config.get_bool("enable_type_check"));
     }
 
     #[test]
@@ -682,11 +747,11 @@ mod tests {
 
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
-        let rust_config = state.preset_configs.get("Rust").unwrap();
-        assert_eq!(rust_config.get_bool("enable_coverage"), false);
+        let rust_config = state.preset_configs().get("Rust").unwrap();
+        assert!(!rust_config.get_bool("enable_coverage"));
 
         // Python detected, so its bool defaults apply
-        let python_config = state.preset_configs.get("PythonApp").unwrap();
+        let python_config = state.preset_configs().get("PythonApp").unwrap();
         assert!(python_config.values.contains_key("enable_type_check"));
     }
 
@@ -702,9 +767,9 @@ mod tests {
 
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
-        let go_config = state.preset_configs.get("GoApp").unwrap();
-        assert_eq!(go_config.get_bool("enable_linter"), true);
-        assert_eq!(go_config.get_bool("enable_security_scan"), true);
+        let go_config = state.preset_configs().get("GoApp").unwrap();
+        assert!(go_config.get_bool("enable_linter"));
+        assert!(go_config.get_bool("enable_security_scan"));
     }
 
     #[test]
@@ -729,7 +794,7 @@ mod tests {
                 EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
             // Docker config should exist even if not shown in tree (category not expanded)
-            let docker_config = state.preset_configs.get("Docker");
+            let docker_config = state.preset_configs().get("Docker");
             assert!(
                 docker_config.is_some(),
                 "Docker preset should be available for {:?}",
@@ -750,8 +815,8 @@ mod tests {
 
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
-        let docker_config = state.preset_configs.get("Docker").unwrap();
-        assert_eq!(docker_config.get_bool("enable_cache"), true);
+        let docker_config = state.preset_configs().get("Docker").unwrap();
+        assert!(docker_config.get_bool("enable_cache"));
     }
 
     #[test]
@@ -766,9 +831,9 @@ mod tests {
 
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
-        let docker_config = state.preset_configs.get("Docker").unwrap();
+        let docker_config = state.preset_configs().get("Docker").unwrap();
         // Docker preset is available but not enabled by default for non-Docker projects
-        assert_eq!(docker_config.get_bool("enable_cache"), false);
+        assert!(!docker_config.get_bool("enable_cache"));
     }
 
     #[test]
@@ -784,11 +849,11 @@ mod tests {
         let state = EditorState::from_detection(detection, None, dir.path().to_path_buf()).unwrap();
 
         // Docker config should exist
-        let docker_config = state.preset_configs.get("Docker");
+        let docker_config = state.preset_configs().get("Docker");
         assert!(docker_config.is_some(), "Docker preset should be available");
 
         // But not enabled by default
-        assert_eq!(docker_config.unwrap().get_bool("enable_cache"), false);
+        assert!(!docker_config.unwrap().get_bool("enable_cache"));
     }
 
     #[test]
@@ -876,5 +941,73 @@ mod tests {
 
         // The first preset with options enabled should be used (registry order)
         assert!(state.yaml_preview.contains("cargo"));
+    }
+
+    fn rust_state(dir: &std::path::Path) -> EditorState {
+        let detection = DetectionResult {
+            project_type: ProjectType::RustLibrary,
+            language_version: Some("stable".to_string()),
+            metadata: HashMap::new(),
+        };
+        EditorState::from_detection(detection, None, dir.to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn test_pipeline_settings_are_independent() {
+        use crate::editor::config::OptionValue;
+        let dir = tempdir().unwrap();
+        let mut state = rust_state(dir.path());
+
+        state.set_option_value("Rust", "enable_coverage", OptionValue::Bool(true));
+
+        state.switch_to_platform(Platform::GitLab);
+        state.set_option_value("Rust", "enable_coverage", OptionValue::Bool(false));
+        state.set_option_value("Rust", "enable_linter", OptionValue::Bool(true));
+
+        assert!(!state.preset_configs().get("Rust").unwrap().get_bool("enable_coverage"));
+
+        state.switch_to_platform(Platform::GitHub);
+        assert!(state.preset_configs().get("Rust").unwrap().get_bool("enable_coverage"));
+        assert!(!state.preset_configs().get("Rust").unwrap().get_bool("enable_linter"));
+    }
+
+    #[test]
+    fn test_browsing_platforms_does_not_persist() {
+        let dir = tempdir().unwrap();
+        let mut state = rust_state(dir.path());
+
+        state.switch_to_platform(Platform::Jenkins);
+        assert!(!state.has_pipeline(Platform::Jenkins));
+        assert_eq!(state.persisted_pipeline_count(), 1);
+
+        // Modifying the transient pipeline persists it
+        state.toggle_option("Rust", "enable_linter");
+        assert!(state.has_pipeline(Platform::Jenkins));
+        assert_eq!(state.persisted_pipeline_count(), 2);
+    }
+
+    #[test]
+    fn test_export_to_ron_round_trips_multiple_pipelines() {
+        use crate::editor::config::OptionValue;
+        let dir = tempdir().unwrap();
+        let mut state = rust_state(dir.path());
+
+        state.set_option_value("Rust", "enable_coverage", OptionValue::Bool(true));
+        state.switch_to_platform(Platform::GitLab);
+        state.set_option_value("Rust", "enable_coverage", OptionValue::Bool(false));
+        state.set_option_value("Rust", "enable_linter", OptionValue::Bool(true));
+
+        let ron_str = state.export_to_ron().unwrap();
+        let config = crate::config::parse_config(&ron_str).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.pipeline_count(), 2);
+
+        let coverage_for = |platform| {
+            let pipeline = config.pipeline_for(platform).unwrap();
+            let (_, preset_config) = pipeline.presets[0].to_preset_config();
+            preset_config.get_bool("enable_coverage")
+        };
+        assert!(coverage_for(Platform::GitHub));
+        assert!(!coverage_for(Platform::GitLab));
     }
 }

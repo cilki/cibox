@@ -22,6 +22,8 @@ mod tests {
                 "test".to_string(),
                 GiteaJob {
                     runs_on: "ubuntu-latest".to_string(),
+                    container: None,
+                    env: None,
                     steps: vec![GiteaStep {
                         name: Some("Checkout".to_string()),
                         uses: Some("actions/checkout@v4".to_string()),
@@ -42,15 +44,4 @@ mod tests {
         assert!(yaml.contains("actions/checkout@v4"));
     }
 
-    #[test]
-    fn test_gitea_step_helpers() {
-        // Test that GitHub step helpers work for Gitea
-        let checkout = GiteaStep::checkout();
-        assert_eq!(checkout.name, Some("Checkout code".to_string()));
-        assert_eq!(checkout.uses, Some("actions/checkout@v4".to_string()));
-
-        let run_step = GiteaStep::run("Build", "cargo build");
-        assert_eq!(run_step.name, Some("Build".to_string()));
-        assert_eq!(run_step.run, Some("cargo build".to_string()));
-    }
 }

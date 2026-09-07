@@ -38,14 +38,17 @@ pub fn generate_editor_preset_impl(opts: &PresetOpts, fields: &[PresetFieldOpts]
 
             #matches_project_impl
 
-            fn generate(
+            fn build_jobs(
                 &self,
                 config: &crate::editor::config::PresetConfig,
-                platform: crate::editor::state::Platform,
                 language_version: &str,
-            ) -> crate::error::Result<String> {
+            ) -> crate::error::Result<crate::ir::PresetJobs> {
                 let preset = Self::from_config(config, language_version);
-                crate::platforms::helpers::generate_for_platform(&preset, platform)
+                Ok(crate::ir::PresetJobs::new(
+                    #preset_id,
+                    #preset_name,
+                    crate::ir::ToJobs::jobs(&preset),
+                ))
             }
         }
     }

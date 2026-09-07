@@ -134,13 +134,24 @@ pub trait EditorPreset: Send + Sync {
     /// Define the fields for this preset
     fn fields(&self) -> Vec<OptionMeta>;
 
-    /// Build the preset with given configuration and generate output
+    /// Build the preset with given configuration and produce its
+    /// platform-neutral jobs (combinable with other presets' jobs)
+    fn build_jobs(
+        &self,
+        config: &PresetConfig,
+        language_version: &str,
+    ) -> Result<crate::ir::PresetJobs>;
+
+    /// Build the preset with given configuration and generate rendered output
     fn generate(
         &self,
         config: &PresetConfig,
         platform: Platform,
         language_version: &str,
-    ) -> Result<String>;
+    ) -> Result<String> {
+        let jobs = self.build_jobs(config, language_version)?;
+        crate::platforms::lower::lower(platform, &[jobs])?.render()
+    }
 
     /// Check if this preset matches the detected project type
     /// This is used for UI coloring and sorting, not for enabling/disabling presets

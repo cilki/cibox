@@ -38,6 +38,15 @@ pub enum CircleCIStep {
         #[serde(rename = "save_cache")]
         save_cache: CircleCICacheSave,
     },
+    StoreArtifacts {
+        #[serde(rename = "store_artifacts")]
+        store_artifacts: CircleCIStoreArtifacts,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CircleCIStoreArtifacts {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

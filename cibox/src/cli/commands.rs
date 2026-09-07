@@ -1,4 +1,4 @@
-use crate::config::{preset_choice_to_config, CiboxConfig};
+use crate::config::{parse_config, preset_choice_to_config, Platform};
 use crate::editor::registry::build_registry;
 use crate::error::Result;
 use crate::generator::MultiPresetGenerator;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Handle the generate command
 pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: bool) -> Result<()> {
     use crate::detection::DetectorRegistry;
-    use crate::editor::state::Platform;
+    use std::str::FromStr;
 
     // 1. Load and parse RON
     println!("{} {}", "Loading".cyan().bold(), config_path);
@@ -19,62 +19,80 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
 
     // 2. Parse RON
     println!("{}", "Parsing RON configuration...".cyan().bold());
-    let config: CiboxConfig = crate::config::ron_options()
-        .from_str(&ron_str)
+    let config = parse_config(&ron_str)
         .with_context(|| "Failed to parse RON config. Check syntax and structure.")?;
+    config.validate()?;
 
     if config.is_empty() {
         bail!("No presets defined in configuration file");
     }
 
-    // 3. Detect project and determine platform
+    // 3. Detect project and select pipelines
     let working_dir = std::path::PathBuf::from(".");
     let detector_registry = DetectorRegistry::new();
     let detection = detector_registry.detect(&working_dir)?;
 
-    let platform = if let Some(p) = platform_arg {
-        match p.to_lowercase().as_str() {
-            "github" => Platform::GitHub,
-            "gitea" => Platform::Gitea,
-            "gitlab" => Platform::GitLab,
-            "circleci" => Platform::CircleCI,
-            "jenkins" => Platform::Jenkins,
-            _ => Platform::GitHub,
+    let pipelines: Vec<_> = if let Some(p) = platform_arg {
+        let platform = Platform::from_str(&p)
+            .map_err(|_| crate::error::unsupported_platform_error(&p))?;
+        match config.pipeline_for(platform) {
+            Some(pipeline) => vec![pipeline.clone()],
+            None => {
+                let configured: Vec<String> = config
+                    .0
+                    .iter()
+                    .map(|p| p.platform.to_string())
+                    .collect();
+                bail!(
+                    "No pipeline configured for platform '{}'. Configured platforms: {}",
+                    platform,
+                    configured.join(", ")
+                );
+            }
         }
     } else {
-        Platform::GitHub // Default platform
+        config.0.clone()
     };
 
-    println!(
-        "{} {} preset(s) for platform {}",
-        "Found".green().bold(),
-        config.len(),
-        format!("{:?}", platform).yellow()
-    );
-
-    // 4. Convert to preset configs
+    // 4. Generate outputs for each pipeline
     let registry = Arc::new(build_registry());
-    let mut preset_configs = Vec::new();
-
-    for preset_choice in &config.presets {
-        let (preset_id, preset_config) = preset_choice_to_config(&preset_choice);
-        println!("  {} {}", "•".blue(), preset_id);
-        preset_configs.push((preset_id, preset_config));
-    }
-
-    // 5. Generate outputs
-    println!("\n{}", "Generating CI configurations...".cyan().bold());
     let language_version = detection
         .language_version
         .unwrap_or_else(|| "stable".to_string());
 
-    let generator = MultiPresetGenerator::new(preset_configs, registry, platform, language_version);
+    println!("\n{}", "Generating CI configurations...".cyan().bold());
+    let mut outputs = Vec::new();
+    for pipeline in &pipelines {
+        println!(
+            "{} {} preset(s) for platform {}",
+            "Found".green().bold(),
+            pipeline.presets.len(),
+            pipeline.platform.to_string().yellow()
+        );
 
-    let outputs = generator
-        .generate_all()
-        .with_context(|| "Failed to generate CI configurations")?;
+        let mut preset_configs = Vec::new();
+        for preset_choice in &pipeline.presets {
+            let (preset_id, preset_config) = preset_choice_to_config(preset_choice);
+            println!("  {} {}", "•".blue(), preset_id);
+            preset_configs.push((preset_id, preset_config));
+        }
 
-    // 6. Write files
+        let generator = MultiPresetGenerator::new(
+            preset_configs,
+            registry.clone(),
+            pipeline.platform,
+            language_version.clone(),
+        );
+
+        outputs.extend(generator.generate_all().with_context(|| {
+            format!(
+                "Failed to generate CI configuration for {}",
+                pipeline.platform
+            )
+        })?);
+    }
+
+    // 5. Write files
     let base_path = PathBuf::from(".");
 
     for (filename, content) in outputs {
@@ -119,14 +137,13 @@ pub fn handle_validate(config_path: &str) -> Result<()> {
         .with_context(|| format!("Failed to read config file: {}", config_path))?;
 
     // Parse RON
-    let config: CiboxConfig = crate::config::ron_options()
-        .from_str(&ron_str)
-        .with_context(|| {
-            "Failed to parse RON config. Check syntax and structure:\n\
-             - Ensure all fields are properly formatted\n\
-             - Check for missing commas\n\
-             - Verify enum variants match expected values"
-        })?;
+    let config = parse_config(&ron_str).with_context(|| {
+        "Failed to parse RON config. Check syntax and structure:\n\
+         - Ensure all fields are properly formatted\n\
+         - Check for missing commas\n\
+         - Verify enum variants match expected values"
+    })?;
+    config.validate()?;
 
     // Basic validation
     if config.is_empty() {
@@ -134,16 +151,13 @@ pub fn handle_validate(config_path: &str) -> Result<()> {
     }
 
     println!("\n{}", "Configuration is valid!".green().bold());
-    println!("  Presets: {}", config.len());
+    println!("  Pipelines: {}", config.pipeline_count());
 
-    for (idx, preset) in config.presets.iter().enumerate() {
-        let preset_name = match preset {
-            crate::config::PresetChoice::PythonApp(_) => "Python",
-            crate::config::PresetChoice::Rust(_) => "Rust",
-            crate::config::PresetChoice::GoApp(_) => "Go App",
-            crate::config::PresetChoice::Docker(_) => "Docker",
-        };
-        println!("    {}. {}", idx + 1, preset_name);
+    for pipeline in &config.0 {
+        println!("  {}:", pipeline.platform.name().yellow());
+        for (idx, preset) in pipeline.presets.iter().enumerate() {
+            println!("    {}. {}", idx + 1, preset.display_name());
+        }
     }
 
     Ok(())

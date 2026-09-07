@@ -85,22 +85,34 @@ impl EditorApp {
     }
 
     fn write_config(&self) -> Result<()> {
+        use crate::generator::MultiPresetGenerator;
         use std::fs;
 
-        let output_path = self
-            .state
-            .working_dir
-            .join(self.state.target_platform.output_path());
+        for pipeline in self.state.pipelines.iter().filter(|p| p.persist) {
+            let preset_configs = self.state.enabled_preset_configs(pipeline);
+            if preset_configs.is_empty() {
+                continue;
+            }
 
-        // Create parent directories
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent)?;
+            let generator = MultiPresetGenerator::new(
+                preset_configs,
+                self.state.registry.clone(),
+                pipeline.platform,
+                self.state.language_version.clone(),
+            );
+
+            for (filename, content) in generator.generate_all()? {
+                let output_path = self.state.working_dir.join(filename);
+
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                fs::write(&output_path, content)?;
+
+                println!("✨ Generated: {}", output_path.display());
+            }
         }
-
-        // Write file
-        fs::write(&output_path, &self.state.yaml_preview)?;
-
-        println!("✨ Generated: {}", output_path.display());
 
         Ok(())
     }

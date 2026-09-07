@@ -9,6 +9,12 @@ pub struct PresetRegistry {
     presets: Vec<Arc<dyn EditorPreset>>,
 }
 
+impl Default for PresetRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PresetRegistry {
     pub fn new() -> Self {
         Self {
@@ -29,15 +35,14 @@ impl PresetRegistry {
     }
 }
 
-/// Build the global preset registry
-pub fn build_registry() -> PresetRegistry {
-    let mut registry = PresetRegistry::new();
-
-    // Register all editor preset implementations
-    registry.register(Arc::new(crate::presets::Rust::default()));
-    registry.register(Arc::new(crate::presets::PythonApp::default()));
-    registry.register(Arc::new(crate::presets::GoApp::default()));
-    registry.register(Arc::new(crate::presets::Docker::default()));
-
-    registry
+macro_rules! generate_build_registry {
+    ($(($variant:ident, $ty:path, $display:literal)),+ $(,)?) => {
+        /// Build the global preset registry
+        pub fn build_registry() -> PresetRegistry {
+            let mut registry = PresetRegistry::new();
+            $(registry.register(Arc::new(<$ty>::default()));)+
+            registry
+        }
+    };
 }
+crate::presets::with_presets!(generate_build_registry);

@@ -1,5 +1,7 @@
+pub mod platform;
 pub mod ron_types;
 
+pub use platform::Platform;
 pub use ron_types::*;
 
 /// RON options shared by every cibox.ron read and write.

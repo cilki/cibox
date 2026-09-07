@@ -19,7 +19,7 @@ pub enum Commands {
         #[arg(default_value = "cibox.ron")]
         config: String,
 
-        /// Target platform
+        /// Generate only this pipeline from the config (default: all pipelines)
         #[arg(short, long)]
         platform: Option<String>,
 
