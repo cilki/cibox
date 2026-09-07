@@ -27,10 +27,15 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
         bail!("No presets defined in configuration file");
     }
 
-    // 3. Detect project and select pipelines
+    // 3. Detect project and select pipelines.
+    //
+    // Detection only supplies a fallback language/toolchain version; the presets
+    // themselves come from the RON file. Failing to recognize the working
+    // directory (e.g. generating into an empty dir, or a project type the
+    // detector doesn't know) must not abort generation — fall back to "stable".
     let working_dir = std::path::PathBuf::from(".");
     let detector_registry = DetectorRegistry::new();
-    let detection = detector_registry.detect(&working_dir)?;
+    let detection = detector_registry.detect(&working_dir).ok();
 
     let pipelines: Vec<_> = if let Some(p) = platform_arg {
         let platform = Platform::from_str(&p)
@@ -57,7 +62,7 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
     // 4. Generate outputs for each pipeline
     let registry = Arc::new(build_registry());
     let language_version = detection
-        .language_version
+        .and_then(|d| d.language_version)
         .unwrap_or_else(|| "stable".to_string());
 
     println!("\n{}", "Generating CI configurations...".cyan().bold());
