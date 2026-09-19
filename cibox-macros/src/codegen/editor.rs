@@ -137,7 +137,6 @@ fn generate_fields_method(fields: &[PresetFieldOpts]) -> TokenStream {
                 display_name: #display_name.to_string(),
                 description: #description.to_string(),
                 default_value: #default_value,
-                depends_on: None,
             }
         }
     });

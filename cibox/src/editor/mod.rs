@@ -9,11 +9,6 @@ use crate::detection::DetectorRegistry;
 use crate::error::Result;
 use std::path::PathBuf;
 
-/// Run the interactive editor for configuring CI pipelines
-pub fn run() -> Result<()> {
-    run_with_args(".", None)
-}
-
 /// Run the editor with specific arguments
 pub fn run_with_args(dir: &str, platform: Option<String>) -> Result<()> {
     // Auto-detect project

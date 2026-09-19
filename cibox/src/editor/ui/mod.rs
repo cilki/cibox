@@ -221,9 +221,6 @@ fn render_presets_panel(f: &mut Frame, area: Rect, state: &EditorState) {
                     OptionValue::String(s) => {
                         format!("      {}: {}", display_name, s)
                     }
-                    OptionValue::Int(n) => {
-                        format!("      {}: {}", display_name, n)
-                    }
                 };
 
                 let text_color = if is_selected {

@@ -38,13 +38,6 @@ impl PythonLinter {
             PythonLinter::Ruff => "ruff check .",
         }
     }
-
-    pub fn toggle(&self) -> Self {
-        match self {
-            PythonLinter::Flake8 => PythonLinter::Ruff,
-            PythonLinter::Ruff => PythonLinter::Flake8,
-        }
-    }
 }
 
 /// Formatter tool options for Python
@@ -82,13 +75,6 @@ impl PythonFormatter {
         match self {
             PythonFormatter::Black => "black --check .",
             PythonFormatter::Ruff => "ruff format --check .",
-        }
-    }
-
-    pub fn toggle(&self) -> Self {
-        match self {
-            PythonFormatter::Black => PythonFormatter::Ruff,
-            PythonFormatter::Ruff => PythonFormatter::Black,
         }
     }
 }

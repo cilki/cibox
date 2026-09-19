@@ -12,26 +12,11 @@ pub enum OptionValue {
         variants: Vec<String>,
     },
     String(String),
-    Int(i32),
 }
 
 impl OptionValue {
     pub fn as_bool(&self) -> bool {
         matches!(self, OptionValue::Bool(true))
-    }
-
-    pub fn toggle_bool(&mut self) {
-        if let OptionValue::Bool(v) = self {
-            *v = !*v;
-        }
-    }
-
-    pub fn cycle_enum(&mut self) {
-        if let OptionValue::Enum { selected, variants } = self {
-            let idx = variants.iter().position(|v| v == selected).unwrap_or(0);
-            let next_idx = (idx + 1) % variants.len();
-            *selected = variants[next_idx].clone();
-        }
     }
 }
 
@@ -42,7 +27,6 @@ pub struct OptionMeta {
     pub display_name: String,
     pub description: String,
     pub default_value: OptionValue,
-    pub depends_on: Option<String>, // ID of parent option this depends on
 }
 
 /// Runtime configuration state for a preset
@@ -52,8 +36,6 @@ pub struct PresetConfig {
     pub preset_id: String,
     /// Flat map of option_id -> value
     pub values: HashMap<String, OptionValue>,
-    /// Track which options have been explicitly set (vs using defaults)
-    pub explicitly_set: std::collections::HashSet<String>,
 }
 
 impl PresetConfig {
@@ -61,7 +43,6 @@ impl PresetConfig {
         Self {
             preset_id,
             values: HashMap::new(),
-            explicitly_set: std::collections::HashSet::new(),
         }
     }
 
@@ -97,23 +78,7 @@ impl PresetConfig {
     }
 
     pub fn set(&mut self, option_id: String, value: OptionValue) {
-        self.explicitly_set.insert(option_id.clone());
         self.values.insert(option_id, value);
-    }
-
-    pub fn toggle(&mut self, option_id: &str) {
-        if let Some(value) = self.values.get_mut(option_id) {
-            self.explicitly_set.insert(option_id.to_string());
-            match value {
-                OptionValue::Bool(b) => *b = !*b,
-                OptionValue::Enum { .. } => value.cycle_enum(),
-                _ => {}
-            }
-        }
-    }
-
-    pub fn is_explicitly_set(&self, option_id: &str) -> bool {
-        self.explicitly_set.contains(option_id)
     }
 }
 
