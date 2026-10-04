@@ -1,7 +1,24 @@
 use crate::editor::state::{EditorState, Platform};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
+    // Ignore release/repeat events; they would double-type in insert mode
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
+    // A text knob is being edited: capture all input
+    if state.input.is_some() {
+        match key.code {
+            KeyCode::Enter => state.commit_input(),
+            KeyCode::Esc => state.cancel_input(),
+            KeyCode::Backspace => state.input_backspace(),
+            KeyCode::Char(c) => state.input_push(c),
+            _ => {}
+        }
+        return;
+    }
+
     // If platform menu is open, handle menu navigation
     if state.platform_menu_open {
         match key.code {
@@ -42,9 +59,17 @@ pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
             state.open_platform_menu();
         }
 
-        // Toggle the rule under the cursor
+        // Toggle the rule/option under the cursor, or edit a text knob
         KeyCode::Enter | KeyCode::Char(' ') => {
-            state.toggle_current();
+            state.activate_current();
+        }
+
+        // Expand/collapse a rule's config options
+        KeyCode::Right | KeyCode::Char('l') => {
+            state.expand_current();
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            state.collapse_current();
         }
 
         // Shift-J/K scroll the preview

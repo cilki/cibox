@@ -1,5 +1,5 @@
 `cibox` is a tool that generates CI/CD configurations for multiple platforms
-(GitHub Actions, GitLab CI, CircleCI, Jenkins, Gitea) from detected project
+(GitHub Actions, GitLab CI, CircleCI, Gitea) from detected project
 facts. It is built around **rules**: opinionated units of CI configuration
 (one per concern, e.g. `rust-test`, `rust-release`, `docker-build`) that are
 auto-enabled by detection and individually overridable in `cibox.ron`.
@@ -22,6 +22,13 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
   overrides, nix-services style (`rule_name: (enabled: bool, ...knobs)`).
   These types must stay hand-written literals — `build.rs` feeds this file to
   roniker for the RON LSP (`cibox lsp`).
+- `cibox update` merges into existing files instead of overwriting:
+  `generator::plan` lists the managed files and their jobs,
+  `generator::merge_file` conforms/prunes cibox-owned jobs (ownership via
+  `Rule::owns_job_id`) at the `serde_yaml::Value` level and preserves
+  everything the user added or removed. Missing/empty files and `--force`
+  get the full `generator::render_file` output. The editor TUI still
+  overwrites (it previews a diff).
 
 To add a rule:
 

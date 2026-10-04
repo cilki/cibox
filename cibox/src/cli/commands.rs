@@ -2,7 +2,7 @@ use crate::config::{infer_platform, parse_config, CiboxConfig, Platform};
 use crate::detection::{gather_facts, ProjectFacts};
 use crate::error::Result;
 use crate::rules::{resolve, ResolvedRule};
-use anyhow::{bail, Context};
+use anyhow::Context;
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -59,8 +59,8 @@ fn print_rule_table(resolved: &[ResolvedRule]) {
     }
 }
 
-/// Handle the generate command
-pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: bool) -> Result<()> {
+/// Handle the update command
+pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: bool) -> Result<()> {
     let working_dir = PathBuf::from(".");
     let facts = gather_facts(&working_dir);
     let config = load_config(config_path, config_path != "cibox.ron")?;
@@ -69,39 +69,69 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
 
     println!(
         "{} {} for {}",
-        "Generating".cyan().bold(),
+        "Updating".cyan().bold(),
         "CI configuration".normal(),
         platform.name().yellow()
     );
     print_rule_table(&resolved);
 
-    let outputs = crate::generator::generate(&facts, &resolved, platform)
+    let planned = crate::generator::plan(&facts, &resolved, platform)
         .with_context(|| format!("Failed to generate CI configuration for {platform}"))?;
 
     println!();
-    for (filename, content) in outputs {
-        let output_path = working_dir.join(&filename);
+    for file in planned {
+        let output_path = working_dir.join(&file.path);
+        let path_label = output_path.display().to_string().yellow();
+        let existing = std::fs::read_to_string(&output_path).ok();
 
-        if output_path.exists() && !force {
-            bail!(
-                "File exists: {}. Use --force to overwrite",
-                output_path.display()
-            );
-        }
+        // A missing or empty file gets the full canonical content (as does
+        // --force); a file with content is merged: cibox-owned jobs are
+        // conformed or pruned, everything the user did to it is kept
+        let content = match existing {
+            Some(text) if !force && !text.trim().is_empty() => {
+                match crate::generator::merge_file(platform, &file, &resolved, &text)? {
+                    crate::generator::MergeOutcome::Unchanged => {
+                        println!("  {} {} unchanged", "○".dimmed(), path_label);
+                        continue;
+                    }
+                    crate::generator::MergeOutcome::WouldEmpty => {
+                        println!(
+                            "  {} {} would be left without jobs — remove it yourself if unwanted",
+                            "!".yellow().bold(),
+                            path_label
+                        );
+                        continue;
+                    }
+                    crate::generator::MergeOutcome::Merged {
+                        content,
+                        conformed,
+                        removed,
+                        preserved,
+                    } => {
+                        println!(
+                            "  {} {} ({conformed} updated, {removed} removed, {preserved} custom kept)",
+                            "✓".green().bold(),
+                            path_label
+                        );
+                        content
+                    }
+                }
+            }
+            _ => {
+                if file.jobs.is_empty() {
+                    continue;
+                }
+                println!("  {} {}", "✓".green().bold(), path_label);
+                crate::generator::render_file(platform, &file)?
+            }
+        };
 
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
         }
-
         std::fs::write(&output_path, content)
             .with_context(|| format!("Failed to write file: {}", output_path.display()))?;
-
-        println!(
-            "  {} {}",
-            "✓".green().bold(),
-            output_path.display().to_string().yellow()
-        );
     }
 
     println!("\n{}", "Done!".green().bold());
@@ -204,8 +234,8 @@ pub fn handle_detect(dir: &str) -> Result<()> {
     println!();
     println!("{}", "Next steps:".cyan().bold());
     println!(
-        "  • Run {} to write the pipeline",
-        "cibox generate".yellow()
+        "  • Run {} to write or refresh the pipeline",
+        "cibox update".yellow()
     );
     println!(
         "  • Run {} to adjust rules interactively",

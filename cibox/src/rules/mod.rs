@@ -43,6 +43,13 @@ pub trait Rule {
     /// The jobs this rule contributes. Must work even when the rule was
     /// force-enabled without its facts being present.
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job>;
+
+    /// Whether a job key found in an existing CI file belongs to this rule.
+    /// Rules that emit variant ids beyond `id()` must override this so
+    /// `cibox update` can conform and prune their jobs.
+    fn owns_job_id(&self, id: &str) -> bool {
+        id == self.id()
+    }
 }
 
 /// A rule plus its resolved state for this project + config
@@ -85,6 +92,12 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         }),
         Box::new(DockerRelease {
             image: docker_image,
+            platforms: config
+                .rules
+                .docker_release
+                .platforms
+                .clone()
+                .unwrap_or_default(),
         }),
         Box::new(Gitleaks),
     ];
@@ -185,6 +198,28 @@ mod tests {
     }
 
     #[test]
+    fn test_every_rule_owns_its_emitted_job_ids() {
+        // Guards against a rule emitting variant job ids (like
+        // docker-release-linux) without overriding owns_job_id
+        let mut config = CiboxConfig::default();
+        config.rules.docker_release.platforms = Some(vec![
+            crate::config::DockerPlatform::LinuxAmd64,
+            crate::config::DockerPlatform::WindowsAmd64,
+        ]);
+        let facts = rust_facts();
+        for r in resolve(&facts, &config) {
+            for job in r.rule.jobs(&facts) {
+                assert!(
+                    r.rule.owns_job_id(&job.id),
+                    "rule {} does not own its job id {}",
+                    r.rule.id(),
+                    job.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_every_rule_has_an_enabled_override_slot() {
         let resolved = resolve(&ProjectFacts::default(), &CiboxConfig::default());
         for r in &resolved {
@@ -216,6 +251,30 @@ mod tests {
         assert!(jobs[0].steps.iter().any(|s| matches!(
             s,
             crate::ir::Step::Run { command, .. } if command.contains("-t fossable/cibox")
+        )));
+    }
+
+    #[test]
+    fn test_docker_platforms_knob_flows_into_jobs() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+
+        let mut config = CiboxConfig::default();
+        config.rules.docker_release.platforms = Some(vec![
+            crate::config::DockerPlatform::LinuxAmd64,
+            crate::config::DockerPlatform::LinuxArm64,
+        ]);
+        let resolved = resolve(&facts, &config);
+        let release = resolved
+            .iter()
+            .find(|r| r.rule.id() == "docker-release")
+            .unwrap();
+        let jobs = release.rule.jobs(&facts);
+        assert!(jobs[0].steps.iter().any(|s| matches!(
+            s,
+            crate::ir::Step::Run { command, .. }
+                if command.contains("--platform linux/amd64,linux/arm64")
         )));
     }
 

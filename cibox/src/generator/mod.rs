@@ -1,26 +1,41 @@
 //! Turn resolved rules into output files for a platform.
 
+mod merge;
+
+pub use merge::{merge_file, MergeOutcome};
+
 use crate::config::Platform;
 use crate::detection::ProjectFacts;
 use crate::error::Result;
 use crate::ir::Job;
-use crate::platforms::github::lower::{lower_github, WorkflowKind};
-use crate::platforms::helpers::PlatformConfig;
+use crate::platforms::github::lower::lower_github;
+pub use crate::platforms::github::lower::WorkflowKind;
 use crate::rules::{enabled_jobs, ResolvedRule};
 use anyhow::bail;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// Generate all output files for one platform.
+/// One output file cibox manages: where it goes and the jobs it should hold.
+///
+/// `jobs` may be empty (e.g. a GitHub `release.yml` when no release rules are
+/// enabled) so the update path can strip stale cibox jobs from such a file.
+#[derive(Debug, Clone)]
+pub struct PlannedFile {
+    pub path: PathBuf,
+    pub jobs: Vec<Job>,
+    pub kind: WorkflowKind,
+}
+
+/// Plan the output files for one platform without rendering them.
 ///
 /// GitHub/Gitea get a `ci.yml` for branch/PR jobs and a separate `release.yml`
 /// for tags-only jobs; the other platforms are single-file and gate release
 /// jobs within the document.
-pub fn generate(
+pub fn plan(
     facts: &ProjectFacts,
     resolved: &[ResolvedRule],
     platform: Platform,
-) -> Result<Vec<(PathBuf, String)>> {
+) -> Result<Vec<PlannedFile>> {
     let jobs = enabled_jobs(facts, resolved);
     if jobs.is_empty() {
         bail!("No rules enabled — nothing to generate. Run `cibox detect` to see why.");
@@ -35,45 +50,75 @@ pub fn generate(
             let (release, ci): (Vec<Job>, Vec<Job>) =
                 jobs.into_iter().partition(|job| job.tags_only);
 
-            let mut outputs = Vec::new();
-            if !ci.is_empty() {
-                let workflow = lower_github(&ci, WorkflowKind::Ci);
-                outputs.push((
-                    PathBuf::from(workflow_dir).join("ci.yml"),
-                    serde_yaml::to_string(&workflow)?,
-                ));
-            }
-            if !release.is_empty() {
-                let workflow = lower_github(&release, WorkflowKind::Release);
-                outputs.push((
-                    PathBuf::from(workflow_dir).join("release.yml"),
-                    serde_yaml::to_string(&workflow)?,
-                ));
-            }
-            Ok(outputs)
+            Ok(vec![
+                PlannedFile {
+                    path: PathBuf::from(workflow_dir).join("ci.yml"),
+                    jobs: ci,
+                    kind: WorkflowKind::Ci,
+                },
+                PlannedFile {
+                    path: PathBuf::from(workflow_dir).join("release.yml"),
+                    jobs: release,
+                    kind: WorkflowKind::Release,
+                },
+            ])
         }
-        Platform::GitLab | Platform::CircleCI | Platform::Jenkins => {
-            let lowered = crate::platforms::lower::lower(platform, &jobs)?;
+        Platform::GitLab | Platform::CircleCI => {
+            if let Some(job) = jobs.iter().find(|j| j.runs_on == crate::ir::RunnerOs::Windows) {
+                bail!(
+                    "job '{}' needs a Windows runner, which is only supported on GitHub/Gitea; \
+                     remove WindowsAmd64 from docker_release.platforms or switch platform",
+                    job.id
+                );
+            }
+            Ok(vec![PlannedFile {
+                path: platform.output_path(),
+                jobs,
+                kind: WorkflowKind::Ci,
+            }])
+        }
+    }
+}
+
+/// Render the full canonical content of one planned file.
+pub fn render_file(platform: Platform, file: &PlannedFile) -> Result<String> {
+    match platform {
+        Platform::GitHub | Platform::Gitea => {
+            let workflow = lower_github(&file.jobs, file.kind);
+            Ok(serde_yaml::to_string(&workflow)?)
+        }
+        Platform::GitLab | Platform::CircleCI => {
+            let lowered = crate::platforms::lower::lower(platform, &file.jobs)?;
             let mut content = lowered.render()?;
 
             // These platforms read secrets from ambient CI variables; list
             // what the jobs expect so setup is discoverable
-            let secrets: BTreeSet<&str> = jobs
+            let secrets: BTreeSet<&str> = file
+                .jobs
                 .iter()
                 .flat_map(|job| job.secrets.iter().map(String::as_str))
                 .collect();
             if !secrets.is_empty() {
                 let names = secrets.into_iter().collect::<Vec<_>>().join(", ");
-                let comment = match lowered {
-                    PlatformConfig::Jenkins(_) => format!("// Required CI variables: {names}\n"),
-                    _ => format!("# Required CI variables: {names}\n"),
-                };
-                content.insert_str(0, &comment);
+                content.insert_str(0, &format!("# Required CI variables: {names}\n"));
             }
 
-            Ok(vec![(platform.output_path(), content)])
+            Ok(content)
         }
     }
+}
+
+/// Generate all output files for one platform, skipping empty ones.
+pub fn generate(
+    facts: &ProjectFacts,
+    resolved: &[ResolvedRule],
+    platform: Platform,
+) -> Result<Vec<(PathBuf, String)>> {
+    plan(facts, resolved, platform)?
+        .into_iter()
+        .filter(|file| !file.jobs.is_empty())
+        .map(|file| Ok((file.path.clone(), render_file(platform, &file)?)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -95,6 +140,29 @@ mod tests {
         fs::write(dir.path().join("Dockerfile"), "FROM rust:latest\n").unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
         crate::detection::gather_facts(dir.path())
+    }
+
+    #[test]
+    fn test_plan_always_includes_release_file_for_github() {
+        // Even with every release rule disabled, the release.yml entry is
+        // planned (with no jobs) so `update` can prune stale jobs from it
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rules.rust_release.enabled = Some(false);
+        config.rules.docker_release.enabled = Some(false);
+        let resolved = resolve(&facts, &config);
+
+        let planned = plan(&facts, &resolved, Platform::GitHub).unwrap();
+        let release = planned
+            .iter()
+            .find(|f| f.path.ends_with("release.yml"))
+            .expect("release.yml planned");
+        assert!(release.jobs.is_empty());
+        assert_eq!(release.kind, WorkflowKind::Release);
+
+        // generate() skips the empty file, as before
+        let outputs = generate(&facts, &resolved, Platform::GitHub).unwrap();
+        assert!(outputs.iter().all(|(p, _)| !p.ends_with("release.yml")));
     }
 
     #[test]
@@ -126,7 +194,7 @@ mod tests {
         let facts = full_facts();
         let resolved = resolve(&facts, &CiboxConfig::default());
 
-        for platform in [Platform::GitLab, Platform::CircleCI, Platform::Jenkins] {
+        for platform in [Platform::GitLab, Platform::CircleCI] {
             let outputs = generate(&facts, &resolved, platform).unwrap();
             assert_eq!(outputs.len(), 1, "{platform:?}");
             assert_eq!(outputs[0].0, platform.output_path());
@@ -166,17 +234,53 @@ mod tests {
             let outputs = generate(&facts, &resolved, platform).unwrap();
             assert!(!outputs.is_empty(), "{platform:?} produced no output");
             for (path, content) in outputs {
-                match platform {
-                    Platform::Jenkins => {
-                        assert_eq!(content.matches("pipeline {").count(), 1, "{path:?}")
-                    }
-                    _ => {
-                        serde_yaml::from_str::<serde_yaml::Value>(&content)
-                            .unwrap_or_else(|e| panic!("{path:?} is not valid YAML: {e}"));
-                    }
-                }
+                serde_yaml::from_str::<serde_yaml::Value>(&content)
+                    .unwrap_or_else(|e| panic!("{path:?} is not valid YAML: {e}"));
             }
         }
+    }
+
+    #[test]
+    fn test_mixed_docker_platforms_on_github() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rules.docker_release.platforms = Some(vec![
+            crate::config::DockerPlatform::LinuxAmd64,
+            crate::config::DockerPlatform::WindowsAmd64,
+        ]);
+        let resolved = resolve(&facts, &config);
+
+        let outputs = generate(&facts, &resolved, Platform::GitHub).unwrap();
+        let release = &outputs
+            .iter()
+            .find(|(p, _)| p.ends_with("release.yml"))
+            .unwrap()
+            .1;
+        assert!(release.contains("docker-release-linux"), "{release}");
+        assert!(release.contains("docker-release-windows"), "{release}");
+        assert!(release.contains("windows-latest"), "{release}");
+        assert!(release.contains("imagetools create"), "{release}");
+        assert!(release.contains("needs:"), "{release}");
+    }
+
+    #[test]
+    fn test_windows_platform_errors_outside_github() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rules.docker_release.platforms =
+            Some(vec![crate::config::DockerPlatform::WindowsAmd64]);
+        let resolved = resolve(&facts, &config);
+
+        for platform in [Platform::GitLab, Platform::CircleCI] {
+            let err = generate(&facts, &resolved, platform).unwrap_err();
+            assert!(
+                err.to_string().contains("Windows runner"),
+                "{platform:?}: {err}"
+            );
+        }
+        // GitHub and Gitea are fine
+        generate(&facts, &resolved, Platform::GitHub).unwrap();
+        generate(&facts, &resolved, Platform::Gitea).unwrap();
     }
 
     #[test]

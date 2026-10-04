@@ -25,6 +25,16 @@ impl Stage {
     }
 }
 
+/// Operating system of the runner a job needs. Windows is honored only by
+/// GitHub/Gitea lowering (`runs-on: windows-latest`); the other platforms
+/// refuse to generate windows jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunnerOs {
+    #[default]
+    Linux,
+    Windows,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cache {
     pub key: String,
@@ -33,7 +43,7 @@ pub struct Cache {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
-    /// Fetch the repository. Implicit on GitLab/Jenkins; `full_history`
+    /// Fetch the repository. Implicit on GitLab; `full_history`
     /// disables shallow cloning where the platform defaults to it.
     Checkout { full_history: bool },
     /// Run a shell command
@@ -65,14 +75,13 @@ pub struct Job {
     /// Unique job key, by convention the id of the rule that produced it
     /// (e.g. "rust-test")
     pub id: String,
-    /// Human name used for Jenkins stage names and step grouping
+    /// Human name used for step grouping
     pub name: String,
     pub stage: Stage,
     /// Container image to run in; None = the platform's default runner
     pub image: Option<String>,
     /// Job invokes the docker CLI and needs a daemon: GitHub runs on the host
-    /// runner, GitLab uses docker:latest, CircleCI adds setup_remote_docker,
-    /// Jenkins runs directly on the agent
+    /// runner, GitLab uses docker:latest, CircleCI adds setup_remote_docker
     pub needs_docker: bool,
     pub steps: Vec<Step>,
     pub timeout_minutes: Option<u32>,
@@ -80,7 +89,7 @@ pub struct Job {
     /// trigger on GitHub)
     pub tags_only: bool,
     pub cache: Option<Cache>,
-    /// Paths preserved as build artifacts (no-op on Jenkins)
+    /// Paths preserved as build artifacts
     pub artifacts: Vec<String>,
     pub env: Vec<(String, String)>,
     /// Secret names the job reads as env vars. GitHub maps each to
@@ -88,6 +97,8 @@ pub struct Job {
     pub secrets: Vec<String>,
     /// Ids of other jobs this one depends on
     pub needs: Vec<String>,
+    /// Runner operating system; Linux unless the job can only run on Windows
+    pub runs_on: RunnerOs,
 }
 
 impl Job {
@@ -106,6 +117,7 @@ impl Job {
             env: Vec::new(),
             secrets: Vec::new(),
             needs: Vec::new(),
+            runs_on: RunnerOs::default(),
         }
     }
 
@@ -149,6 +161,16 @@ impl Job {
 
     pub fn with_secrets(mut self, secrets: Vec<String>) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    pub fn with_needs(mut self, needs: Vec<String>) -> Self {
+        self.needs = needs;
+        self
+    }
+
+    pub fn on_windows(mut self) -> Self {
+        self.runs_on = RunnerOs::Windows;
         self
     }
 }

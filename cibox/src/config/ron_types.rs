@@ -72,8 +72,8 @@ pub struct Rules {
     #[serde(skip_serializing_if = "DockerRule::is_default")]
     pub docker_build: DockerRule,
     /// Build and push the image to a registry on version tags
-    #[serde(skip_serializing_if = "DockerRule::is_default")]
-    pub docker_release: DockerRule,
+    #[serde(skip_serializing_if = "DockerReleaseRule::is_default")]
+    pub docker_release: DockerReleaseRule,
     /// Scan the full git history for hardcoded secrets
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub gitleaks: RuleToggle,
@@ -88,7 +88,7 @@ pub struct RuleToggle {
     pub enabled: Option<bool>,
 }
 
-/// Override for the docker rules: toggle plus image name
+/// Override for the docker-build rule: toggle plus image name
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockerRule {
@@ -101,6 +101,69 @@ pub struct DockerRule {
     pub image_name: Option<String>,
 }
 
+/// Override for the docker-release rule: toggle, image name, and target
+/// platforms
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockerReleaseRule {
+    /// Force this rule on or off; omit to let detection decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Image name, e.g. "fossable/cibox". Setting it on either docker rule
+    /// applies to both; the default is derived from the git remote. Must not
+    /// include a tag when `platforms` is set — multi-arch staging tags are
+    /// appended to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+    /// Target platforms for a multi-arch image, e.g. [LinuxAmd64, LinuxArm64].
+    /// Omit for a plain single-arch build on the host runner. Linux platforms
+    /// build in one buildx+QEMU job; WindowsAmd64 adds a Windows-runner job
+    /// (GitHub/Gitea only, and the Dockerfile must support a Windows base) and
+    /// the final tag becomes a merged multi-platform manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<DockerPlatform>>,
+}
+
+/// A target platform for a multi-arch docker image
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DockerPlatform {
+    /// linux/amd64
+    LinuxAmd64,
+    /// linux/arm64
+    LinuxArm64,
+    /// linux/arm/v7 (32-bit ARM)
+    LinuxArmV7,
+    /// linux/riscv64
+    LinuxRiscv64,
+    /// windows/amd64 — built on a Windows runner; GitHub/Gitea only
+    WindowsAmd64,
+}
+
+impl DockerPlatform {
+    pub const ALL: [DockerPlatform; 5] = [
+        DockerPlatform::LinuxAmd64,
+        DockerPlatform::LinuxArm64,
+        DockerPlatform::LinuxArmV7,
+        DockerPlatform::LinuxRiscv64,
+        DockerPlatform::WindowsAmd64,
+    ];
+
+    /// The docker platform string, e.g. "linux/amd64"
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DockerPlatform::LinuxAmd64 => "linux/amd64",
+            DockerPlatform::LinuxArm64 => "linux/arm64",
+            DockerPlatform::LinuxArmV7 => "linux/arm/v7",
+            DockerPlatform::LinuxRiscv64 => "linux/riscv64",
+            DockerPlatform::WindowsAmd64 => "windows/amd64",
+        }
+    }
+
+    pub fn is_windows(&self) -> bool {
+        matches!(self, DockerPlatform::WindowsAmd64)
+    }
+}
+
 impl RuleToggle {
     pub fn is_default(&self) -> bool {
         self.enabled.is_none()
@@ -110,6 +173,12 @@ impl RuleToggle {
 impl DockerRule {
     pub fn is_default(&self) -> bool {
         self.enabled.is_none() && self.image_name.is_none()
+    }
+}
+
+impl DockerReleaseRule {
+    pub fn is_default(&self) -> bool {
+        self.enabled.is_none() && self.image_name.is_none() && self.platforms.is_none()
     }
 }
 
@@ -243,6 +312,33 @@ mod tests {
 
         let parsed = parse_config(&ron_str).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn test_parse_docker_platforms() {
+        let config = parse_config(
+            r#"(rules: (docker_release: (platforms: [LinuxArm64, WindowsAmd64])))"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.rules.docker_release.platforms,
+            Some(vec![
+                DockerPlatform::LinuxArm64,
+                DockerPlatform::WindowsAmd64
+            ])
+        );
+        assert_eq!(config.rules.docker_release.enabled, None);
+    }
+
+    #[test]
+    fn test_docker_platforms_round_trip() {
+        let mut config = CiboxConfig::default();
+        config.rules.docker_release.platforms =
+            Some(vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64]);
+        let ron_str = serialize_config(&config).unwrap();
+        assert!(ron_str.contains("platforms"), "{ron_str}");
+        assert!(!ron_str.contains("image_name"), "{ron_str}");
+        assert_eq!(parse_config(&ron_str).unwrap(), config);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::platforms::helpers::PlatformConfig;
 
 /// Lower jobs into a single platform config document.
 ///
-/// GitLab/CircleCI/Jenkins gate tags-only jobs within the one document. For
+/// GitLab/CircleCI gate tags-only jobs within the one document. For
 /// GitHub/Gitea this produces a CI workflow where tags-only jobs are guarded
 /// by an `if:` expression; the generator normally splits them into a separate
 /// release workflow instead.
@@ -28,6 +28,5 @@ pub fn lower(platform: Platform, jobs: &[Job]) -> Result<PlatformConfig> {
         Platform::CircleCI => {
             PlatformConfig::CircleCI(super::circleci::lower::lower_circleci(jobs))
         }
-        Platform::Jenkins => PlatformConfig::Jenkins(super::jenkins::lower::lower_jenkins(jobs)),
     })
 }

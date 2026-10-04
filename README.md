@@ -29,7 +29,6 @@ another CI platform.
 - Github Actions
 - Gitlab
 - Circle CI
-- Jenkins
 - Gitea
 
 ## How it works
@@ -41,15 +40,21 @@ Docker rules, a publishable package enables its release rule — and contributes
 jobs to the generated pipeline. Release rules run only on `v*` git tags (e.g.
 `rust-release` runs `cargo publish`).
 
-Running `cibox generate` in a project with no configuration at all produces a
+Running `cibox update` in a project with no configuration at all produces a
 working pipeline: detection picks the rules and the target platform is
 inferred from existing CI files or your git remote.
 
 ```
 $ cibox detect      # show project facts and which rules fired
-$ cibox generate    # write the pipeline files
+$ cibox update      # write or refresh the pipeline files
 $ cibox             # interactive TUI to toggle rules
 ```
+
+`cibox update` is safe to re-run after you customize the generated files. It
+conforms the jobs cibox manages to its current output, removes managed jobs
+whose rule you disabled, and leaves everything else alone: jobs you deleted
+stay deleted, and jobs you added are kept. Pass `--force` to rewrite the
+files from scratch instead.
 
 ## `cibox.ron`
 

@@ -6,11 +6,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Generate {
+        Some(Commands::Update {
             config,
             platform,
             force,
-        }) => cibox::cli::commands::handle_generate(&config, platform, force),
+        }) => cibox::cli::commands::handle_update(&config, platform, force),
         Some(Commands::Validate { config }) => cibox::cli::commands::handle_validate(&config),
         Some(Commands::Editor { dir }) => cibox::editor::run_with_args(&dir, None),
         Some(Commands::Detect { dir }) => cibox::cli::commands::handle_detect(&dir),

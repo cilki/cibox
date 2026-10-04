@@ -1,4 +1,4 @@
-use crate::editor::state::{EditorState, Platform};
+use crate::editor::state::{EditorState, Platform, Row, RuleRow};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -103,35 +103,71 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
     for (i, row) in state.rows.iter().enumerate() {
         let is_selected = i == state.cursor;
 
-        let checkbox = if row.enabled { "[✓]" } else { "[ ]" };
-        let checkbox_color = match (row.enabled, row.detected) {
-            (true, true) => Color::Green,
-            (true, false) => Color::Yellow,
-            _ => Color::DarkGray,
+        let line = match row {
+            Row::Rule(rule) => rule_line(rule, is_selected),
+            Row::TextKnob {
+                rule_id,
+                label,
+                override_value,
+                effective,
+                ..
+            } => {
+                let editing = state
+                    .input
+                    .as_ref()
+                    .filter(|input| input.rule_id == *rule_id);
+                if let Some(input) = editing {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("       {label}: "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{}▏", input.buffer),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ])
+                } else {
+                    let overridden = override_value.is_some();
+                    let value_color = match (is_selected, overridden) {
+                        (true, _) => Color::Yellow,
+                        (false, true) => Color::White,
+                        (false, false) => Color::DarkGray,
+                    };
+                    let marker = if overridden { " *" } else { "" };
+                    Line::from(vec![
+                        Span::styled(
+                            format!("       {label}: "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{effective}{marker}"),
+                            Style::default().fg(value_color),
+                        ),
+                    ])
+                }
+            }
+            Row::ArchOption { arch, selected } => {
+                let checkbox = if *selected { "[✓]" } else { "[ ]" };
+                let checkbox_color = if *selected {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                };
+                let text_color = match (is_selected, selected) {
+                    (true, _) => Color::Yellow,
+                    (false, true) => Color::White,
+                    (false, false) => Color::DarkGray,
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!("     {checkbox} "),
+                        Style::default().fg(checkbox_color),
+                    ),
+                    Span::styled(arch.as_str(), Style::default().fg(text_color)),
+                ])
+            }
         };
-
-        let text_color = if is_selected {
-            Color::Yellow
-        } else if row.enabled {
-            Color::White
-        } else {
-            Color::DarkGray
-        };
-
-        // Mark rules whose state is overridden in cibox.ron
-        let marker = if row.overridden() { " *" } else { "" };
-
-        let line = Line::from(vec![
-            Span::styled(format!(" {checkbox} "), Style::default().fg(checkbox_color)),
-            Span::styled(
-                format!("{}{}", row.id, marker),
-                Style::default().fg(text_color),
-            ),
-            Span::styled(
-                format!("  {}", row.name),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
 
         let item_style = if is_selected {
             Style::default().add_modifier(Modifier::BOLD)
@@ -150,6 +186,46 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
     );
 
     f.render_widget(list, area);
+}
+
+fn rule_line(row: &RuleRow, is_selected: bool) -> Line<'static> {
+    let checkbox = if row.enabled { "[✓]" } else { "[ ]" };
+    let checkbox_color = match (row.enabled, row.detected) {
+        (true, true) => Color::Green,
+        (true, false) => Color::Yellow,
+        _ => Color::DarkGray,
+    };
+
+    let text_color = if is_selected {
+        Color::Yellow
+    } else if row.enabled {
+        Color::White
+    } else {
+        Color::DarkGray
+    };
+
+    // Expand indicator for rules with config options
+    let arrow = match (row.expandable, row.expanded) {
+        (true, true) => "▾ ",
+        (true, false) => "▸ ",
+        (false, _) => "  ",
+    };
+
+    // Mark rules whose state is overridden in cibox.ron
+    let marker = if row.overridden() { " *" } else { "" };
+
+    Line::from(vec![
+        Span::styled(format!(" {checkbox} "), Style::default().fg(checkbox_color)),
+        Span::styled(arrow.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}{}", row.id, marker),
+            Style::default().fg(text_color),
+        ),
+        Span::styled(
+            format!("  {}", row.name),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
 }
 
 fn render_preview_panel(f: &mut Frame, area: Rect, state: &EditorState) {
@@ -524,7 +600,15 @@ fn highlight_yaml(yaml: &str) -> Vec<Line<'_>> {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &EditorState) {
-    let help_text = if state.platform_menu_open {
+    let help_text = if state.input.is_some() {
+        vec![
+            Span::raw("type to edit | "),
+            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::raw(" save | "),
+            Span::styled("Esc", Style::default().fg(Color::Red)),
+            Span::raw(" cancel"),
+        ]
+    } else if state.platform_menu_open {
         vec![
             Span::styled("↑↓/jk", Style::default().fg(Color::Blue)),
             Span::raw(" navigate | "),
@@ -536,7 +620,9 @@ fn render_footer(f: &mut Frame, area: Rect, state: &EditorState) {
     } else {
         vec![
             Span::styled("Space/Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" toggle rule | "),
+            Span::raw(" toggle/edit | "),
+            Span::styled("←→/hl", Style::default().fg(Color::Yellow)),
+            Span::raw(" options | "),
             Span::styled("↑↓/jk", Style::default().fg(Color::Blue)),
             Span::raw(" navigate | "),
             Span::styled("JK", Style::default().fg(Color::Magenta)),

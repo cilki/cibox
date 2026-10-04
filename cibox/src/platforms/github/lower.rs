@@ -1,6 +1,7 @@
-use crate::ir::{Job, Step};
+use crate::ir::{Job, RunnerOs, Step};
 use crate::platforms::github::models::{
-    GitHubJob, GitHubStep, GitHubTriggerConfig, GitHubTriggers, GitHubWorkflow,
+    GitHubDefaults, GitHubJob, GitHubRunDefaults, GitHubStep, GitHubTriggerConfig, GitHubTriggers,
+    GitHubWorkflow,
 };
 use std::collections::BTreeMap;
 
@@ -129,7 +130,17 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
     }
 
     GitHubJob {
-        runs_on: "ubuntu-latest".to_string(),
+        runs_on: match job.runs_on {
+            RunnerOs::Linux => "ubuntu-latest",
+            RunnerOs::Windows => "windows-latest",
+        }
+        .to_string(),
+        // Generated commands are POSIX shell; windows-latest ships Git Bash
+        defaults: (job.runs_on == RunnerOs::Windows).then(|| GitHubDefaults {
+            run: GitHubRunDefaults {
+                shell: "bash".to_string(),
+            },
+        }),
         // Docker-daemon jobs run directly on the host runner
         container: if job.needs_docker {
             None
@@ -235,6 +246,24 @@ mod tests {
             workflow.jobs["rust-release"].if_expr.as_deref(),
             Some("startsWith(github.ref, 'refs/tags/v')")
         );
+    }
+
+    #[test]
+    fn test_windows_job_runs_on_windows_with_bash() {
+        let workflow = lower_github(
+            &[
+                Job::new("docker-release-windows", "Docker push (windows)", Stage::Deploy)
+                    .on_windows(),
+                Job::new("docker-release-linux", "Docker push (linux)", Stage::Deploy),
+            ],
+            WorkflowKind::Release,
+        );
+        let windows = &workflow.jobs["docker-release-windows"];
+        assert_eq!(windows.runs_on, "windows-latest");
+        assert_eq!(windows.defaults.as_ref().unwrap().run.shell, "bash");
+        let linux = &workflow.jobs["docker-release-linux"];
+        assert_eq!(linux.runs_on, "ubuntu-latest");
+        assert_eq!(linux.defaults, None);
     }
 
     #[test]

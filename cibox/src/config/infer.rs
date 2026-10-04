@@ -36,10 +36,10 @@ mod tests {
     #[test]
     fn test_existing_ci_wins_over_remote() {
         let facts = ProjectFacts {
-            existing_ci: vec![Platform::Jenkins],
+            existing_ci: vec![Platform::CircleCI],
             remote_host: Some(RemoteHost::GitLab),
             ..ProjectFacts::default()
         };
-        assert_eq!(infer_platform(&facts), Platform::Jenkins);
+        assert_eq!(infer_platform(&facts), Platform::CircleCI);
     }
 }

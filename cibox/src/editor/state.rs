@@ -1,12 +1,16 @@
-use crate::config::{infer_platform, serialize_config, CiboxConfig};
+use crate::config::{infer_platform, serialize_config, CiboxConfig, DockerPlatform};
 use crate::detection::ProjectFacts;
 use crate::error::Result;
 use crate::rules::resolve;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub use crate::config::Platform;
 
-/// One row in the rule checklist
+/// Rules whose config options can be expanded inline
+const EXPANDABLE_RULES: [&str; 2] = ["docker-build", "docker-release"];
+
+/// A rule line in the checklist
 #[derive(Debug, Clone)]
 pub struct RuleRow {
     pub id: &'static str,
@@ -14,6 +18,9 @@ pub struct RuleRow {
     pub description: &'static str,
     pub detected: bool,
     pub enabled: bool,
+    /// Whether this rule has config options to expand
+    pub expandable: bool,
+    pub expanded: bool,
 }
 
 impl RuleRow {
@@ -21,6 +28,31 @@ impl RuleRow {
     pub fn overridden(&self) -> bool {
         self.enabled != self.detected
     }
+}
+
+/// One row in the rules panel: a rule, or one config option of an expanded rule
+#[derive(Debug, Clone)]
+pub enum Row {
+    Rule(RuleRow),
+    /// A string knob (e.g. image_name)
+    TextKnob {
+        rule_id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        /// The cibox.ron override, if any
+        override_value: Option<String>,
+        /// The value in effect (facts-derived default when not overridden)
+        effective: String,
+    },
+    /// One target-platform checkbox under docker-release
+    ArchOption { arch: DockerPlatform, selected: bool },
+}
+
+/// In-progress edit of a text knob
+#[derive(Debug, Clone)]
+pub struct KnobInput {
+    pub rule_id: &'static str,
+    pub buffer: String,
 }
 
 pub struct EditorState {
@@ -38,8 +70,12 @@ pub struct EditorState {
     pub platform: Platform,
 
     // Rule checklist
-    pub rows: Vec<RuleRow>,
+    pub rows: Vec<Row>,
     pub cursor: usize,
+    /// Ids of rules whose config options are shown
+    pub expanded: HashSet<&'static str>,
+    /// Text knob currently being edited, if any
+    pub input: Option<KnobInput>,
 
     // UI state
     pub platform_menu_open: bool,
@@ -88,6 +124,8 @@ impl EditorState {
             platform,
             rows: Vec::new(),
             cursor: 0,
+            expanded: HashSet::new(),
+            input: None,
             platform_menu_open: false,
             platform_menu_cursor: Platform::all()
                 .iter()
@@ -107,19 +145,72 @@ impl EditorState {
         Ok(state)
     }
 
+    /// The image name detection would use without any override
+    fn default_image(&self) -> String {
+        self.facts
+            .repo_slug
+            .clone()
+            .unwrap_or_else(|| self.facts.dir_name.clone())
+    }
+
+    /// The image name in effect, mirroring the precedence in rules::resolve
+    fn effective_image(&self) -> String {
+        self.config
+            .rules
+            .docker_build
+            .image_name
+            .clone()
+            .or_else(|| self.config.rules.docker_release.image_name.clone())
+            .unwrap_or_else(|| self.default_image())
+    }
+
     /// Re-resolve rules against the current config and regenerate the preview
     pub fn refresh(&mut self) {
         let resolved = resolve(&self.facts, &self.config);
-        self.rows = resolved
-            .iter()
-            .map(|r| RuleRow {
-                id: r.rule.id(),
+        self.rows = Vec::new();
+        for r in &resolved {
+            let id = r.rule.id();
+            let expandable = EXPANDABLE_RULES.contains(&id);
+            let expanded = expandable && self.expanded.contains(id);
+            self.rows.push(Row::Rule(RuleRow {
+                id,
                 name: r.rule.name(),
                 description: r.rule.description(),
                 detected: r.detected,
                 enabled: r.enabled,
-            })
-            .collect();
+                expandable,
+                expanded,
+            }));
+            if expanded {
+                let override_value = match id {
+                    "docker-build" => self.config.rules.docker_build.image_name.clone(),
+                    _ => self.config.rules.docker_release.image_name.clone(),
+                };
+                self.rows.push(Row::TextKnob {
+                    rule_id: id,
+                    label: "image_name",
+                    description: "Image name, e.g. \"fossable/cibox\"; applies to both docker \
+                                  rules. Press Enter to edit.",
+                    override_value,
+                    effective: self.effective_image(),
+                });
+                if id == "docker-release" {
+                    let selected = self
+                        .config
+                        .rules
+                        .docker_release
+                        .platforms
+                        .clone()
+                        .unwrap_or_default();
+                    for arch in DockerPlatform::ALL {
+                        self.rows.push(Row::ArchOption {
+                            arch,
+                            selected: selected.contains(&arch),
+                        });
+                    }
+                }
+            }
+        }
         if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
         }
@@ -145,23 +236,131 @@ impl EditorState {
         }
     }
 
-    pub fn current_row(&self) -> Option<&RuleRow> {
+    pub fn current_row(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
     }
 
-    /// Flip the rule under the cursor. An override matching detection is
+    /// Activate the row under the cursor: toggle a rule or arch checkbox, or
+    /// start editing a text knob
+    pub fn activate_current(&mut self) {
+        match self.rows.get(self.cursor).cloned() {
+            Some(Row::Rule(rule)) => self.toggle_rule(&rule),
+            Some(Row::TextKnob {
+                rule_id, effective, ..
+            }) => {
+                self.input = Some(KnobInput {
+                    rule_id,
+                    buffer: effective,
+                });
+            }
+            Some(Row::ArchOption { arch, .. }) => self.toggle_arch(arch),
+            None => {}
+        }
+    }
+
+    /// Flip a rule's enabled state. An override matching detection is
     /// removed, so cibox.ron stays delta-only.
-    pub fn toggle_current(&mut self) {
-        let Some(row) = self.rows.get(self.cursor) else {
-            return;
-        };
-        let new_enabled = !row.enabled;
-        let override_value = (new_enabled != row.detected).then_some(new_enabled);
+    fn toggle_rule(&mut self, rule: &RuleRow) {
+        let new_enabled = !rule.enabled;
+        let override_value = (new_enabled != rule.detected).then_some(new_enabled);
         self.config
             .rules
-            .set_enabled_override(row.id, override_value);
+            .set_enabled_override(rule.id, override_value);
         self.refresh();
         self.auto_save_ron();
+    }
+
+    /// Flip one docker-release target platform; an empty selection collapses
+    /// back to "unset" so cibox.ron stays delta-only
+    pub fn toggle_arch(&mut self, arch: DockerPlatform) {
+        let mut selected = self
+            .config
+            .rules
+            .docker_release
+            .platforms
+            .clone()
+            .unwrap_or_default();
+        if let Some(pos) = selected.iter().position(|p| *p == arch) {
+            selected.remove(pos);
+        } else {
+            selected.push(arch);
+        }
+        let selected: Vec<DockerPlatform> = DockerPlatform::ALL
+            .iter()
+            .copied()
+            .filter(|p| selected.contains(p))
+            .collect();
+        self.config.rules.docker_release.platforms = (!selected.is_empty()).then_some(selected);
+        self.refresh();
+        self.auto_save_ron();
+    }
+
+    /// Commit the text knob being edited. A value matching the facts-derived
+    /// default (or an empty one) removes the override.
+    pub fn commit_input(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let value = input.buffer.trim().to_string();
+        let override_value = (!value.is_empty() && value != self.default_image()).then_some(value);
+        match input.rule_id {
+            "docker-build" => self.config.rules.docker_build.image_name = override_value,
+            "docker-release" => self.config.rules.docker_release.image_name = override_value,
+            _ => {}
+        }
+        self.refresh();
+        self.auto_save_ron();
+    }
+
+    pub fn cancel_input(&mut self) {
+        self.input = None;
+    }
+
+    pub fn input_push(&mut self, c: char) {
+        if let Some(input) = &mut self.input {
+            input.buffer.push(c);
+        }
+    }
+
+    pub fn input_backspace(&mut self) {
+        if let Some(input) = &mut self.input {
+            input.buffer.pop();
+        }
+    }
+
+    /// Show the config options of the rule under the cursor
+    pub fn expand_current(&mut self) {
+        if let Some(Row::Rule(rule)) = self.rows.get(self.cursor) {
+            if rule.expandable && self.expanded.insert(rule.id) {
+                self.refresh();
+            }
+        }
+    }
+
+    /// Index of the rule row owning the row at `idx`
+    fn parent_rule_index(&self, mut idx: usize) -> Option<usize> {
+        loop {
+            if matches!(self.rows.get(idx)?, Row::Rule(_)) {
+                return Some(idx);
+            }
+            idx = idx.checked_sub(1)?;
+        }
+    }
+
+    /// Hide the config options of the rule under the cursor (jumping to the
+    /// parent rule first when on a child row)
+    pub fn collapse_current(&mut self) {
+        let Some(parent) = self.parent_rule_index(self.cursor) else {
+            return;
+        };
+        let Some(Row::Rule(rule)) = self.rows.get(parent) else {
+            return;
+        };
+        if self.expanded.remove(rule.id) {
+            self.cursor = parent;
+            self.refresh();
+            self.update_current_item_description();
+        }
     }
 
     pub fn cycle_platform(&mut self) {
@@ -200,10 +399,15 @@ impl EditorState {
     }
 
     pub fn update_current_item_description(&mut self) {
-        self.current_item_description = self
-            .current_row()
-            .map(|row| row.description.to_string())
-            .unwrap_or_default();
+        self.current_item_description = match self.current_row() {
+            Some(Row::Rule(row)) => row.description.to_string(),
+            Some(Row::TextKnob { description, .. }) => description.to_string(),
+            Some(Row::ArchOption { arch, .. }) => format!(
+                "Include {} in the released multi-arch image",
+                arch.as_str()
+            ),
+            None => String::new(),
+        };
     }
 
     pub fn scroll_preview_up(&mut self) {
@@ -250,9 +454,34 @@ mod tests {
         dir
     }
 
+    fn docker_dir() -> tempfile::TempDir {
+        let dir = rust_dir();
+        fs::write(dir.path().join("Dockerfile"), "FROM rust:latest\n").unwrap();
+        dir
+    }
+
     fn state_for(dir: &std::path::Path) -> EditorState {
         let facts = crate::detection::gather_facts(dir);
         EditorState::new(facts, None, dir.to_path_buf()).unwrap()
+    }
+
+    fn rule_row<'a>(state: &'a EditorState, id: &str) -> &'a RuleRow {
+        state
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Rule(row) if row.id == id => Some(row),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn rule_index(state: &EditorState, id: &str) -> usize {
+        state
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Rule(row) if row.id == id))
+            .unwrap()
     }
 
     #[test]
@@ -260,11 +489,10 @@ mod tests {
         let dir = rust_dir();
         let state = state_for(dir.path());
 
-        let row = |id: &str| state.rows.iter().find(|r| r.id == id).unwrap().clone();
-        assert!(row("rust-test").enabled);
-        assert!(row("rust-release").enabled);
-        assert!(!row("go-test").enabled);
-        assert!(!row("docker-build").enabled);
+        assert!(rule_row(&state, "rust-test").enabled);
+        assert!(rule_row(&state, "rust-release").enabled);
+        assert!(!rule_row(&state, "go-test").enabled);
+        assert!(!rule_row(&state, "docker-build").enabled);
         assert!(state.yaml_preview.contains("cargo test"));
     }
 
@@ -274,16 +502,16 @@ mod tests {
         let mut state = state_for(dir.path());
 
         // Disable a detected rule
-        state.cursor = state.rows.iter().position(|r| r.id == "rust-fmt").unwrap();
-        state.toggle_current();
-        assert!(!state.rows[state.cursor].enabled);
+        state.cursor = rule_index(&state, "rust-fmt");
+        state.activate_current();
+        assert!(!rule_row(&state, "rust-fmt").enabled);
 
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         assert!(ron_str.contains("rust_fmt"), "{ron_str}");
         assert!(!ron_str.contains("rust_test"), "{ron_str}");
 
         // Toggling back removes the override entirely
-        state.toggle_current();
+        state.activate_current();
         assert!(state.config.rules.is_default());
     }
 
@@ -317,7 +545,7 @@ mod tests {
         )
         .unwrap();
         let state = state_for(dir.path());
-        let row = state.rows.iter().find(|r| r.id == "rust-test").unwrap();
+        let row = rule_row(&state, "rust-test");
         assert!(row.detected);
         assert!(!row.enabled);
         assert!(row.overridden());
@@ -325,12 +553,115 @@ mod tests {
 
     #[test]
     fn test_preview_shows_merged_pipeline_for_multiple_environments() {
-        let dir = rust_dir();
-        fs::write(dir.path().join("Dockerfile"), "FROM rust:latest\n").unwrap();
+        let dir = docker_dir();
         let state = state_for(dir.path());
         // GitHub preview concatenates ci.yml and release.yml
         assert!(state.yaml_preview.contains("cargo test"), "{}", state.yaml_preview);
         assert!(state.yaml_preview.contains("docker build"), "{}", state.yaml_preview);
         assert!(state.yaml_preview.contains("release.yml"), "{}", state.yaml_preview);
+    }
+
+    #[test]
+    fn test_expand_shows_config_option_rows() {
+        let dir = docker_dir();
+        let mut state = state_for(dir.path());
+
+        // Only expandable rules react to expand
+        state.cursor = rule_index(&state, "rust-test");
+        state.expand_current();
+        assert_eq!(
+            state.rows.len(),
+            16,
+            "non-expandable rule must not grow the list"
+        );
+
+        state.cursor = rule_index(&state, "docker-release");
+        state.expand_current();
+        assert!(rule_row(&state, "docker-release").expanded);
+        let idx = rule_index(&state, "docker-release");
+        assert!(matches!(
+            state.rows[idx + 1],
+            Row::TextKnob { label: "image_name", .. }
+        ));
+        // image_name + one row per DockerPlatform
+        assert_eq!(state.rows.len(), 16 + 1 + DockerPlatform::ALL.len());
+
+        // Collapsing from a child row jumps back to the parent
+        state.cursor = idx + 2;
+        state.collapse_current();
+        assert_eq!(state.cursor, rule_index(&state, "docker-release"));
+        assert_eq!(state.rows.len(), 16);
+    }
+
+    #[test]
+    fn test_arch_toggle_is_delta_only() {
+        let dir = docker_dir();
+        let mut state = state_for(dir.path());
+
+        state.cursor = rule_index(&state, "docker-release");
+        state.expand_current();
+
+        state.toggle_arch(DockerPlatform::LinuxArm64);
+        state.toggle_arch(DockerPlatform::LinuxAmd64);
+        // Stored in ALL order regardless of toggle order
+        assert_eq!(
+            state.config.rules.docker_release.platforms,
+            Some(vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64])
+        );
+        let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
+        assert!(ron_str.contains("LinuxArm64"), "{ron_str}");
+        assert!(state.yaml_preview.contains("buildx"), "{}", state.yaml_preview);
+
+        // Unselecting everything removes the key entirely
+        state.toggle_arch(DockerPlatform::LinuxArm64);
+        state.toggle_arch(DockerPlatform::LinuxAmd64);
+        assert!(state.config.rules.is_default());
+    }
+
+    #[test]
+    fn test_image_name_editing() {
+        let dir = docker_dir();
+        let mut state = state_for(dir.path());
+        let default = state.default_image();
+
+        state.cursor = rule_index(&state, "docker-build");
+        state.expand_current();
+        state.cursor = rule_index(&state, "docker-build") + 1;
+
+        // Enter starts editing prefilled with the effective value
+        state.activate_current();
+        assert_eq!(state.input.as_ref().unwrap().buffer, default);
+
+        // Esc cancels without touching the config
+        state.cancel_input();
+        assert!(state.config.rules.is_default());
+
+        // Typing a custom name stores the override
+        state.activate_current();
+        for _ in 0..state.input.as_ref().unwrap().buffer.len() {
+            state.input_backspace();
+        }
+        for c in "fossable/cibox".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(
+            state.config.rules.docker_build.image_name.as_deref(),
+            Some("fossable/cibox")
+        );
+        assert!(state.yaml_preview.contains("fossable/cibox"));
+
+        // Committing the facts default clears the override
+        state.cursor = rule_index(&state, "docker-build") + 1;
+        state.activate_current();
+        let buffer_len = state.input.as_ref().unwrap().buffer.len();
+        for _ in 0..buffer_len {
+            state.input_backspace();
+        }
+        for c in default.chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert!(state.config.rules.is_default());
     }
 }

@@ -13,8 +13,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Generate CI config from detected rules (cibox.ron overrides optional)
-    Generate {
+    /// Update CI config in place: conform and prune cibox-managed jobs,
+    /// keeping jobs you added and respecting jobs you removed
+    Update {
         /// Path to cibox.ron override file (optional)
         #[arg(default_value = "cibox.ron")]
         config: String,
@@ -23,7 +24,7 @@ pub enum Commands {
         #[arg(short, long)]
         platform: Option<String>,
 
-        /// Force overwrite existing files
+        /// Rewrite files completely: re-add dropped jobs and discard customizations
         #[arg(short, long)]
         force: bool,
     },

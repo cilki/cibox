@@ -67,7 +67,6 @@ fn existing_ci(path: &Path) -> Vec<Platform> {
             Platform::Gitea => path.join(".gitea/workflows").is_dir(),
             Platform::GitLab => path.join(".gitlab-ci.yml").is_file(),
             Platform::CircleCI => path.join(".circleci").is_dir(),
-            Platform::Jenkins => path.join("Jenkinsfile").is_file(),
         }
     };
     Platform::all().into_iter().filter(|&p| present(p)).collect()

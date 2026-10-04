@@ -19,7 +19,6 @@ pub enum Platform {
     Gitea,
     GitLab,
     CircleCI,
-    Jenkins,
 }
 
 impl Platform {
@@ -29,7 +28,6 @@ impl Platform {
             Platform::Gitea,
             Platform::GitLab,
             Platform::CircleCI,
-            Platform::Jenkins,
         ]
     }
 
@@ -39,7 +37,6 @@ impl Platform {
             Platform::Gitea => "Gitea Actions",
             Platform::GitLab => "GitLab CI",
             Platform::CircleCI => "CircleCI",
-            Platform::Jenkins => "Jenkins",
         }
     }
 
@@ -49,7 +46,6 @@ impl Platform {
             Platform::Gitea => PathBuf::from(".gitea/workflows/ci.yml"),
             Platform::GitLab => PathBuf::from(".gitlab-ci.yml"),
             Platform::CircleCI => PathBuf::from(".circleci/config.yml"),
-            Platform::Jenkins => PathBuf::from("Jenkinsfile"),
         }
     }
 }

@@ -30,6 +30,8 @@ pub struct GitHubJob {
     #[serde(rename = "runs-on")]
     pub runs_on: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<GitHubDefaults>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
@@ -42,6 +44,16 @@ pub struct GitHubJob {
     pub continue_on_error: Option<bool>,
     #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
     pub if_expr: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitHubDefaults {
+    pub run: GitHubRunDefaults,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitHubRunDefaults {
+    pub shell: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,6 +84,7 @@ mod tests {
                 "test".to_string(),
                 GitHubJob {
                     runs_on: "ubuntu-latest".to_string(),
+                    defaults: None,
                     container: None,
                     env: None,
                     steps: vec![GitHubStep {
