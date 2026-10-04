@@ -1,110 +1,87 @@
-use crate::config::{parse_config, preset_choice_to_config, Platform};
-use crate::editor::registry::build_registry;
+use crate::config::{infer_platform, parse_config, CiboxConfig, Platform};
+use crate::detection::{gather_facts, ProjectFacts};
 use crate::error::Result;
-use crate::generator::MultiPresetGenerator;
+use crate::rules::{resolve, ResolvedRule};
 use anyhow::{bail, Context};
 use colored::Colorize;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+/// Load cibox.ron if present. A missing file at the default path is fine —
+/// detection supplies everything; an explicitly named missing file is an error.
+fn load_config(config_path: &str, explicit_required: bool) -> Result<CiboxConfig> {
+    match std::fs::read_to_string(config_path) {
+        Ok(ron_str) => parse_config(&ron_str)
+            .with_context(|| format!("Failed to parse {config_path}")),
+        Err(_) if !explicit_required => {
+            println!(
+                "{} no {} — using detected defaults",
+                "Note:".cyan().bold(),
+                config_path
+            );
+            Ok(CiboxConfig::default())
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to read config file: {config_path}")),
+    }
+}
+
+/// CLI flag > cibox.ron > inference from the repository
+fn effective_platform(
+    platform_arg: Option<String>,
+    config: &CiboxConfig,
+    facts: &ProjectFacts,
+) -> Result<Platform> {
+    if let Some(p) = platform_arg {
+        return Platform::from_str(&p).map_err(|_| crate::error::unsupported_platform_error(&p));
+    }
+    Ok(config.platform.unwrap_or_else(|| infer_platform(facts)))
+}
+
+fn print_rule_table(resolved: &[ResolvedRule]) {
+    for rule in resolved {
+        let marker = if rule.enabled {
+            "✓".green().bold()
+        } else {
+            "○".dimmed()
+        };
+        let origin = match (rule.detected, rule.enabled) {
+            (true, true) => "detected".green().dimmed(),
+            (false, true) => "enabled in cibox.ron".yellow(),
+            (true, false) => "disabled in cibox.ron".yellow(),
+            (false, false) => "not detected".dimmed(),
+        };
+        let name = if rule.enabled {
+            rule.rule.id().normal()
+        } else {
+            rule.rule.id().dimmed()
+        };
+        println!("  {} {:<16} {}", marker, name, origin);
+    }
+}
 
 /// Handle the generate command
 pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: bool) -> Result<()> {
-    use crate::detection::DetectorRegistry;
-    use std::str::FromStr;
+    let working_dir = PathBuf::from(".");
+    let facts = gather_facts(&working_dir);
+    let config = load_config(config_path, config_path != "cibox.ron")?;
+    let platform = effective_platform(platform_arg, &config, &facts)?;
+    let resolved = resolve(&facts, &config);
 
-    // 1. Load and parse RON
-    println!("{} {}", "Loading".cyan().bold(), config_path);
-    let ron_str = std::fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read config file: {}", config_path))?;
+    println!(
+        "{} {} for {}",
+        "Generating".cyan().bold(),
+        "CI configuration".normal(),
+        platform.name().yellow()
+    );
+    print_rule_table(&resolved);
 
-    // 2. Parse RON
-    println!("{}", "Parsing RON configuration...".cyan().bold());
-    let config = parse_config(&ron_str)
-        .with_context(|| "Failed to parse RON config. Check syntax and structure.")?;
-    config.validate()?;
+    let outputs = crate::generator::generate(&facts, &resolved, platform)
+        .with_context(|| format!("Failed to generate CI configuration for {platform}"))?;
 
-    if config.is_empty() {
-        bail!("No presets defined in configuration file");
-    }
-
-    // 3. Detect project and select pipelines.
-    //
-    // Detection only supplies a fallback language/toolchain version; the presets
-    // themselves come from the RON file. Failing to recognize the working
-    // directory (e.g. generating into an empty dir, or a project type the
-    // detector doesn't know) must not abort generation — fall back to "stable".
-    let working_dir = std::path::PathBuf::from(".");
-    let detector_registry = DetectorRegistry::new();
-    let detection = detector_registry.detect(&working_dir).ok();
-
-    let pipelines: Vec<_> = if let Some(p) = platform_arg {
-        let platform = Platform::from_str(&p)
-            .map_err(|_| crate::error::unsupported_platform_error(&p))?;
-        match config.pipeline_for(platform) {
-            Some(pipeline) => vec![pipeline.clone()],
-            None => {
-                let configured: Vec<String> = config
-                    .0
-                    .iter()
-                    .map(|p| p.platform.to_string())
-                    .collect();
-                bail!(
-                    "No pipeline configured for platform '{}'. Configured platforms: {}",
-                    platform,
-                    configured.join(", ")
-                );
-            }
-        }
-    } else {
-        config.0.clone()
-    };
-
-    // 4. Generate outputs for each pipeline
-    let registry = Arc::new(build_registry());
-    let language_version = detection
-        .and_then(|d| d.language_version)
-        .unwrap_or_else(|| "stable".to_string());
-
-    println!("\n{}", "Generating CI configurations...".cyan().bold());
-    let mut outputs = Vec::new();
-    for pipeline in &pipelines {
-        println!(
-            "{} {} preset(s) for platform {}",
-            "Found".green().bold(),
-            pipeline.presets.len(),
-            pipeline.platform.to_string().yellow()
-        );
-
-        let mut preset_configs = Vec::new();
-        for preset_choice in &pipeline.presets {
-            let (preset_id, preset_config) = preset_choice_to_config(preset_choice);
-            println!("  {} {}", "•".blue(), preset_id);
-            preset_configs.push((preset_id, preset_config));
-        }
-
-        let generator = MultiPresetGenerator::new(
-            preset_configs,
-            registry.clone(),
-            pipeline.platform,
-            language_version.clone(),
-        );
-
-        outputs.extend(generator.generate_all().with_context(|| {
-            format!(
-                "Failed to generate CI configuration for {}",
-                pipeline.platform
-            )
-        })?);
-    }
-
-    // 5. Write files
-    let base_path = PathBuf::from(".");
-
+    println!();
     for (filename, content) in outputs {
-        // Use the full path (includes subdirectories like .github/workflows)
-        let output_path = base_path.join(&filename);
+        let output_path = working_dir.join(&filename);
 
-        // Check if file exists and force flag
         if output_path.exists() && !force {
             bail!(
                 "File exists: {}. Use --force to overwrite",
@@ -112,13 +89,11 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
             );
         }
 
-        // Create parent directories if needed
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
         }
 
-        // Write file
         std::fs::write(&output_path, content)
             .with_context(|| format!("Failed to write file: {}", output_path.display()))?;
 
@@ -137,167 +112,110 @@ pub fn handle_generate(config_path: &str, platform_arg: Option<String>, force: b
 pub fn handle_validate(config_path: &str) -> Result<()> {
     println!("{} {}", "Validating".cyan().bold(), config_path);
 
-    // Load file
     let ron_str = std::fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read config file: {}", config_path))?;
-
-    // Parse RON
+        .with_context(|| format!("Failed to read config file: {config_path}"))?;
     let config = parse_config(&ron_str).with_context(|| {
         "Failed to parse RON config. Check syntax and structure:\n\
          - Ensure all fields are properly formatted\n\
          - Check for missing commas\n\
-         - Verify enum variants match expected values"
+         - Verify rule names match the documented set"
     })?;
-    config.validate()?;
-
-    // Basic validation
-    if config.is_empty() {
-        bail!("Validation failed: No presets defined in configuration");
-    }
 
     println!("\n{}", "Configuration is valid!".green().bold());
-    println!("  Pipelines: {}", config.pipeline_count());
 
-    for pipeline in &config.0 {
-        println!("  {}:", pipeline.platform.name().yellow());
-        for (idx, preset) in pipeline.presets.iter().enumerate() {
-            println!("    {}. {}", idx + 1, preset.display_name());
-        }
-    }
+    let facts = gather_facts(Path::new("."));
+    let platform = config.platform.unwrap_or_else(|| infer_platform(&facts));
+    let source = if config.platform.is_some() {
+        "from cibox.ron"
+    } else {
+        "inferred"
+    };
+    println!("  Platform: {} ({})", platform.name().yellow(), source);
+    println!("  Rules:");
+    print_rule_table(&resolve(&facts, &config));
 
     Ok(())
 }
 
 /// Handle the detect command
 pub fn handle_detect(dir: &str) -> Result<()> {
-    use crate::detection::DetectorRegistry;
-    use crate::editor::registry::build_registry;
-    use std::path::PathBuf;
-
     let working_dir = PathBuf::from(dir);
+    let facts = gather_facts(&working_dir);
 
-    println!("{}", "Detecting project type...".cyan().bold());
+    println!("{}", "Project facts:".cyan().bold());
+    let yes_no = |b: bool| if b { "yes".green() } else { "no".dimmed() };
+    if let Some(rust) = &facts.rust {
+        println!(
+            "  {} Rust{}{}",
+            "✓".green(),
+            rust.package_name
+                .as_deref()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default(),
+            if rust.is_workspace { " [workspace]" } else { "" },
+        );
+        println!("    publishable: {}", yes_no(rust.publishable));
+    }
+    if let Some(python) = &facts.python {
+        println!("  {} Python", "✓".green());
+        println!("    publishable: {}", yes_no(python.publishable));
+    }
+    if let Some(go) = &facts.go {
+        println!(
+            "  {} Go{}",
+            "✓".green(),
+            go.module_path
+                .as_deref()
+                .map(|m| format!(" ({m})"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(docker) = &facts.docker {
+        println!("  {} Docker ({})", "✓".green(), docker.dockerfile);
+    }
+    println!("    git repository: {}", yes_no(facts.is_git_repo));
+    if let Some(slug) = &facts.repo_slug {
+        println!("    remote: {}", slug);
+    }
+    if !facts.existing_ci.is_empty() {
+        let names: Vec<&str> = facts.existing_ci.iter().map(|p| p.name()).collect();
+        println!("    existing CI: {}", names.join(", "));
+    }
+
     println!();
-
-    // 1. Detect project type
-    let detector_registry = DetectorRegistry::new();
-    let detection = match detector_registry.detect(&working_dir) {
-        Ok(d) => d,
-        Err(_) => {
-            println!("{}", "✗ No project type detected".red().bold());
-            println!();
-            println!("This directory doesn't appear to contain a recognized project type.");
-            println!("Supported project types:");
-            println!("  • Rust (Cargo.toml)");
-            println!("  • Python (pyproject.toml, setup.py, requirements.txt)");
-            println!("  • Go (go.mod)");
-            println!("  • Docker (Dockerfile, docker-compose.yml)");
-            return Ok(());
-        }
-    };
-
-    // 2. Display project type
     println!(
         "{} {}",
-        "✓ Project Type:".green().bold(),
-        detection.project_type
+        "Inferred platform:".cyan().bold(),
+        infer_platform(&facts).name().yellow()
     );
 
-    if let Some(version) = &detection.language_version {
-        println!("  {} {}", "Language Version:".dimmed(), version);
-    }
-
-    // 3. Display metadata if any
-    if !detection.metadata.is_empty() {
-        println!();
-        println!("{}", "Metadata:".cyan().bold());
-        for (key, value) in &detection.metadata {
-            println!("  {} {}", format!("{}:", key).dimmed(), value);
-        }
-    }
-
-    // 4. Check for existing CI files
     println!();
-    println!(
-        "{}",
-        "Checking for existing CI configurations...".cyan().bold()
-    );
+    println!("{}", "Rules:".cyan().bold());
+    let config_path = working_dir.join("cibox.ron");
+    let config = match std::fs::read_to_string(&config_path) {
+        Ok(ron_str) => parse_config(&ron_str).unwrap_or_else(|e| {
+            eprintln!("Warning: ignoring unparseable cibox.ron: {e}");
+            CiboxConfig::default()
+        }),
+        Err(_) => CiboxConfig::default(),
+    };
+    print_rule_table(&resolve(&facts, &config));
 
-    let ci_files = vec![
-        (".github/workflows", "GitHub Actions"),
-        (".gitea/workflows", "Gitea Actions"),
-        (".gitlab-ci.yml", "GitLab CI"),
-        (".circleci/config.yml", "CircleCI"),
-        ("Jenkinsfile", "Jenkins"),
-    ];
-
-    let mut found_ci = false;
-    for (path, platform) in ci_files {
-        let full_path = working_dir.join(path);
-        if full_path.exists() {
-            println!("  {} {}", "✓".green(), platform);
-            found_ci = true;
-        }
-    }
-
-    if !found_ci {
-        println!("  {} No existing CI configurations found", "ℹ".blue());
-    }
-
-    // 5. Show matching presets
-    println!();
-    println!("{}", "Matching presets for this project:".cyan().bold());
-
-    let registry = build_registry();
-    let mut matching_presets = Vec::new();
-    let mut available_presets = Vec::new();
-
-    for preset in registry.all() {
-        if preset.matches_project(&detection.project_type, &working_dir) {
-            matching_presets.push(preset);
-        } else {
-            available_presets.push(preset);
-        }
-    }
-
-    if matching_presets.is_empty() {
-        println!("  {} No presets match this project type", "ℹ".blue());
-    } else {
-        for preset in &matching_presets {
-            println!("  {} {}", "✓".green().bold(), preset.preset_name());
-            println!("    {}", preset.preset_description().dimmed());
-        }
-    }
-
-    // 6. Show other available presets
-    if !available_presets.is_empty() {
-        println!();
-        println!("{}", "Other available presets:".dimmed());
-        for preset in &available_presets {
-            println!("  {} {}", "○".dimmed(), preset.preset_name().dimmed());
-            println!("    {}", preset.preset_description().dimmed());
-        }
-    }
-
-    // 7. Suggest next steps
     println!();
     println!("{}", "Next steps:".cyan().bold());
-    if matching_presets.is_empty() {
-        println!(
-            "  • Run {} to configure CI for this project",
-            "cibox editor".yellow()
-        );
-    } else {
-        println!(
-            "  • Run {} to interactively configure CI",
-            "cibox editor".yellow()
-        );
-        println!(
-            "  • Or create a {} file and run {}",
-            "cibox.ron".yellow(),
-            "cibox generate".yellow()
-        );
-    }
+    println!(
+        "  • Run {} to write the pipeline",
+        "cibox generate".yellow()
+    );
+    println!(
+        "  • Run {} to adjust rules interactively",
+        "cibox editor".yellow()
+    );
+    println!(
+        "  • Or override rules in {} (with LSP support via {})",
+        "cibox.ron".yellow(),
+        "cibox lsp".yellow()
+    );
 
     Ok(())
 }

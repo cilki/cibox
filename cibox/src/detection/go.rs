@@ -1,46 +1,42 @@
-use super::{DetectionResult, ProjectDetector, ProjectType};
-use crate::error::Result;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-pub struct GoDetector;
+/// Facts about a Go project (go.mod)
+#[derive(Debug, Clone, Default)]
+pub struct GoFacts {
+    pub module_path: Option<String>,
+}
 
-impl ProjectDetector for GoDetector {
-    fn detect(&self, path: &Path) -> Result<Option<DetectionResult>> {
-        let go_mod = path.join("go.mod");
+pub(super) fn gather(path: &Path) -> Option<GoFacts> {
+    let contents = fs::read_to_string(path.join("go.mod")).ok()?;
+    let module_path = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("module "))
+        .map(|m| m.trim().to_string());
+    Some(GoFacts { module_path })
+}
 
-        if !go_mod.exists() {
-            return Ok(None);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
-        let mut metadata = HashMap::new();
-
-        // Try to parse go.mod for version
-        if let Ok(contents) = fs::read_to_string(&go_mod) {
-            if let Some(line) = contents.lines().find(|l| l.starts_with("go ")) {
-                let version = line.strip_prefix("go ").unwrap_or("1.21").trim();
-                metadata.insert("go_version".to_string(), version.to_string());
-            }
-        }
-
-        // Simple heuristic: apps have main.go in root or cmd/
-        let is_app = path.join("main.go").exists() || path.join("cmd").is_dir();
-
-        let project_type = if is_app {
-            ProjectType::GoApp
-        } else {
-            ProjectType::GoLibrary
-        };
-
-        Ok(Some(DetectionResult {
-            project_type,
-            language_version: Some("1.21".to_string()),
-            metadata,
-        }))
+    #[test]
+    fn test_no_go_mod() {
+        let dir = tempdir().unwrap();
+        assert!(gather(dir.path()).is_none());
     }
 
-    fn name(&self) -> &str {
-        "Go"
+    #[test]
+    fn test_module_path_parsed() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("go.mod"),
+            "module github.com/foo/bar\n\ngo 1.23\n",
+        )
+        .unwrap();
+        let facts = gather(dir.path()).unwrap();
+        assert_eq!(facts.module_path.as_deref(), Some("github.com/foo/bar"));
     }
 }

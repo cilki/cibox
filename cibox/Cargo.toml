@@ -10,9 +10,7 @@ keywords = ["ci", "github-actions", "gitlab-ci", "automation"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-cibox-macros = { version = "0.0.1", path = "../cibox-macros" }
 clap = { version = "4.5", features = ["derive", "cargo"] }
-derive_builder = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -22,13 +20,8 @@ roniker = { version = "0.4", features = ["lsp"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 toml = "1.1"
 anyhow = "1.0"
-walkdir = "2.5"
 cargo_toml = "1.0"
 colored = "3.0.0"
-indicatif = "0.18.3"
-similar = "3.2"
-console = "0.16.1"
-chrono = "0.4"
 ratatui = "0.30"
 crossterm = "0.29.0"
 

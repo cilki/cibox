@@ -57,6 +57,9 @@ pub fn jenkins_to_string(config: &JenkinsConfig) -> String {
     result.push_str("    stages {\n");
     for stage in &config.stages {
         result.push_str(&format!("        stage('{}') {{\n", stage.name));
+        if let Some(tag) = &stage.when_tag {
+            result.push_str(&format!("            when {{ tag '{}' }}\n", tag));
+        }
         result.push_str("            steps {\n");
         for step in &stage.steps {
             result.push_str(&format!("                {}\n", step));
@@ -82,6 +85,7 @@ mod tests {
             stages: vec![JenkinsStage {
                 name: "Build".to_string(),
                 steps: vec!["sh 'cargo build'".to_string()],
+                when_tag: None,
             }],
         };
 
@@ -91,6 +95,22 @@ mod tests {
         assert!(result.contains("label 'docker'"));
         assert!(result.contains("stage('Build')"));
         assert!(result.contains("sh 'cargo build'"));
+    }
+
+    #[test]
+    fn test_jenkins_when_tag() {
+        let config = JenkinsConfig {
+            agent: "any".to_string(),
+            environment: vec![],
+            stages: vec![JenkinsStage {
+                name: "Cargo publish".to_string(),
+                steps: vec!["sh 'cargo publish'".to_string()],
+                when_tag: Some("v*".to_string()),
+            }],
+        };
+
+        let result = jenkins_to_string(&config);
+        assert!(result.contains("when { tag 'v*' }"), "{result}");
     }
 
     #[test]
@@ -121,6 +141,7 @@ mod tests {
                 JenkinsStage {
                     name: "Test".to_string(),
                     steps: vec!["sh 'cargo test'".to_string()],
+                    when_tag: None,
                 },
                 JenkinsStage {
                     name: "Deploy".to_string(),
@@ -128,6 +149,7 @@ mod tests {
                         "sh 'docker build .'".to_string(),
                         "sh 'docker push'".to_string(),
                     ],
+                    when_tag: None,
                 },
             ],
         };

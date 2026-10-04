@@ -12,4 +12,6 @@ pub struct JenkinsConfig {
 pub struct JenkinsStage {
     pub name: String,
     pub steps: Vec<String>,
+    /// Restrict the stage to tag builds matching this pattern (`when { tag }`)
+    pub when_tag: Option<String>,
 }

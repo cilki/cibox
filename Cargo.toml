@@ -1,3 +1,3 @@
 [workspace]
-members = ["cibox", "cibox-macros"]
+members = ["cibox"]
 resolver = "2"

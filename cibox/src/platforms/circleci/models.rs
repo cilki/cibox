@@ -76,13 +76,32 @@ pub struct CircleCIWorkflow {
 #[serde(untagged)]
 pub enum CircleCIWorkflowJob {
     Simple(String),
-    WithRequires {
+    Detailed {
         #[serde(flatten)]
-        job: BTreeMap<String, CircleCIJobRequires>,
+        job: BTreeMap<String, CircleCIWorkflowJobDetail>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CircleCIJobRequires {
-    pub requires: Vec<String>,
+pub struct CircleCIWorkflowJobDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<CircleCIFilters>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CircleCIFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<CircleCIFilterPattern>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branches: Option<CircleCIFilterPattern>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CircleCIFilterPattern {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<String>,
 }

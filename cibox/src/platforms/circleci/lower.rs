@@ -1,48 +1,57 @@
-use crate::ir::{Job, PresetJobs, Step};
+use crate::ir::{Job, Step};
 use crate::platforms::circleci::models::{
-    CircleCICache, CircleCICacheSave, CircleCIConfig, CircleCIDocker, CircleCIJob,
-    CircleCIJobRequires, CircleCIRun, CircleCIStep, CircleCIStoreArtifacts, CircleCIWorkflow,
-    CircleCIWorkflowJob,
+    CircleCICache, CircleCICacheSave, CircleCIConfig, CircleCIDocker, CircleCIFilterPattern,
+    CircleCIFilters, CircleCIJob, CircleCIRun, CircleCIStep, CircleCIStoreArtifacts,
+    CircleCIWorkflow, CircleCIWorkflowJob, CircleCIWorkflowJobDetail,
 };
-use crate::platforms::lower::job_key;
 use std::collections::BTreeMap;
 
 const DEFAULT_IMAGE: &str = "cimg/base:stable";
 
-pub fn lower_circleci(presets: &[PresetJobs]) -> CircleCIConfig {
-    let mut jobs = BTreeMap::new();
+pub fn lower_circleci(jobs: &[Job]) -> CircleCIConfig {
+    let mut lowered = BTreeMap::new();
     let mut workflow_jobs = Vec::new();
 
-    for preset in presets {
-        for job in &preset.jobs {
-            let key = job_key(&preset.slug, &job.id);
-            jobs.insert(key.clone(), lower_job(job));
-            if job.needs.is_empty() {
-                workflow_jobs.push(CircleCIWorkflowJob::Simple(key));
-            } else {
-                workflow_jobs.push(CircleCIWorkflowJob::WithRequires {
-                    job: BTreeMap::from([(
-                        key,
-                        CircleCIJobRequires {
-                            requires: job
-                                .needs
-                                .iter()
-                                .map(|n| job_key(&preset.slug, n))
-                                .collect(),
-                        },
-                    )]),
-                });
-            }
+    for job in jobs {
+        lowered.insert(job.id.clone(), lower_job(job));
+
+        // CircleCI runs no job on tag pushes unless it has a tag filter, so
+        // tags-only jobs need both the tag filter and a branch ignore
+        let filters = job.tags_only.then(|| CircleCIFilters {
+            tags: Some(CircleCIFilterPattern {
+                only: Some("/^v.*/".to_string()),
+                ignore: None,
+            }),
+            branches: Some(CircleCIFilterPattern {
+                only: None,
+                ignore: Some("/.*/".to_string()),
+            }),
+        });
+
+        if job.needs.is_empty() && filters.is_none() {
+            workflow_jobs.push(CircleCIWorkflowJob::Simple(job.id.clone()));
+        } else {
+            workflow_jobs.push(CircleCIWorkflowJob::Detailed {
+                job: BTreeMap::from([(
+                    job.id.clone(),
+                    CircleCIWorkflowJobDetail {
+                        requires: (!job.needs.is_empty()).then(|| job.needs.clone()),
+                        filters,
+                    },
+                )]),
+            });
         }
     }
 
     CircleCIConfig {
         version: "2.1".to_string(),
         orbs: None,
-        jobs,
+        jobs: lowered,
         workflows: BTreeMap::from([(
             "main".to_string(),
-            CircleCIWorkflow { jobs: workflow_jobs },
+            CircleCIWorkflow {
+                jobs: workflow_jobs,
+            },
         )]),
     }
 }
@@ -112,12 +121,8 @@ mod tests {
     #[test]
     fn test_single_main_workflow() {
         let config = lower_circleci(&[
-            PresetJobs::new("Rust", "Rust", vec![Job::new("test", "Test", Stage::Test)]),
-            PresetJobs::new(
-                "Docker",
-                "Docker",
-                vec![Job::new("build", "Build", Stage::Build)],
-            ),
+            Job::new("rust-test", "Cargo test", Stage::Test),
+            Job::new("docker-build", "Docker build", Stage::Build),
         ]);
         assert_eq!(config.workflows.len(), 1);
         assert_eq!(config.workflows["main"].jobs.len(), 2);
@@ -127,13 +132,9 @@ mod tests {
 
     #[test]
     fn test_docker_job_gets_setup_remote_docker() {
-        let config = lower_circleci(&[PresetJobs::new(
-            "Docker",
-            "Docker",
-            vec![Job::new("build", "Build", Stage::Build)
-                .with_docker()
-                .with_steps(vec![Step::checkout(), Step::run("Build", "docker build .")])],
-        )]);
+        let config = lower_circleci(&[Job::new("docker-build", "Docker build", Stage::Build)
+            .with_docker()
+            .with_steps(vec![Step::checkout(), Step::run("Build", "docker build .")])]);
         let job = &config.jobs["docker-build"];
         assert_eq!(job.docker[0].image, DEFAULT_IMAGE);
         assert_eq!(
@@ -144,15 +145,40 @@ mod tests {
 
     #[test]
     fn test_cache_restore_and_save() {
-        let config = lower_circleci(&[PresetJobs::new(
-            "Rust",
-            "Rust",
-            vec![Job::new("test", "Test", Stage::Test)
-                .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")])
-                .with_cache("rust-cache", vec!["target/".to_string()])],
-        )]);
+        let config = lower_circleci(&[Job::new("rust-test", "Cargo test", Stage::Test)
+            .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")])
+            .with_cache("rust-cache", vec!["target/".to_string()])]);
         let steps = &config.jobs["rust-test"].steps;
         assert!(matches!(steps[1], CircleCIStep::Cache { .. }));
         assert!(matches!(steps.last(), Some(CircleCIStep::SaveCache { .. })));
+    }
+
+    #[test]
+    fn test_tags_only_job_gets_filters() {
+        let config = lower_circleci(&[
+            Job::new("rust-test", "Cargo test", Stage::Test),
+            Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only(),
+        ]);
+        let detailed = config.workflows["main"]
+            .jobs
+            .iter()
+            .find_map(|j| match j {
+                CircleCIWorkflowJob::Detailed { job } => job.get("rust-release"),
+                _ => None,
+            })
+            .expect("release job should be detailed");
+        let filters = detailed.filters.as_ref().unwrap();
+        assert_eq!(
+            filters.tags.as_ref().unwrap().only.as_deref(),
+            Some("/^v.*/")
+        );
+        assert_eq!(
+            filters.branches.as_ref().unwrap().ignore.as_deref(),
+            Some("/.*/")
+        );
+
+        // The YAML round-trips
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("filters"), "{yaml}");
     }
 }

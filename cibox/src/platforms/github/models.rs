@@ -40,6 +40,8 @@ pub struct GitHubJob {
     pub timeout_minutes: Option<u32>,
     #[serde(rename = "continue-on-error", skip_serializing_if = "Option::is_none")]
     pub continue_on_error: Option<bool>,
+    #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
+    pub if_expr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +84,7 @@ mod tests {
                     needs: None,
                     timeout_minutes: None,
                     continue_on_error: None,
+                    if_expr: None,
                 },
             )]),
         };

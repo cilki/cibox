@@ -1,33 +1,33 @@
 //! Lowering from the platform-neutral IR (`crate::ir`) to platform models.
 //!
-//! Cross-platform policy lives here: job keys are namespaced as
-//! `{preset slug}-{job id}`, and trigger rules are defined once.
+//! Jobs arrive with their final keys (the rule ids); trigger rules and
+//! platform idioms are defined here and in the per-platform modules.
 
 use crate::config::Platform;
 use crate::error::Result;
-use crate::ir::PresetJobs;
+use crate::ir::Job;
+use crate::platforms::github::lower::WorkflowKind;
 use crate::platforms::helpers::PlatformConfig;
 
-/// Lower one or more presets' jobs into a single platform config.
+/// Lower jobs into a single platform config document.
 ///
-/// GitLab/CircleCI/Jenkins are single-file platforms: pass all presets at
-/// once. GitHub/Gitea emit one file per preset: call once per preset.
-pub fn lower(platform: Platform, presets: &[PresetJobs]) -> Result<PlatformConfig> {
+/// GitLab/CircleCI/Jenkins gate tags-only jobs within the one document. For
+/// GitHub/Gitea this produces a CI workflow where tags-only jobs are guarded
+/// by an `if:` expression; the generator normally splits them into a separate
+/// release workflow instead.
+pub fn lower(platform: Platform, jobs: &[Job]) -> Result<PlatformConfig> {
     Ok(match platform {
-        Platform::GitHub => PlatformConfig::GitHub(super::github::lower::lower_github(presets)),
+        Platform::GitHub => {
+            PlatformConfig::GitHub(super::github::lower::lower_github(jobs, WorkflowKind::Ci))
+        }
         // Gitea Actions uses the same workflow format as GitHub Actions
-        Platform::Gitea => PlatformConfig::Gitea(super::github::lower::lower_github(presets)),
-        Platform::GitLab => PlatformConfig::GitLab(super::gitlab::lower::lower_gitlab(presets)),
+        Platform::Gitea => {
+            PlatformConfig::Gitea(super::github::lower::lower_github(jobs, WorkflowKind::Ci))
+        }
+        Platform::GitLab => PlatformConfig::GitLab(super::gitlab::lower::lower_gitlab(jobs)),
         Platform::CircleCI => {
-            PlatformConfig::CircleCI(super::circleci::lower::lower_circleci(presets))
+            PlatformConfig::CircleCI(super::circleci::lower::lower_circleci(jobs))
         }
-        Platform::Jenkins => {
-            PlatformConfig::Jenkins(super::jenkins::lower::lower_jenkins(presets))
-        }
+        Platform::Jenkins => PlatformConfig::Jenkins(super::jenkins::lower::lower_jenkins(jobs)),
     })
-}
-
-/// Namespaced job key: "rust" + "test" → "rust-test"
-pub(crate) fn job_key(slug: &str, job_id: &str) -> String {
-    format!("{slug}-{job_id}")
 }

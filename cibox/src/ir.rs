@@ -1,6 +1,6 @@
 //! Platform-neutral intermediate representation of CI jobs.
 //!
-//! Presets describe their jobs once as [`Job`]s; the lowering layer in
+//! Rules describe their jobs once as [`Job`]s; the lowering layer in
 //! `crate::platforms::lower` turns them into each platform's config model.
 
 /// Pipeline phase; variant order is the GitLab stage order
@@ -62,8 +62,8 @@ impl Step {
 /// Platform-neutral description of one CI job
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
-    /// Short id, unique within the preset (e.g. "test"). The lowering layer
-    /// prefixes it with the preset slug ("rust-test").
+    /// Unique job key, by convention the id of the rule that produced it
+    /// (e.g. "rust-test")
     pub id: String,
     /// Human name used for Jenkins stage names and step grouping
     pub name: String,
@@ -86,7 +86,7 @@ pub struct Job {
     /// Secret names the job reads as env vars. GitHub maps each to
     /// `${{ secrets.NAME }}`; other platforms expect CI-level variables.
     pub secrets: Vec<String>,
-    /// Ids of other jobs in the same preset this one depends on
+    /// Ids of other jobs this one depends on
     pub needs: Vec<String>,
 }
 
@@ -153,56 +153,9 @@ impl Job {
     }
 }
 
-/// What each preset produces
-pub trait ToJobs {
-    fn jobs(&self) -> Vec<Job>;
-}
-
-/// A preset's jobs plus provenance, the unit the lowering layer consumes
-#[derive(Debug, Clone)]
-pub struct PresetJobs {
-    /// e.g. "Rust", "PythonApp"
-    pub preset_id: String,
-    /// e.g. "Rust", "Python App" — used for Jenkins stage prefixes
-    pub display_name: String,
-    /// Job-key prefix, e.g. "rust", "python"
-    pub slug: String,
-    pub jobs: Vec<Job>,
-}
-
-impl PresetJobs {
-    pub fn new(preset_id: &str, display_name: &str, jobs: Vec<Job>) -> Self {
-        Self {
-            preset_id: preset_id.to_string(),
-            display_name: display_name.to_string(),
-            slug: slug_of(preset_id),
-            jobs,
-        }
-    }
-}
-
-/// Lowercased first CamelCase word of a preset id: "PythonApp" → "python"
-pub fn slug_of(preset_id: &str) -> String {
-    let end = preset_id
-        .char_indices()
-        .skip(1)
-        .find(|(_, c)| c.is_uppercase())
-        .map(|(i, _)| i)
-        .unwrap_or(preset_id.len());
-    preset_id[..end].to_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_slug_of() {
-        assert_eq!(slug_of("Rust"), "rust");
-        assert_eq!(slug_of("PythonApp"), "python");
-        assert_eq!(slug_of("GoApp"), "go");
-        assert_eq!(slug_of("Gitleaks"), "gitleaks");
-    }
 
     #[test]
     fn test_stage_order() {

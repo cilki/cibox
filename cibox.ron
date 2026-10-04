@@ -1,33 +1,7 @@
-[
-    (
-        platform: GitHub,
-        presets: [
-            Rust(
-                rust_version: "stable",
-                enable_coverage: true,
-                enable_linter: false,
-                enable_security_scan: false,
-                enable_format_check: false,
-                build_release: false,
-            ),
-            Python(
-                python_version: "3.11",
-                linter: None,
-                enable_type_check: false,
-                formatter: None,
-            ),
-            Docker(
-                image_name: "fossable/cibox",
-                registry: dockerhub,
-                dockerfile_path: "./Dockerfile",
-                build_context: ".",
-                enable_cache: false,
-                push_on_tags_only: false,
-            ),
-            Gitleaks(
-                enable_scan: true,
-                scan_full_history: true,
-            ),
-        ],
+(
+    platform: GitHub,
+    rules: (
+        docker_build: (image_name: "fossable/cibox"),
+        docker_release: (enabled: false),
     ),
-]
+)

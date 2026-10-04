@@ -1,32 +1,31 @@
-use crate::ir::{Job, PresetJobs, Stage, Step};
+use crate::ir::{Job, Stage, Step};
 use crate::platforms::gitlab::models::{
     GitLabArtifacts, GitLabCI, GitLabCache, GitLabJob, GitLabOnly,
 };
-use crate::platforms::lower::job_key;
 use std::collections::BTreeMap;
 
-pub fn lower_gitlab(presets: &[PresetJobs]) -> GitLabCI {
-    let mut jobs = BTreeMap::new();
+pub fn lower_gitlab(jobs: &[Job]) -> GitLabCI {
+    let mut lowered = BTreeMap::new();
     let mut stages: Vec<Stage> = Vec::new();
     let mut variables: BTreeMap<String, String> = BTreeMap::new();
 
-    for preset in presets {
-        for job in &preset.jobs {
-            if !stages.contains(&job.stage) {
-                stages.push(job.stage);
-            }
-            for (key, value) in &job.env {
-                variables.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-            // GitLab clones shallowly by default; a full-history checkout
-            // needs GIT_DEPTH=0
-            if job.steps.iter().any(
-                |step| matches!(step, Step::Checkout { full_history } if *full_history),
-            ) {
-                variables.insert("GIT_DEPTH".to_string(), "0".to_string());
-            }
-            jobs.insert(job_key(&preset.slug, &job.id), lower_job(&preset.slug, job));
+    for job in jobs {
+        if !stages.contains(&job.stage) {
+            stages.push(job.stage);
         }
+        for (key, value) in &job.env {
+            variables.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        // GitLab clones shallowly by default; a full-history checkout
+        // needs GIT_DEPTH=0
+        if job
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::Checkout { full_history } if *full_history))
+        {
+            variables.insert("GIT_DEPTH".to_string(), "0".to_string());
+        }
+        lowered.insert(job.id.clone(), lower_job(job));
     }
 
     stages.sort();
@@ -35,11 +34,11 @@ pub fn lower_gitlab(presets: &[PresetJobs]) -> GitLabCI {
             .then(|| stages.iter().map(|s| s.as_str().to_string()).collect()),
         variables: (!variables.is_empty()).then_some(variables),
         cache: None,
-        jobs,
+        jobs: lowered,
     }
 }
 
-fn lower_job(slug: &str, job: &Job) -> GitLabJob {
+fn lower_job(job: &Job) -> GitLabJob {
     let script = job
         .steps
         .iter()
@@ -60,8 +59,7 @@ fn lower_job(slug: &str, job: &Job) -> GitLabJob {
         script,
         before_script: None,
         after_script: None,
-        needs: (!job.needs.is_empty())
-            .then(|| job.needs.iter().map(|n| job_key(slug, n)).collect()),
+        needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
         cache: job.cache.as_ref().map(|cache| GitLabCache {
             key: cache.key.clone(),
             paths: cache.paths.clone(),
@@ -85,12 +83,8 @@ mod tests {
     #[test]
     fn test_stages_union_in_order() {
         let config = lower_gitlab(&[
-            PresetJobs::new(
-                "Docker",
-                "Docker",
-                vec![Job::new("build", "Build", Stage::Build)],
-            ),
-            PresetJobs::new("Rust", "Rust", vec![Job::new("test", "Test", Stage::Test)]),
+            Job::new("docker-build", "Docker build", Stage::Build),
+            Job::new("rust-test", "Cargo test", Stage::Test),
         ]);
         assert_eq!(
             config.stages,
@@ -102,25 +96,17 @@ mod tests {
 
     #[test]
     fn test_full_history_sets_git_depth() {
-        let config = lower_gitlab(&[PresetJobs::new(
-            "Gitleaks",
-            "Gitleaks",
-            vec![Job::new("scan", "Secret Scan", Stage::Security)
-                .with_steps(vec![Step::checkout_full_history()])],
-        )]);
+        let config = lower_gitlab(&[Job::new("gitleaks", "Gitleaks", Stage::Security)
+            .with_steps(vec![Step::checkout_full_history()])]);
         assert_eq!(config.variables.unwrap()["GIT_DEPTH"], "0");
     }
 
     #[test]
     fn test_docker_job_uses_docker_image() {
-        let config = lower_gitlab(&[PresetJobs::new(
-            "Docker",
-            "Docker",
-            vec![Job::new("build", "Build", Stage::Build)
-                .with_docker()
-                .tags_only()],
-        )]);
-        let job = &config.jobs["docker-build"];
+        let config = lower_gitlab(&[Job::new("docker-release", "Docker push", Stage::Deploy)
+            .with_docker()
+            .tags_only()]);
+        let job = &config.jobs["docker-release"];
         assert_eq!(job.image.as_deref(), Some("docker:latest"));
         assert_eq!(
             job.only.as_ref().unwrap().refs,
@@ -130,12 +116,8 @@ mod tests {
 
     #[test]
     fn test_checkout_excluded_from_script() {
-        let config = lower_gitlab(&[PresetJobs::new(
-            "Rust",
-            "Rust",
-            vec![Job::new("test", "Test", Stage::Test)
-                .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")])],
-        )]);
+        let config = lower_gitlab(&[Job::new("rust-test", "Cargo test", Stage::Test)
+            .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")])]);
         assert_eq!(config.jobs["rust-test"].script, vec!["cargo test"]);
     }
 }

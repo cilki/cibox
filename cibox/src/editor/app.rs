@@ -1,4 +1,4 @@
-use crate::detection::DetectionResult;
+use crate::detection::ProjectFacts;
 use crate::editor::events::handle_key_event;
 use crate::editor::state::EditorState;
 use crate::editor::ui::render_ui;
@@ -18,18 +18,14 @@ pub struct EditorApp {
 }
 
 impl EditorApp {
-    pub fn new(detection: DetectionResult, platform: Option<String>) -> Result<Self> {
-        let working_dir = PathBuf::from(".");
-
-        // Check if cibox.ron exists, if so, load from it
-        let cibox_ron_path = working_dir.join("cibox.ron");
-        let state = if cibox_ron_path.exists() {
-            EditorState::from_ron_file(&cibox_ron_path)?
-        } else {
-            EditorState::from_detection(detection, platform, working_dir)?
-        };
-
-        Ok(Self { state })
+    pub fn new(
+        facts: ProjectFacts,
+        platform: Option<String>,
+        working_dir: PathBuf,
+    ) -> Result<Self> {
+        Ok(Self {
+            state: EditorState::new(facts, platform, working_dir)?,
+        })
     }
 
     pub fn run(mut self) -> Result<()> {
@@ -85,33 +81,18 @@ impl EditorApp {
     }
 
     fn write_config(&self) -> Result<()> {
-        use crate::generator::MultiPresetGenerator;
-        use std::fs;
+        let resolved = crate::rules::resolve(&self.state.facts, &self.state.config);
+        let outputs =
+            crate::generator::generate(&self.state.facts, &resolved, self.state.platform)?;
 
-        for pipeline in self.state.pipelines.iter().filter(|p| p.persist) {
-            let preset_configs = self.state.enabled_preset_configs(pipeline);
-            if preset_configs.is_empty() {
-                continue;
+        for (filename, content) in outputs {
+            let output_path = self.state.working_dir.join(filename);
+
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
 
-            let generator = MultiPresetGenerator::new(
-                preset_configs,
-                self.state.registry.clone(),
-                pipeline.platform,
-                self.state.language_version.clone(),
-            );
-
-            for (filename, content) in generator.generate_all()? {
-                let output_path = self.state.working_dir.join(filename);
-
-                if let Some(parent) = output_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-
-                fs::write(&output_path, content)?;
-
-                println!("✨ Generated: {}", output_path.display());
-            }
+            std::fs::write(&output_path, content)?;
         }
 
         Ok(())

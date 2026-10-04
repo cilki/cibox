@@ -1,5 +1,4 @@
-use crate::editor::config::OptionValue;
-use crate::editor::state::{EditorState, Platform, TreeItem};
+use crate::editor::state::{EditorState, Platform};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -37,7 +36,7 @@ pub fn render_ui(f: &mut Frame, state: &EditorState) {
         ])
         .split(chunks[1]);
 
-    render_presets_panel(f, main_chunks[0], state);
+    render_rules_panel(f, main_chunks[0], state);
 
     // Right side: preview above platform selector
     let right_chunks = Layout::default()
@@ -64,7 +63,7 @@ fn render_info_bar(f: &mut Frame, area: Rect, state: &EditorState) {
     let text = if !state.current_item_description.is_empty() {
         state.current_item_description.clone()
     } else {
-        "Navigate with ↑↓/jk, toggle with Space/Enter, expand/collapse with ←→/hl".to_string()
+        "Navigate with ↑↓/jk, toggle rules with Space/Enter".to_string()
     };
 
     let paragraph = Paragraph::new(text)
@@ -80,10 +79,15 @@ fn render_info_bar(f: &mut Frame, area: Rect, state: &EditorState) {
 }
 
 fn render_platform_bar(f: &mut Frame, area: Rect, state: &EditorState) {
+    let inferred = if state.config.platform.is_none() {
+        " (inferred)"
+    } else {
+        ""
+    };
     let text = format!(
-        "Pipeline: {} ({} configured, press 'p' to change)",
-        state.target_platform().name(),
-        state.persisted_pipeline_count()
+        "Platform: {}{} (press 'p' to change)",
+        state.platform.name(),
+        inferred
     );
 
     let paragraph = Paragraph::new(text)
@@ -93,160 +97,54 @@ fn render_platform_bar(f: &mut Frame, area: Rect, state: &EditorState) {
     f.render_widget(paragraph, area);
 }
 
-fn render_presets_panel(f: &mut Frame, area: Rect, state: &EditorState) {
+fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
     let mut items: Vec<ListItem> = Vec::new();
 
-    for (i, item) in state.tree_items.iter().enumerate() {
-        let is_selected = i == state.tree_cursor;
+    for (i, row) in state.rows.iter().enumerate() {
+        let is_selected = i == state.cursor;
 
-        let list_item = match item {
-            TreeItem::Category(category) => {
-                let is_expanded = state.expanded_categories.contains(category);
-                let expand_icon = if is_expanded { "▼" } else { "▶" };
-
-                let text_color = if is_selected {
-                    Color::Yellow
-                } else {
-                    Color::White
-                };
-
-                let line = Line::from(vec![Span::styled(
-                    format!("{} {}", expand_icon, category),
-                    Style::default()
-                        .fg(text_color)
-                        .add_modifier(Modifier::BOLD),
-                )]);
-
-                let item_style = if is_selected {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
-                ListItem::new(line).style(item_style)
-            }
-            TreeItem::Preset(preset_id) => {
-                let preset = match state.registry.get(preset_id) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let config = state.preset_configs().get(preset_id.as_str());
-                let is_expanded = state.expanded_presets.contains(preset_id);
-                let has_options_enabled = config
-                    .map(|c| {
-                        c.values
-                            .values()
-                            .any(|v| matches!(v, OptionValue::Bool(true)))
-                    })
-                    .unwrap_or(false);
-                let matches_project =
-                    preset.matches_project(&state.project_type, &state.working_dir);
-                let has_non_defaults = state.has_preset_non_defaults(preset_id);
-
-                let expand_icon = if is_expanded { "▼" } else { "▶" };
-                let circle_icon = if has_options_enabled { "●" } else { "○" };
-
-                let circle_color = if has_options_enabled {
-                    if matches_project {
-                        Color::Green
-                    } else {
-                        Color::DarkGray
-                    }
-                } else {
-                    Color::White
-                };
-
-                let text_color = if is_selected {
-                    Color::Yellow
-                } else if !has_non_defaults {
-                    Color::DarkGray
-                } else {
-                    Color::White
-                };
-
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!("  {} ", expand_icon),
-                        Style::default().fg(text_color),
-                    ),
-                    Span::styled(circle_icon, Style::default().fg(circle_color)),
-                    Span::styled(
-                        format!(" {}", preset.preset_name()),
-                        Style::default().fg(text_color),
-                    ),
-                ]);
-
-                let item_style = if is_selected {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
-                ListItem::new(line).style(item_style)
-            }
-            TreeItem::Field(preset_id, field_id) => {
-                let preset = match state.registry.get(preset_id) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let config = match state.preset_configs().get(preset_id.as_str()) {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                let value = match config.get(field_id) {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                // Find the field metadata to get the display name
-                let fields = preset.fields();
-                let field_meta = fields.iter().find(|f| &f.id == field_id);
-
-                let display_name = field_meta
-                    .map(|f| f.display_name.as_str())
-                    .unwrap_or(field_id);
-                let is_non_default = state.is_option_non_default(preset_id, field_id);
-
-                let display_text = match value {
-                    OptionValue::Bool(b) => {
-                        let checkbox = if *b { "[✓]" } else { "[ ]" };
-                        format!("      {} {}", checkbox, display_name)
-                    }
-                    OptionValue::Enum { selected, .. } => {
-                        format!("      {} ({})", display_name, selected)
-                    }
-                    OptionValue::String(s) => {
-                        format!("      {}: {}", display_name, s)
-                    }
-                };
-
-                let text_color = if is_selected {
-                    Color::Yellow
-                } else if !is_non_default {
-                    Color::DarkGray
-                } else {
-                    Color::White
-                };
-
-                let item_style = if is_selected {
-                    Style::default().fg(text_color).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(text_color)
-                };
-
-                ListItem::new(display_text).style(item_style)
-            }
+        let checkbox = if row.enabled { "[✓]" } else { "[ ]" };
+        let checkbox_color = match (row.enabled, row.detected) {
+            (true, true) => Color::Green,
+            (true, false) => Color::Yellow,
+            _ => Color::DarkGray,
         };
 
-        items.push(list_item);
+        let text_color = if is_selected {
+            Color::Yellow
+        } else if row.enabled {
+            Color::White
+        } else {
+            Color::DarkGray
+        };
+
+        // Mark rules whose state is overridden in cibox.ron
+        let marker = if row.overridden() { " *" } else { "" };
+
+        let line = Line::from(vec![
+            Span::styled(format!(" {checkbox} "), Style::default().fg(checkbox_color)),
+            Span::styled(
+                format!("{}{}", row.id, marker),
+                Style::default().fg(text_color),
+            ),
+            Span::styled(
+                format!("  {}", row.name),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+
+        let item_style = if is_selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        items.push(ListItem::new(line).style(item_style));
     }
 
     let list = List::new(items).block(
         Block::default()
-            .title(" Presets ")
+            .title(" Rules (* = overridden in cibox.ron) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
@@ -272,7 +170,7 @@ fn render_preview_panel(f: &mut Frame, area: Rect, state: &EditorState) {
             .scroll((state.preview_scroll, 0))
     };
 
-    let output_path = state.target_platform().output_path();
+    let output_path = state.platform.output_path();
     let filename = output_path.to_str().unwrap_or("config.yml");
 
     let block = Block::default()
@@ -308,8 +206,7 @@ fn render_platform_menu(f: &mut Frame, state: &EditorState) {
         .enumerate()
         .map(|(i, platform)| {
             let is_selected = i == state.platform_menu_cursor;
-            let is_current = *platform == state.target_platform();
-            let is_configured = state.has_pipeline(*platform);
+            let is_current = *platform == state.platform;
 
             let style = if is_selected {
                 Style::default()
@@ -321,7 +218,7 @@ fn render_platform_menu(f: &mut Frame, state: &EditorState) {
                 Style::default()
             };
 
-            let marker = if is_configured { "● " } else { "○ " };
+            let marker = if is_current { "● " } else { "○ " };
             let prefix = if is_selected { "> " } else { "  " };
 
             ListItem::new(format!("{}{}{}", prefix, marker, platform.name())).style(style)
@@ -509,7 +406,7 @@ fn highlight_yaml_line_owned(line: String, bg_color: Option<Color>) -> Line<'sta
                 spans.push(Span::styled(value.to_string(), value_style));
             }
         }
-    } else if trimmed_start.starts_with("- ") {
+    } else if let Some(rest) = trimmed_start.strip_prefix("- ") {
         // List item
         let mut bullet_style = Style::default().fg(Color::Yellow);
         if let Some(bg) = bg_color {
@@ -521,7 +418,7 @@ fn highlight_yaml_line_owned(line: String, bg_color: Option<Color>) -> Line<'sta
         if let Some(bg) = bg_color {
             text_style = text_style.bg(bg);
         }
-        spans.push(Span::styled(trimmed_start[2..].to_string(), text_style));
+        spans.push(Span::styled(rest.to_string(), text_style));
     } else {
         // Other lines
         let mut style = Style::default();
@@ -608,13 +505,13 @@ fn highlight_yaml(yaml: &str) -> Vec<Line<'_>> {
                     spans.push(Span::raw(value.to_string()));
                 }
             }
-        } else if trimmed.starts_with("- ") {
+        } else if let Some(rest) = trimmed.strip_prefix("- ") {
             // List item
             spans.push(Span::styled(
                 "- ".to_string(),
                 Style::default().fg(Color::Yellow),
             ));
-            spans.push(Span::raw(trimmed[2..].to_string()));
+            spans.push(Span::raw(rest.to_string()));
         } else {
             // Other lines
             spans.push(Span::raw(trimmed.to_string()));
@@ -638,10 +535,8 @@ fn render_footer(f: &mut Frame, area: Rect, state: &EditorState) {
         ]
     } else {
         vec![
-            Span::styled("←→/hl", Style::default().fg(Color::Blue)),
-            Span::raw(" expand/collapse | "),
             Span::styled("Space/Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" toggle | "),
+            Span::raw(" toggle rule | "),
             Span::styled("↑↓/jk", Style::default().fg(Color::Blue)),
             Span::raw(" navigate | "),
             Span::styled("JK", Style::default().fg(Color::Magenta)),

@@ -2,109 +2,190 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Platform;
 use crate::error::Result;
-use crate::presets::{Docker, Gitleaks, GoApp, PythonApp, Rust};
 
-/// Top-level cibox configuration: an array of pipelines, one per CI platform
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CiboxConfig(pub Vec<Pipeline>);
-
-/// A single CI pipeline targeting one platform
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pipeline {
-    /// Target CI platform
-    pub platform: Platform,
-    /// List of preset configurations for this pipeline
-    pub presets: Vec<PresetChoice>,
+/// cibox.ron: overrides from the detected defaults. The file itself is
+/// optional and every field in it is optional — an empty `()` (or no file at
+/// all) means "do whatever detection decides".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CiboxConfig {
+    /// Target CI platform. Omit to infer it from existing CI files or the
+    /// git remote (falling back to GitHub).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
+    /// Per-rule overrides; rules not listed here follow detection
+    #[serde(skip_serializing_if = "Rules::is_default")]
+    pub rules: Rules,
 }
 
 impl CiboxConfig {
-    pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|p| p.presets.is_empty())
+    pub fn is_default(&self) -> bool {
+        self == &CiboxConfig::default()
+    }
+}
+
+/// One entry per rule, nix-services style: each rule has an `enabled`
+/// override plus whatever knobs the rule supports.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rules {
+    /// Run cargo test with all features on every push
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_test: RuleToggle,
+    /// Check code formatting with cargo fmt
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_fmt: RuleToggle,
+    /// Run clippy with warnings denied
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_clippy: RuleToggle,
+    /// Audit dependencies for known vulnerabilities
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_audit: RuleToggle,
+    /// Publish to crates.io on version tags (requires CARGO_REGISTRY_TOKEN)
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_release: RuleToggle,
+    /// Install the package and run pytest on every push
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub python_test: RuleToggle,
+    /// Lint with ruff
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub python_lint: RuleToggle,
+    /// Check code formatting with ruff
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub python_fmt: RuleToggle,
+    /// Build and upload to PyPI on version tags (requires TWINE_PASSWORD)
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub python_release: RuleToggle,
+    /// Run go test on every push
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub go_test: RuleToggle,
+    /// Compile all packages
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub go_build: RuleToggle,
+    /// Lint with golangci-lint
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub go_lint: RuleToggle,
+    /// Scan for security problems with gosec
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub go_audit: RuleToggle,
+    /// Build the Dockerfile on every push
+    #[serde(skip_serializing_if = "DockerRule::is_default")]
+    pub docker_build: DockerRule,
+    /// Build and push the image to a registry on version tags
+    #[serde(skip_serializing_if = "DockerRule::is_default")]
+    pub docker_release: DockerRule,
+    /// Scan the full git history for hardcoded secrets
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub gitleaks: RuleToggle,
+}
+
+/// Override for a rule without knobs
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuleToggle {
+    /// Force this rule on or off; omit to let detection decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Override for the docker rules: toggle plus image name
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockerRule {
+    /// Force this rule on or off; omit to let detection decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Image name, e.g. "fossable/cibox". Setting it on either docker rule
+    /// applies to both; the default is derived from the git remote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+}
+
+impl RuleToggle {
+    pub fn is_default(&self) -> bool {
+        self.enabled.is_none()
+    }
+}
+
+impl DockerRule {
+    pub fn is_default(&self) -> bool {
+        self.enabled.is_none() && self.image_name.is_none()
+    }
+}
+
+impl Rules {
+    pub fn is_default(&self) -> bool {
+        self == &Rules::default()
     }
 
-    pub fn len(&self) -> usize {
-        self.0.iter().map(|p| p.presets.len()).sum()
-    }
-
-    pub fn pipeline_count(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn pipeline_for(&self, platform: Platform) -> Option<&Pipeline> {
-        self.0.iter().find(|p| p.platform == platform)
-    }
-
-    /// Reject configurations with more than one pipeline per platform
-    pub fn validate(&self) -> Result<()> {
-        let mut seen = std::collections::HashSet::new();
-        for pipeline in &self.0 {
-            if !seen.insert(pipeline.platform) {
-                return Err(crate::error::validation_error(format!(
-                    "Duplicate pipeline for platform '{}'",
-                    pipeline.platform
-                )));
-            }
+    /// The `enabled` override for a rule by its kebab-case id
+    pub fn enabled_override(&self, rule_id: &str) -> Option<bool> {
+        match rule_id {
+            "rust-test" => self.rust_test.enabled,
+            "rust-fmt" => self.rust_fmt.enabled,
+            "rust-clippy" => self.rust_clippy.enabled,
+            "rust-audit" => self.rust_audit.enabled,
+            "rust-release" => self.rust_release.enabled,
+            "python-test" => self.python_test.enabled,
+            "python-lint" => self.python_lint.enabled,
+            "python-fmt" => self.python_fmt.enabled,
+            "python-release" => self.python_release.enabled,
+            "go-test" => self.go_test.enabled,
+            "go-build" => self.go_build.enabled,
+            "go-lint" => self.go_lint.enabled,
+            "go-audit" => self.go_audit.enabled,
+            "docker-build" => self.docker_build.enabled,
+            "docker-release" => self.docker_release.enabled,
+            "gitleaks" => self.gitleaks.enabled,
+            _ => None,
         }
-        Ok(())
+    }
+
+    /// Set the `enabled` override for a rule by its kebab-case id
+    pub fn set_enabled_override(&mut self, rule_id: &str, enabled: Option<bool>) {
+        match rule_id {
+            "rust-test" => self.rust_test.enabled = enabled,
+            "rust-fmt" => self.rust_fmt.enabled = enabled,
+            "rust-clippy" => self.rust_clippy.enabled = enabled,
+            "rust-audit" => self.rust_audit.enabled = enabled,
+            "rust-release" => self.rust_release.enabled = enabled,
+            "python-test" => self.python_test.enabled = enabled,
+            "python-lint" => self.python_lint.enabled = enabled,
+            "python-fmt" => self.python_fmt.enabled = enabled,
+            "python-release" => self.python_release.enabled = enabled,
+            "go-test" => self.go_test.enabled = enabled,
+            "go-build" => self.go_build.enabled = enabled,
+            "go-lint" => self.go_lint.enabled = enabled,
+            "go-audit" => self.go_audit.enabled = enabled,
+            "docker-build" => self.docker_build.enabled = enabled,
+            "docker-release" => self.docker_release.enabled = enabled,
+            "gitleaks" => self.gitleaks.enabled = enabled,
+            _ => {}
+        }
     }
 }
 
 /// Parse a cibox.ron document
 pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
+    if ron_str.trim_start().starts_with('[') {
+        anyhow::bail!(
+            "cibox.ron uses the old pipeline-list format, which has been replaced \
+             by rule overrides. Delete the file and re-run cibox, or see the README \
+             for the new format."
+        );
+    }
     Ok(crate::config::ron_options().from_str(ron_str)?)
 }
 
-/// Preset choice enum - supports all available presets
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PresetChoice {
-    #[serde(rename = "Python")]
-    PythonApp(PythonApp),
-    Rust(Rust),
-    GoApp(GoApp),
-    Docker(Docker),
-    Gitleaks(Gitleaks),
-}
-
-macro_rules! preset_choice_tables {
-    ($(($variant:ident, $ty:path, $display:literal)),+ $(,)?) => {
-        impl PresetChoice {
-            /// Convert a PresetChoice to a PresetConfig using the generated conversion methods
-            pub fn to_preset_config(&self) -> (String, crate::editor::config::PresetConfig) {
-                match self {
-                    $(PresetChoice::$variant(preset) => {
-                        (stringify!($variant).to_string(), preset.to_preset_config())
-                    })+
-                }
-            }
-
-            /// Human-readable name for display in CLI output
-            pub fn display_name(&self) -> &'static str {
-                match self {
-                    $(PresetChoice::$variant(_) => $display,)+
-                }
-            }
-        }
-
-        /// Convert a (preset_id, PresetConfig) tuple to a PresetChoice
-        pub fn preset_config_to_choice(
-            preset_id: &str,
-            config: &crate::editor::config::PresetConfig,
-        ) -> PresetChoice {
-            match preset_id {
-                $(stringify!($variant) => PresetChoice::$variant(<$ty>::from_config(config, "")),)+
-                _ => panic!("Unknown preset ID: {}", preset_id),
-            }
-        }
-    };
-}
-crate::presets::with_presets!(preset_choice_tables);
-
-/// Convert a PresetChoice to a (preset_id, PresetConfig) tuple
-pub fn preset_choice_to_config(
-    choice: &PresetChoice,
-) -> (String, crate::editor::config::PresetConfig) {
-    choice.to_preset_config()
+/// Serialize a config as a pretty cibox.ron document
+pub fn serialize_config(config: &CiboxConfig) -> Result<String> {
+    let pretty = ron::ser::PrettyConfig::new()
+        .depth_limit(4)
+        .separate_tuple_members(true)
+        .enumerate_arrays(false);
+    crate::config::ron_options()
+        .to_string_pretty(config, pretty)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize to RON: {}", e))
 }
 
 #[cfg(test)]
@@ -112,84 +193,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_single_paren_presets() {
-        let config = parse_config(
-            r#"[
-                (
-                    platform: GitHub,
-                    presets: [
-                        Rust(enable_linter: true),
-                        Python(linter: ruff),
-                        Docker(registry: githubregistry),
-                    ],
-                ),
-            ]"#,
-        )
-        .unwrap();
-        assert_eq!(config.pipeline_count(), 1);
-        assert_eq!(config.len(), 3);
-        assert_eq!(config.0[0].platform, Platform::GitHub);
+    fn test_parse_empty_config() {
+        let config = parse_config("()").unwrap();
+        assert!(config.is_default());
+        assert!(config.platform.is_none());
     }
 
     #[test]
-    fn test_serialize_uses_single_parens() {
-        let config = CiboxConfig(vec![Pipeline {
-            platform: Platform::GitHub,
-            presets: vec![PresetChoice::Rust(Rust::default())],
-        }]);
-        let ron_str = crate::config::ron_options()
-            .to_string_pretty(&config, ron::ser::PrettyConfig::new())
-            .unwrap();
-        assert!(ron_str.trim_start().starts_with('['), "{ron_str}");
-        assert!(ron_str.contains("platform: GitHub"), "{ron_str}");
-        assert!(ron_str.contains("Rust("), "{ron_str}");
-        assert!(!ron_str.contains("Rust(("), "{ron_str}");
+    fn test_parse_overrides() {
+        let config = parse_config(
+            r#"(
+                platform: GitLab,
+                rules: (
+                    rust_release: (enabled: false),
+                    docker_build: (enabled: true, image_name: "fossable/cibox"),
+                ),
+            )"#,
+        )
+        .unwrap();
+        assert_eq!(config.platform, Some(Platform::GitLab));
+        assert_eq!(config.rules.rust_release.enabled, Some(false));
+        assert_eq!(config.rules.docker_build.enabled, Some(true));
+        assert_eq!(
+            config.rules.docker_build.image_name.as_deref(),
+            Some("fossable/cibox")
+        );
+        // Unlisted rules follow detection
+        assert_eq!(config.rules.rust_test.enabled, None);
+    }
+
+    #[test]
+    fn test_knob_without_enabled_leaves_detection_in_charge() {
+        let config = parse_config(
+            r#"(rules: (docker_build: (image_name: "a/b")))"#,
+        )
+        .unwrap();
+        assert_eq!(config.rules.docker_build.enabled, None);
+        assert_eq!(config.rules.docker_build.image_name.as_deref(), Some("a/b"));
+    }
+
+    #[test]
+    fn test_serialize_is_delta_only() {
+        let mut config = CiboxConfig::default();
+        config.rules.rust_release.enabled = Some(false);
+        let ron_str = serialize_config(&config).unwrap();
+        assert!(ron_str.contains("rust_release"), "{ron_str}");
+        assert!(!ron_str.contains("rust_test"), "{ron_str}");
+        assert!(!ron_str.contains("platform"), "{ron_str}");
 
         let parsed = parse_config(&ron_str).unwrap();
-        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed, config);
     }
 
     #[test]
-    fn test_parse_multiple_pipelines_with_different_settings() {
-        let config = parse_config(
+    fn test_old_format_rejected_with_hint() {
+        let err = parse_config(
             r#"[
-                ( platform: GitHub, presets: [ Rust(enable_coverage: true) ] ),
-                ( platform: GitLab, presets: [ Rust(enable_coverage: false) ] ),
+                ( platform: GitHub, presets: [ Rust(enable_linter: true) ] ),
             ]"#,
         )
-        .unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.pipeline_count(), 2);
-
-        let coverage_for = |platform| {
-            let pipeline = config.pipeline_for(platform).unwrap();
-            let (_, preset_config) = pipeline.presets[0].to_preset_config();
-            preset_config.get_bool("enable_coverage")
-        };
-        assert!(coverage_for(Platform::GitHub));
-        assert!(!coverage_for(Platform::GitLab));
+        .unwrap_err();
+        assert!(err.to_string().contains("old pipeline-list format"));
     }
 
     #[test]
-    fn test_legacy_format_rejected() {
-        let result = parse_config(
-            r#"(
-                version: "1",
-                presets: [ Rust(enable_linter: true) ],
-            )"#,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_duplicate_platform_rejected() {
-        let config = parse_config(
-            r#"[
-                ( platform: GitHub, presets: [] ),
-                ( platform: GitHub, presets: [] ),
-            ]"#,
-        )
-        .unwrap();
-        assert!(config.validate().is_err());
+    fn test_enabled_override_round_trip() {
+        let mut rules = Rules::default();
+        rules.set_enabled_override("python-fmt", Some(true));
+        assert_eq!(rules.enabled_override("python-fmt"), Some(true));
+        rules.set_enabled_override("python-fmt", None);
+        assert!(rules.is_default());
     }
 }

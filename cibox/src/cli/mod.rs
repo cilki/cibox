@@ -13,13 +13,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Generate CI config from RON file
+    /// Generate CI config from detected rules (cibox.ron overrides optional)
     Generate {
-        /// Path to cibox.ron config file
+        /// Path to cibox.ron override file (optional)
         #[arg(default_value = "cibox.ron")]
         config: String,
 
-        /// Generate only this pipeline from the config (default: all pipelines)
+        /// Target platform (default: from cibox.ron, or inferred)
         #[arg(short, long)]
         platform: Option<String>,
 
@@ -28,7 +28,7 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Validate RON config syntax
+    /// Validate cibox.ron and show the resulting rule resolution
     Validate {
         /// Path to cibox.ron config file
         #[arg(default_value = "cibox.ron")]
@@ -42,7 +42,7 @@ pub enum Commands {
         dir: String,
     },
 
-    /// Detect project type and matching presets
+    /// Show project facts and which rules they trigger
     Detect {
         /// Project directory
         #[arg(short, long, default_value = ".")]
