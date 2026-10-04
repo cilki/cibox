@@ -42,13 +42,25 @@ jobs to the generated pipeline. Release rules run only on `v*` git tags (e.g.
 
 Running `cibox update` in a project with no configuration at all produces a
 working pipeline: detection picks the rules and the target platform is
-inferred from existing CI files or your git remote.
+inferred from existing CI configuration, then from your git remote's host,
+falling back to GitHub Actions. Pass `--platform` to choose explicitly.
 
 ```
-$ cibox detect      # show project facts and which rules fired
-$ cibox update      # write or refresh the pipeline files
-$ cibox             # interactive TUI to toggle rules
+$ cibox                           # interactive TUI to toggle rules
+$ cibox detect                    # show project facts and which rules fired
+$ cibox validate                  # check cibox.ron and print the resolved rules
+$ cibox update                    # write or refresh the pipeline files
+$ cibox update --platform gitlab  # generate for a specific platform
 ```
+
+The files cibox manages, per platform:
+
+| Platform | Files |
+|---|---|
+| GitHub Actions | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
+| Gitea Actions | `.gitea/workflows/ci.yml`, `.gitea/workflows/release.yml` |
+| GitLab CI | `.gitlab-ci.yml` |
+| CircleCI | `.circleci/config.yml` |
 
 `cibox update` is safe to re-run after you customize the generated files. It
 conforms the jobs cibox manages to its current output, removes managed jobs
@@ -79,6 +91,30 @@ Omitted rules follow detection; an omitted `enabled` leaves detection in
 charge while still applying the knobs. The target platform is not part of
 the file — `cibox update` can generate for any platform, so pass
 `--platform` or let cibox infer it.
+
+### Multi-arch docker images
+
+`docker-release` builds a single image for the runner's own architecture by
+default. Listing `platforms` turns it into a multi-arch build:
+
+```ron
+(
+    docker_release: (
+        image_name: "ghcr.io/example/app",
+        platforms: [LinuxAmd64, LinuxArm64],
+    ),
+)
+```
+
+The available platforms are `LinuxAmd64`, `LinuxArm64`, `LinuxArmV7`,
+`LinuxRiscv64`, and `WindowsAmd64`. Linux targets build together in one
+`docker buildx` job, with QEMU set up when a foreign architecture is
+involved. `WindowsAmd64` can't be emulated, so it gets its own job on a
+Windows runner — that means GitHub Actions or Gitea Actions only (GitLab and
+CircleCI refuse to generate), and the same Dockerfile has to work from a
+Windows base image. Mixing Linux and Windows targets emits three jobs: the
+two per-OS builds push staging tags and a third merges them into one
+multi-platform manifest, so `image_name` must not already carry a tag.
 
 You can use our TUI interface to edit this file or any editor with LSP support.
 Configure your editor to use `cibox lsp` as an LSP and you'll get inline
@@ -111,16 +147,15 @@ language-servers = ["cibox-lsp"]
 | `python-lint` | " | `ruff check .` |
 | `python-fmt` | " | `ruff format --check .` |
 | `python-release` | `[project]` in pyproject.toml | build + `twine upload` on `v*` tags (needs `TWINE_PASSWORD`) |
-| `go-test` | `go.mod` | `go test ./...` |
-| `go-build` | `go.mod` | `go build ./...` |
+| `go-test` | `go.mod` | `go test -v ./...` |
+| `go-build` | `go.mod` | `go build -v ./...` |
 | `go-lint` | `go.mod` | `golangci-lint run` |
 | `go-audit` | `go.mod` | `gosec ./...` |
-| `docker-build` | `Dockerfile` | `docker build` |
-| `docker-release` | `Dockerfile` | build + push on `v*` tags (`ghcr.io/` images use `GITHUB_TOKEN`, others Docker Hub credentials) |
-| `gitleaks` | git repository | secret scan over full history |
+| `docker-build` | `Dockerfile` / `dockerfile` / `Containerfile` | `docker build` |
+| `docker-release` | " | build + push on `v*` tags (`ghcr.io/` images use `GITHUB_TOKEN`, others Docker Hub credentials) |
+| `gitleaks` | git repository | `gitleaks detect` over full history |
 
-On GitHub/Gitea, tag-triggered rules land in a separate
-`.github/workflows/release.yml`; other platforms gate them within the single
-pipeline file. Platforms other than GitHub read the required secrets from
-their own CI variable mechanisms — the generated file lists them in a header
-comment.
+On GitHub/Gitea, tag-triggered rules land in a `release.yml` next to
+`ci.yml`; other platforms gate them within the single pipeline file. Platforms
+other than GitHub read the required secrets from their own CI variable
+mechanisms — the generated file lists them in a header comment.
