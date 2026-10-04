@@ -70,6 +70,8 @@ impl Rule for RustFmt {
             .with_timeout(10)
             .with_steps(vec![
                 Step::checkout(),
+                // The official rust image ships rustup's minimal profile
+                Step::run("Install rustfmt", "rustup component add rustfmt"),
                 Step::run("Check formatting", "cargo fmt -- --check"),
             ])]
     }
@@ -105,6 +107,8 @@ impl Rule for RustClippy {
             )
             .with_steps(vec![
                 Step::checkout(),
+                // The official rust image ships rustup's minimal profile
+                Step::run("Install clippy", "rustup component add clippy"),
                 Step::run("Run clippy", "cargo clippy --all-features -- -D warnings"),
             ])]
     }
