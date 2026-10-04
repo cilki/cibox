@@ -148,8 +148,8 @@ mod tests {
         // planned (with no jobs) so `update` can prune stale jobs from it
         let facts = full_facts();
         let mut config = CiboxConfig::default();
-        config.rules.rust_release.enabled = Some(false);
-        config.rules.docker_release.enabled = Some(false);
+        config.rust_release.enabled = Some(false);
+        config.docker_release.enabled = Some(false);
         let resolved = resolve(&facts, &config);
 
         let planned = plan(&facts, &resolved, Platform::GitHub).unwrap();
@@ -244,7 +244,7 @@ mod tests {
     fn test_mixed_docker_platforms_on_github() {
         let facts = full_facts();
         let mut config = CiboxConfig::default();
-        config.rules.docker_release.platforms = Some(vec![
+        config.docker_release.platforms = Some(vec![
             crate::config::DockerPlatform::LinuxAmd64,
             crate::config::DockerPlatform::WindowsAmd64,
         ]);
@@ -267,7 +267,7 @@ mod tests {
     fn test_windows_platform_errors_outside_github() {
         let facts = full_facts();
         let mut config = CiboxConfig::default();
-        config.rules.docker_release.platforms =
+        config.docker_release.platforms =
             Some(vec![crate::config::DockerPlatform::WindowsAmd64]);
         let resolved = resolve(&facts, &config);
 

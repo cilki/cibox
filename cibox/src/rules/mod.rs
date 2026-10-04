@@ -65,11 +65,10 @@ pub struct ResolvedRule {
 /// with config overrides) and compute its enabled state.
 pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> {
     let docker_image = config
-        .rules
         .docker_build
         .image_name
         .clone()
-        .or_else(|| config.rules.docker_release.image_name.clone())
+        .or_else(|| config.docker_release.image_name.clone())
         .or_else(|| facts.repo_slug.clone())
         .unwrap_or_else(|| facts.dir_name.clone());
 
@@ -93,7 +92,6 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         Box::new(DockerRelease {
             image: docker_image,
             platforms: config
-                .rules
                 .docker_release
                 .platforms
                 .clone()
@@ -107,7 +105,6 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         .map(|rule| {
             let detected = rule.detect(facts);
             let enabled = config
-                .rules
                 .enabled_override(rule.id())
                 .unwrap_or(detected);
             ResolvedRule {
@@ -178,7 +175,7 @@ mod tests {
     fn test_override_disables_detected_rule() {
         let facts = rust_facts();
         let mut config = CiboxConfig::default();
-        config.rules.rust_test.enabled = Some(false);
+        config.rust_test.enabled = Some(false);
         let resolved = resolve(&facts, &config);
         let rust_test = resolved.iter().find(|r| r.rule.id() == "rust-test").unwrap();
         assert!(rust_test.detected);
@@ -188,7 +185,7 @@ mod tests {
     #[test]
     fn test_override_enables_undetected_rule() {
         let mut config = CiboxConfig::default();
-        config.rules.go_test.enabled = Some(true);
+        config.go_test.enabled = Some(true);
         let resolved = resolve(&ProjectFacts::default(), &config);
         let go_test = resolved.iter().find(|r| r.rule.id() == "go-test").unwrap();
         assert!(!go_test.detected);
@@ -202,7 +199,7 @@ mod tests {
         // Guards against a rule emitting variant job ids (like
         // docker-release-linux) without overriding owns_job_id
         let mut config = CiboxConfig::default();
-        config.rules.docker_release.platforms = Some(vec![
+        config.docker_release.platforms = Some(vec![
             crate::config::DockerPlatform::LinuxAmd64,
             crate::config::DockerPlatform::WindowsAmd64,
         ]);
@@ -224,11 +221,11 @@ mod tests {
         let resolved = resolve(&ProjectFacts::default(), &CiboxConfig::default());
         for r in &resolved {
             let mut config = CiboxConfig::default();
-            config.rules.set_enabled_override(r.rule.id(), Some(true));
+            config.set_enabled_override(r.rule.id(), Some(true));
             assert_eq!(
-                config.rules.enabled_override(r.rule.id()),
+                config.enabled_override(r.rule.id()),
                 Some(true),
-                "rule {} is missing from the Rules override mapping",
+                "rule {} is missing from the CiboxConfig override mapping",
                 r.rule.id()
             );
         }
@@ -241,7 +238,7 @@ mod tests {
         let facts = crate::detection::gather_facts(dir.path());
 
         let mut config = CiboxConfig::default();
-        config.rules.docker_build.image_name = Some("fossable/cibox".to_string());
+        config.docker_build.image_name = Some("fossable/cibox".to_string());
         let resolved = resolve(&facts, &config);
         let build = resolved
             .iter()
@@ -261,7 +258,7 @@ mod tests {
         let facts = crate::detection::gather_facts(dir.path());
 
         let mut config = CiboxConfig::default();
-        config.rules.docker_release.platforms = Some(vec![
+        config.docker_release.platforms = Some(vec![
             crate::config::DockerPlatform::LinuxAmd64,
             crate::config::DockerPlatform::LinuxArm64,
         ]);

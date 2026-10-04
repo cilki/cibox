@@ -79,7 +79,7 @@ fn render_info_bar(f: &mut Frame, area: Rect, state: &EditorState) {
 }
 
 fn render_platform_bar(f: &mut Frame, area: Rect, state: &EditorState) {
-    let inferred = if state.config.platform.is_none() {
+    let inferred = if state.platform == state.inferred_platform {
         " (inferred)"
     } else {
         ""

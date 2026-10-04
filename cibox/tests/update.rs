@@ -76,7 +76,7 @@ fn test_update_lifecycle() {
     // Disabling a rule removes its job from the existing file
     fs::write(
         dir.path().join("cibox.ron"),
-        "(rules: (rust_clippy: (enabled: false)))",
+        "(rust_clippy: (enabled: false))",
     )
     .unwrap();
     update(dir.path()).assert().success();

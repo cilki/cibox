@@ -452,7 +452,7 @@ jobs:
     fn test_github_disabled_rule_job_removed() {
         let facts = full_facts();
         let mut config = CiboxConfig::default();
-        config.rules.rust_fmt.enabled = Some(false);
+        config.rust_fmt.enabled = Some(false);
         let resolved = resolve(&facts, &config);
         let file = planned_file(Platform::GitHub, &resolved, 0);
 
@@ -480,7 +480,7 @@ jobs:
     fn test_github_needs_pruned_when_dependency_deleted() {
         let facts = full_facts();
         let mut config = CiboxConfig::default();
-        config.rules.docker_release.platforms = Some(vec![
+        config.docker_release.platforms = Some(vec![
             crate::config::DockerPlatform::LinuxAmd64,
             crate::config::DockerPlatform::WindowsAmd64,
         ]);
@@ -517,7 +517,7 @@ jobs:
     fn test_github_strip_to_empty_leaves_file_alone() {
         let facts = full_facts();
         let mut config = CiboxConfig::default();
-        config.rules.rust_fmt.enabled = Some(false);
+        config.rust_fmt.enabled = Some(false);
         let resolved = resolve(&facts, &config);
         let file = planned_file(Platform::GitHub, &resolved, 0);
 
@@ -612,7 +612,7 @@ my-job:
     fn test_circleci_conforms_both_jobs_and_workflow_entries() {
         let facts = full_facts();
         let mut config = CiboxConfig::default();
-        config.rules.rust_fmt.enabled = Some(false);
+        config.rust_fmt.enabled = Some(false);
         let resolved = resolve(&facts, &config);
         let file = planned_file(Platform::CircleCI, &resolved, 0);
 

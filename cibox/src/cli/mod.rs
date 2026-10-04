@@ -20,7 +20,8 @@ pub enum Commands {
         #[arg(default_value = "cibox.ron")]
         config: String,
 
-        /// Target platform (default: from cibox.ron, or inferred)
+        /// Target platform (default: inferred from existing CI files or the
+        /// git remote)
         #[arg(short, long)]
         platform: Option<String>,
 

@@ -109,7 +109,7 @@ impl EditorState {
         let platform = match platform_arg {
             Some(p) => Platform::from_str(&p)
                 .map_err(|_| crate::error::unsupported_platform_error(&p))?,
-            None => config.platform.unwrap_or(inferred_platform),
+            None => inferred_platform,
         };
 
         let existing_yaml =
@@ -156,11 +156,10 @@ impl EditorState {
     /// The image name in effect, mirroring the precedence in rules::resolve
     fn effective_image(&self) -> String {
         self.config
-            .rules
             .docker_build
             .image_name
             .clone()
-            .or_else(|| self.config.rules.docker_release.image_name.clone())
+            .or_else(|| self.config.docker_release.image_name.clone())
             .unwrap_or_else(|| self.default_image())
     }
 
@@ -183,8 +182,8 @@ impl EditorState {
             }));
             if expanded {
                 let override_value = match id {
-                    "docker-build" => self.config.rules.docker_build.image_name.clone(),
-                    _ => self.config.rules.docker_release.image_name.clone(),
+                    "docker-build" => self.config.docker_build.image_name.clone(),
+                    _ => self.config.docker_release.image_name.clone(),
                 };
                 self.rows.push(Row::TextKnob {
                     rule_id: id,
@@ -197,7 +196,6 @@ impl EditorState {
                 if id == "docker-release" {
                     let selected = self
                         .config
-                        .rules
                         .docker_release
                         .platforms
                         .clone()
@@ -264,7 +262,6 @@ impl EditorState {
         let new_enabled = !rule.enabled;
         let override_value = (new_enabled != rule.detected).then_some(new_enabled);
         self.config
-            .rules
             .set_enabled_override(rule.id, override_value);
         self.refresh();
         self.auto_save_ron();
@@ -275,7 +272,6 @@ impl EditorState {
     pub fn toggle_arch(&mut self, arch: DockerPlatform) {
         let mut selected = self
             .config
-            .rules
             .docker_release
             .platforms
             .clone()
@@ -290,7 +286,7 @@ impl EditorState {
             .copied()
             .filter(|p| selected.contains(p))
             .collect();
-        self.config.rules.docker_release.platforms = (!selected.is_empty()).then_some(selected);
+        self.config.docker_release.platforms = (!selected.is_empty()).then_some(selected);
         self.refresh();
         self.auto_save_ron();
     }
@@ -304,8 +300,8 @@ impl EditorState {
         let value = input.buffer.trim().to_string();
         let override_value = (!value.is_empty() && value != self.default_image()).then_some(value);
         match input.rule_id {
-            "docker-build" => self.config.rules.docker_build.image_name = override_value,
-            "docker-release" => self.config.rules.docker_release.image_name = override_value,
+            "docker-build" => self.config.docker_build.image_name = override_value,
+            "docker-release" => self.config.docker_release.image_name = override_value,
             _ => {}
         }
         self.refresh();
@@ -372,15 +368,13 @@ impl EditorState {
         self.switch_to_platform(platforms[(current_index + 1) % platforms.len()]);
     }
 
-    /// Switch the target platform; the choice is stored in cibox.ron only
-    /// when it differs from the inferred platform
+    /// Switch the target platform for this session; the choice is not
+    /// persisted — cibox.ron holds only rule overrides
     pub fn switch_to_platform(&mut self, platform: Platform) {
         self.platform = platform;
-        self.config.platform = (platform != self.inferred_platform).then_some(platform);
         self.existing_yaml =
             std::fs::read_to_string(self.working_dir.join(platform.output_path())).ok();
         self.refresh();
-        self.auto_save_ron();
     }
 
     pub fn open_platform_menu(&mut self) {
@@ -512,20 +506,20 @@ mod tests {
 
         // Toggling back removes the override entirely
         state.activate_current();
-        assert!(state.config.rules.is_default());
+        assert!(state.config.is_default());
     }
 
     #[test]
-    fn test_platform_override_is_delta_only() {
+    fn test_platform_switch_is_session_only() {
         let dir = rust_dir();
         let mut state = state_for(dir.path());
         assert_eq!(state.platform, Platform::GitHub);
 
+        // Switching platforms never touches cibox.ron — it only holds rules
         state.switch_to_platform(Platform::GitLab);
-        assert_eq!(state.config.platform, Some(Platform::GitLab));
-
-        state.switch_to_platform(state.inferred_platform);
-        assert_eq!(state.config.platform, None);
+        assert_eq!(state.platform, Platform::GitLab);
+        assert!(state.config.is_default());
+        assert!(!dir.path().join("cibox.ron").exists());
     }
 
     #[test]
@@ -541,7 +535,7 @@ mod tests {
         let dir = rust_dir();
         fs::write(
             dir.path().join("cibox.ron"),
-            "(rules: (rust_test: (enabled: false)))",
+            "(rust_test: (enabled: false))",
         )
         .unwrap();
         let state = state_for(dir.path());
@@ -605,7 +599,7 @@ mod tests {
         state.toggle_arch(DockerPlatform::LinuxAmd64);
         // Stored in ALL order regardless of toggle order
         assert_eq!(
-            state.config.rules.docker_release.platforms,
+            state.config.docker_release.platforms,
             Some(vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64])
         );
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
@@ -615,7 +609,7 @@ mod tests {
         // Unselecting everything removes the key entirely
         state.toggle_arch(DockerPlatform::LinuxArm64);
         state.toggle_arch(DockerPlatform::LinuxAmd64);
-        assert!(state.config.rules.is_default());
+        assert!(state.config.is_default());
     }
 
     #[test]
@@ -634,7 +628,7 @@ mod tests {
 
         // Esc cancels without touching the config
         state.cancel_input();
-        assert!(state.config.rules.is_default());
+        assert!(state.config.is_default());
 
         // Typing a custom name stores the override
         state.activate_current();
@@ -646,7 +640,7 @@ mod tests {
         }
         state.commit_input();
         assert_eq!(
-            state.config.rules.docker_build.image_name.as_deref(),
+            state.config.docker_build.image_name.as_deref(),
             Some("fossable/cibox")
         );
         assert!(state.yaml_preview.contains("fossable/cibox"));
@@ -662,6 +656,6 @@ mod tests {
             state.input_push(c);
         }
         state.commit_input();
-        assert!(state.config.rules.is_default());
+        assert!(state.config.is_default());
     }
 }

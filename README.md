@@ -64,22 +64,21 @@ switch (like NixOS services) plus a few knobs where they make sense:
 
 ```ron
 (
-    platform: GitHub,  // optional; inferred when omitted
-    rules: (
-        // Force a rule off that detection enabled
-        rust_audit: (enabled: false),
+    // Force a rule off that detection enabled
+    rust_audit: (enabled: false),
 
-        // Force a rule on that detection missed
-        go_lint: (enabled: true),
+    // Force a rule on that detection missed
+    go_lint: (enabled: true),
 
-        // Set a knob without touching enablement
-        docker_build: (image_name: "example/app"),
-    ),
+    // Set a knob without touching enablement
+    docker_build: (image_name: "example/app"),
 )
 ```
 
 Omitted rules follow detection; an omitted `enabled` leaves detection in
-charge while still applying the knobs.
+charge while still applying the knobs. The target platform is not part of
+the file — `cibox update` can generate for any platform, so pass
+`--platform` or let cibox infer it.
 
 You can use our TUI interface to edit this file or any editor with LSP support.
 Configure your editor to use `cibox lsp` as an LSP and you'll get inline

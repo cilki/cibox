@@ -19,9 +19,11 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
   `tags_only` run on `v*` tags everywhere; GitHub/Gitea put them in a
   separate `release.yml` (see `cibox/src/generator/mod.rs`).
 - `cibox/src/config/ron_types.rs` defines the `cibox.ron` schema: delta-only
-  overrides, nix-services style (`rule_name: (enabled: bool, ...knobs)`).
-  These types must stay hand-written literals — `build.rs` feeds this file to
-  roniker for the RON LSP (`cibox lsp`).
+  rule overrides at the top level, nix-services style
+  (`rule_name: (enabled: bool, ...knobs)`). The platform is not configured
+  there — it comes from `--platform` or inference. These types must stay
+  hand-written literals — `build.rs` feeds this file to roniker for the RON
+  LSP (`cibox lsp`).
 - `cibox update` merges into existing files instead of overwriting:
   `generator::plan` lists the managed files and their jobs,
   `generator::merge_file` conforms/prunes cibox-owned jobs (ownership via
@@ -34,12 +36,12 @@ To add a rule:
 
 1. Add a struct + `impl Rule` in the matching `cibox/src/rules/<env>.rs`
    (or a new file), and register it in `resolve()` in `rules/mod.rs`.
-2. Add a snake_case field for it to `Rules` in
+2. Add a snake_case field for it to `CiboxConfig` in
    `cibox/src/config/ron_types.rs` (type `RuleToggle`, or a dedicated struct
    if the rule has knobs) and extend `enabled_override` /
    `set_enabled_override`. A unit test checks the id ↔ field mapping.
-3. Give it a doc comment on the `Rules` field — roniker surfaces it in the
-   LSP.
+3. Give it a doc comment on the `CiboxConfig` field — roniker surfaces it in
+   the LSP.
 
 Jobs that need tools beyond a language toolchain should run on the
 `fossable/cibox` image (`CIBOX_IMAGE`), built from the `Dockerfile` at the

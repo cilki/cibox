@@ -1,34 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::Platform;
 use crate::error::Result;
 
-/// cibox.ron: overrides from the detected defaults. The file itself is
-/// optional and every field in it is optional — an empty `()` (or no file at
-/// all) means "do whatever detection decides".
+/// cibox.ron: per-rule overrides from the detected defaults, nix-services
+/// style — one entry per rule with an `enabled` override plus whatever knobs
+/// the rule supports. The file itself is optional and every field in it is
+/// optional — an empty `()` (or no file at all) means "do whatever detection
+/// decides". The target platform is not configured here: it comes from
+/// `--platform` or is inferred from existing CI files and the git remote.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CiboxConfig {
-    /// Target CI platform. Omit to infer it from existing CI files or the
-    /// git remote (falling back to GitHub).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform: Option<Platform>,
-    /// Per-rule overrides; rules not listed here follow detection
-    #[serde(skip_serializing_if = "Rules::is_default")]
-    pub rules: Rules,
-}
-
-impl CiboxConfig {
-    pub fn is_default(&self) -> bool {
-        self == &CiboxConfig::default()
-    }
-}
-
-/// One entry per rule, nix-services style: each rule has an `enabled`
-/// override plus whatever knobs the rule supports.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Rules {
     /// Run cargo test with all features on every push
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub rust_test: RuleToggle,
@@ -182,9 +164,9 @@ impl DockerReleaseRule {
     }
 }
 
-impl Rules {
+impl CiboxConfig {
     pub fn is_default(&self) -> bool {
-        self == &Rules::default()
+        self == &CiboxConfig::default()
     }
 
     /// The `enabled` override for a rule by its kebab-case id
@@ -243,7 +225,18 @@ pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
              for the new format."
         );
     }
-    Ok(crate::config::ron_options().from_str(ron_str)?)
+    crate::config::ron_options().from_str(ron_str).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("`platform`") || msg.contains("`rules`") {
+            anyhow::anyhow!(
+                "{msg}\ncibox.ron no longer has `platform` or `rules` fields: rule \
+                 overrides live at the top level, e.g. `(rust_test: (enabled: false))`, \
+                 and the platform comes from --platform or is inferred"
+            )
+        } else {
+            e.into()
+        }
+    })
 }
 
 /// Serialize a config as a pretty cibox.ron document
@@ -265,50 +258,41 @@ mod tests {
     fn test_parse_empty_config() {
         let config = parse_config("()").unwrap();
         assert!(config.is_default());
-        assert!(config.platform.is_none());
     }
 
     #[test]
     fn test_parse_overrides() {
         let config = parse_config(
             r#"(
-                platform: GitLab,
-                rules: (
-                    rust_release: (enabled: false),
-                    docker_build: (enabled: true, image_name: "fossable/cibox"),
-                ),
+                rust_release: (enabled: false),
+                docker_build: (enabled: true, image_name: "fossable/cibox"),
             )"#,
         )
         .unwrap();
-        assert_eq!(config.platform, Some(Platform::GitLab));
-        assert_eq!(config.rules.rust_release.enabled, Some(false));
-        assert_eq!(config.rules.docker_build.enabled, Some(true));
+        assert_eq!(config.rust_release.enabled, Some(false));
+        assert_eq!(config.docker_build.enabled, Some(true));
         assert_eq!(
-            config.rules.docker_build.image_name.as_deref(),
+            config.docker_build.image_name.as_deref(),
             Some("fossable/cibox")
         );
         // Unlisted rules follow detection
-        assert_eq!(config.rules.rust_test.enabled, None);
+        assert_eq!(config.rust_test.enabled, None);
     }
 
     #[test]
     fn test_knob_without_enabled_leaves_detection_in_charge() {
-        let config = parse_config(
-            r#"(rules: (docker_build: (image_name: "a/b")))"#,
-        )
-        .unwrap();
-        assert_eq!(config.rules.docker_build.enabled, None);
-        assert_eq!(config.rules.docker_build.image_name.as_deref(), Some("a/b"));
+        let config = parse_config(r#"(docker_build: (image_name: "a/b"))"#).unwrap();
+        assert_eq!(config.docker_build.enabled, None);
+        assert_eq!(config.docker_build.image_name.as_deref(), Some("a/b"));
     }
 
     #[test]
     fn test_serialize_is_delta_only() {
         let mut config = CiboxConfig::default();
-        config.rules.rust_release.enabled = Some(false);
+        config.rust_release.enabled = Some(false);
         let ron_str = serialize_config(&config).unwrap();
         assert!(ron_str.contains("rust_release"), "{ron_str}");
         assert!(!ron_str.contains("rust_test"), "{ron_str}");
-        assert!(!ron_str.contains("platform"), "{ron_str}");
 
         let parsed = parse_config(&ron_str).unwrap();
         assert_eq!(parsed, config);
@@ -316,29 +300,38 @@ mod tests {
 
     #[test]
     fn test_parse_docker_platforms() {
-        let config = parse_config(
-            r#"(rules: (docker_release: (platforms: [LinuxArm64, WindowsAmd64])))"#,
-        )
-        .unwrap();
+        let config =
+            parse_config(r#"(docker_release: (platforms: [LinuxArm64, WindowsAmd64]))"#).unwrap();
         assert_eq!(
-            config.rules.docker_release.platforms,
+            config.docker_release.platforms,
             Some(vec![
                 DockerPlatform::LinuxArm64,
                 DockerPlatform::WindowsAmd64
             ])
         );
-        assert_eq!(config.rules.docker_release.enabled, None);
+        assert_eq!(config.docker_release.enabled, None);
     }
 
     #[test]
     fn test_docker_platforms_round_trip() {
         let mut config = CiboxConfig::default();
-        config.rules.docker_release.platforms =
+        config.docker_release.platforms =
             Some(vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64]);
         let ron_str = serialize_config(&config).unwrap();
         assert!(ron_str.contains("platforms"), "{ron_str}");
         assert!(!ron_str.contains("image_name"), "{ron_str}");
         assert_eq!(parse_config(&ron_str).unwrap(), config);
+    }
+
+    #[test]
+    fn test_platform_and_rules_fields_rejected_with_hint() {
+        for old in [
+            "(platform: GitHub)",
+            "(rules: (rust_test: (enabled: false)))",
+        ] {
+            let err = parse_config(old).unwrap_err();
+            assert!(err.to_string().contains("top level"), "{old}: {err}");
+        }
     }
 
     #[test]
@@ -354,10 +347,10 @@ mod tests {
 
     #[test]
     fn test_enabled_override_round_trip() {
-        let mut rules = Rules::default();
-        rules.set_enabled_override("python-fmt", Some(true));
-        assert_eq!(rules.enabled_override("python-fmt"), Some(true));
-        rules.set_enabled_override("python-fmt", None);
-        assert!(rules.is_default());
+        let mut config = CiboxConfig::default();
+        config.set_enabled_override("python-fmt", Some(true));
+        assert_eq!(config.enabled_override("python-fmt"), Some(true));
+        config.set_enabled_override("python-fmt", None);
+        assert!(config.is_default());
     }
 }

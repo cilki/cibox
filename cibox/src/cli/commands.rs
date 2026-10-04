@@ -25,16 +25,12 @@ fn load_config(config_path: &str, explicit_required: bool) -> Result<CiboxConfig
     }
 }
 
-/// CLI flag > cibox.ron > inference from the repository
-fn effective_platform(
-    platform_arg: Option<String>,
-    config: &CiboxConfig,
-    facts: &ProjectFacts,
-) -> Result<Platform> {
+/// CLI flag > inference from the repository
+fn effective_platform(platform_arg: Option<String>, facts: &ProjectFacts) -> Result<Platform> {
     if let Some(p) = platform_arg {
         return Platform::from_str(&p).map_err(|_| crate::error::unsupported_platform_error(&p));
     }
-    Ok(config.platform.unwrap_or_else(|| infer_platform(facts)))
+    Ok(infer_platform(facts))
 }
 
 fn print_rule_table(resolved: &[ResolvedRule]) {
@@ -64,7 +60,7 @@ pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: boo
     let working_dir = PathBuf::from(".");
     let facts = gather_facts(&working_dir);
     let config = load_config(config_path, config_path != "cibox.ron")?;
-    let platform = effective_platform(platform_arg, &config, &facts)?;
+    let platform = effective_platform(platform_arg, &facts)?;
     let resolved = resolve(&facts, &config);
 
     println!(
@@ -154,13 +150,8 @@ pub fn handle_validate(config_path: &str) -> Result<()> {
     println!("\n{}", "Configuration is valid!".green().bold());
 
     let facts = gather_facts(Path::new("."));
-    let platform = config.platform.unwrap_or_else(|| infer_platform(&facts));
-    let source = if config.platform.is_some() {
-        "from cibox.ron"
-    } else {
-        "inferred"
-    };
-    println!("  Platform: {} ({})", platform.name().yellow(), source);
+    let platform = infer_platform(&facts);
+    println!("  Platform: {} (inferred)", platform.name().yellow());
     println!("  Rules:");
     print_rule_table(&resolve(&facts, &config));
 
