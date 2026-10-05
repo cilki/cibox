@@ -189,11 +189,16 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
 }
 
 fn rule_line(row: &RuleRow, is_selected: bool) -> Line<'static> {
-    let checkbox = if row.enabled { "[✓]" } else { "[ ]" };
+    // Detected-but-disabled means cibox.ron explicitly disables the rule
+    let checkbox = match (row.enabled, row.detected) {
+        (true, _) => "[✓]",
+        (false, true) => "[-]",
+        (false, false) => "[ ]",
+    };
     let checkbox_color = match (row.enabled, row.detected) {
         (true, true) => Color::Green,
-        (true, false) => Color::Yellow,
-        _ => Color::DarkGray,
+        (true, false) | (false, true) => Color::Yellow,
+        (false, false) => Color::DarkGray,
     };
 
     let text_color = if is_selected {
@@ -211,16 +216,10 @@ fn rule_line(row: &RuleRow, is_selected: bool) -> Line<'static> {
         (false, _) => "  ",
     };
 
-    // Mark rules whose state is overridden in cibox.ron
-    let marker = if row.overridden() { " *" } else { "" };
-
     Line::from(vec![
         Span::styled(format!(" {checkbox} "), Style::default().fg(checkbox_color)),
         Span::styled(arrow.to_string(), Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{}{}", row.id, marker),
-            Style::default().fg(text_color),
-        ),
+        Span::styled(row.id.to_string(), Style::default().fg(text_color)),
         Span::styled(
             format!("  {}", row.name),
             Style::default().fg(Color::DarkGray),
