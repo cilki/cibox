@@ -129,8 +129,10 @@ impl DockerRelease {
         steps
     }
 
-    /// Steps for the Windows-runner job: a plain build/push of `tag`
-    fn windows_steps(&self, facts: &ProjectFacts, tag: &str) -> Vec<Step> {
+    /// Steps for a plain single-architecture build and push of `tag`, used
+    /// both when no platforms are selected and for the Windows-runner job
+    /// (Windows images can't be cross-built with buildx)
+    fn build_push_steps(&self, facts: &ProjectFacts, tag: &str) -> Vec<Step> {
         vec![
             Step::checkout(),
             Step::run("Login to registry", self.login_command()),
@@ -186,20 +188,12 @@ impl Rule for DockerRelease {
             platforms.into_iter().partition(|p| p.is_windows());
 
         match (linux.is_empty(), windows.is_empty()) {
-            // No platform selection: single-arch build/push on the host runner
-            (true, true) => {
-                vec![self
-                    .release_job("", self.name())
-                    .with_timeout(30)
-                    .with_steps(vec![
-                        Step::checkout(),
-                        Step::run("Login to registry", self.login_command()),
-                        Step::run(
-                            "Build image",
-                            format!("docker build{} -t {} .", dockerfile_flag(facts), self.image),
-                        ),
-                        Step::run("Push image", format!("docker push {}", self.image)),
-                    ])]
+            // No linux targets: one plain build/push of the final tag, on a
+            // Windows runner if that's what was asked for
+            (true, windows_empty) => {
+                let job = self.release_job("", self.name()).with_timeout(30);
+                let job = if windows_empty { job } else { job.on_windows() };
+                vec![job.with_steps(self.build_push_steps(facts, &self.image))]
             }
             // Linux only: one buildx job pushes the multi-arch manifest
             (false, true) => {
@@ -207,14 +201,6 @@ impl Rule for DockerRelease {
                     .release_job("", self.name())
                     .with_timeout(60)
                     .with_steps(self.buildx_steps(facts, &linux, &self.image))]
-            }
-            // Windows only: one plain build/push on a Windows runner
-            (true, false) => {
-                vec![self
-                    .release_job("", self.name())
-                    .on_windows()
-                    .with_timeout(30)
-                    .with_steps(self.windows_steps(facts, &self.image))]
             }
             // Mixed: stage per-OS images, then merge into one manifest
             (false, false) => {
@@ -227,7 +213,7 @@ impl Rule for DockerRelease {
                     self.release_job("-windows", "Docker push (windows)")
                         .on_windows()
                         .with_timeout(30)
-                        .with_steps(self.windows_steps(facts, &windows_tag)),
+                        .with_steps(self.build_push_steps(facts, &windows_tag)),
                     self.release_job("", self.name())
                         .with_timeout(10)
                         .with_needs(vec![
