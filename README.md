@@ -152,6 +152,10 @@ language-servers = ["cibox-lsp"]
 | `rust-fmt` | `Cargo.toml` | `cargo fmt -- --check` |
 | `rust-clippy` | `Cargo.toml` | `cargo clippy --all-features -- -D warnings` |
 | `rust-audit` | `Cargo.toml` | `cargo audit` |
+| `rust-doc` | `Cargo.toml` | `cargo doc --no-deps --all-features` on nightly with `RUSTDOCFLAGS=--cfg docsrs` |
+| `rust-msrv` | `rust-version` in `Cargo.toml` | `cargo +<rust-version> check` |
+| `rust-feature-combos` | `[features]` in `Cargo.toml` | `cargo hack --feature-powerset check` |
+| `rust-minimal-versions` | publishable `[package]` | `cargo +nightly update -Zminimal-versions` then `cargo test --locked --all-features --all-targets` |
 | `rust-release` | publishable `[package]` | `cargo publish` on `v*` tags (needs `CARGO_REGISTRY_TOKEN`) |
 | `python-test` | `pyproject.toml` / `requirements.txt` | `pytest` |
 | `python-lint` | " | `ruff check .` |
@@ -164,6 +168,14 @@ language-servers = ["cibox-lsp"]
 | `docker-build` | `Dockerfile` / `dockerfile` / `Containerfile` | `docker build` |
 | `docker-release` | " | build + push on `v*` tags (`ghcr.io/` images use `GITHUB_TOKEN`, others Docker Hub credentials) |
 | `gitleaks` | git repository | `gitleaks detect` over full history |
+
+Detection is finer-grained than "is this a Rust project": `rust-msrv` only
+fires when the root package declares `rust-version`, `rust-feature-combos`
+only when it declares a `[features]` table, and `rust-minimal-versions` only
+for a publishable package, since it exists to catch dependency requirements
+that are lower than what the code really needs. Forcing `rust-msrv` on
+without a declared `rust-version` still works — the job then reads the
+version out of `Cargo.toml` at run time.
 
 On GitHub/Gitea, tag-triggered rules land in a `release.yml` next to
 `ci.yml`; other platforms gate them within the single pipeline file. Platforms
