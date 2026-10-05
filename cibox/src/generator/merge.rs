@@ -15,7 +15,6 @@ use crate::ir::Job;
 use crate::rules::ResolvedRule;
 use anyhow::{bail, Context};
 use serde_yaml::{Mapping, Value};
-use std::collections::BTreeSet;
 
 /// Result of merging canonical output into an existing file
 #[derive(Debug)]
@@ -83,16 +82,7 @@ pub fn merge_file(
     }
 
     let mut content = serde_yaml::to_string(&Value::Mapping(doc))?;
-    if matches!(platform, Platform::GitLab | Platform::CircleCI) {
-        let secrets: BTreeSet<&str> = kept
-            .iter()
-            .flat_map(|job| job.secrets.iter().map(String::as_str))
-            .collect();
-        if !secrets.is_empty() {
-            let names = secrets.into_iter().collect::<Vec<_>>().join(", ");
-            content.insert_str(0, &format!("# Required CI variables: {names}\n"));
-        }
-    }
+    crate::generator::prepend_required_variables(platform, &kept, &mut content);
 
     Ok(MergeOutcome::Merged {
         content,
@@ -606,6 +596,38 @@ my-job:
         // The custom stage survives because my-job references it
         assert!(content.contains("custom"), "{content}");
         assert_eq!((conformed, removed, preserved), (1, 0, 1));
+    }
+
+    #[test]
+    fn test_merge_lists_required_variables_only_where_needed() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+
+        // A kept job with secrets gets the header on the ambient-variable
+        // platforms...
+        let existing = "stages: [deploy]\nrust-release:\n  stage: deploy\n  script: [echo stale]\n";
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitLab, &file, &resolved, existing).unwrap());
+        assert!(
+            content.starts_with("# Required CI variables: CARGO_REGISTRY_TOKEN\n"),
+            "{content}"
+        );
+
+        // ...but not when the surviving jobs need no secrets
+        let existing = "stages: [test]\nrust-test:\n  stage: test\n  script: [echo stale]\n";
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitLab, &file, &resolved, existing).unwrap());
+        assert!(!content.contains("Required CI variables"), "{content}");
+
+        // GitHub workflows name their secrets inline, so no header there
+        let existing = "name: Release\non:\n  push:\n    tags: [v*]\njobs:\n  \
+                        rust-release:\n    runs-on: ubuntu-latest\n    steps:\n      \
+                        - run: echo stale\n";
+        let file = planned_file(Platform::GitHub, &resolved, 1);
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitHub, &file, &resolved, existing).unwrap());
+        assert!(!content.contains("Required CI variables"), "{content}");
     }
 
     #[test]

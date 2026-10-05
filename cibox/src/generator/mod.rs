@@ -8,8 +8,10 @@ use crate::config::Platform;
 use crate::detection::ProjectFacts;
 use crate::error::Result;
 use crate::ir::Job;
+use crate::platforms::circleci::lower::lower_circleci;
 use crate::platforms::github::lower::lower_github;
 pub use crate::platforms::github::lower::WorkflowKind;
+use crate::platforms::gitlab::lower::lower_gitlab;
 use crate::rules::{enabled_jobs, ResolvedRule};
 use anyhow::bail;
 use std::collections::BTreeSet;
@@ -82,29 +84,33 @@ pub fn plan(
 
 /// Render the full canonical content of one planned file.
 pub fn render_file(platform: Platform, file: &PlannedFile) -> Result<String> {
-    match platform {
+    // Gitea Actions uses the GitHub Actions workflow format
+    let mut content = match platform {
         Platform::GitHub | Platform::Gitea => {
-            let workflow = lower_github(&file.jobs, file.kind);
-            Ok(serde_yaml::to_string(&workflow)?)
+            serde_yaml::to_string(&lower_github(&file.jobs, file.kind))?
         }
-        Platform::GitLab | Platform::CircleCI => {
-            let lowered = crate::platforms::lower::lower(platform, &file.jobs)?;
-            let mut content = lowered.render()?;
+        Platform::GitLab => serde_yaml::to_string(&lower_gitlab(&file.jobs))?,
+        Platform::CircleCI => serde_yaml::to_string(&lower_circleci(&file.jobs))?,
+    };
+    prepend_required_variables(platform, &file.jobs, &mut content);
+    Ok(content)
+}
 
-            // These platforms read secrets from ambient CI variables; list
-            // what the jobs expect so setup is discoverable
-            let secrets: BTreeSet<&str> = file
-                .jobs
-                .iter()
-                .flat_map(|job| job.secrets.iter().map(String::as_str))
-                .collect();
-            if !secrets.is_empty() {
-                let names = secrets.into_iter().collect::<Vec<_>>().join(", ");
-                content.insert_str(0, &format!("# Required CI variables: {names}\n"));
-            }
-
-            Ok(content)
-        }
+/// GitLab and CircleCI read secrets from ambient CI variables rather than
+/// naming them in the pipeline, so list what the jobs expect at the top of
+/// the file to make setup discoverable. A no-op on the other platforms,
+/// whose lowered jobs reference their secrets inline.
+pub(crate) fn prepend_required_variables(platform: Platform, jobs: &[Job], content: &mut String) {
+    if !matches!(platform, Platform::GitLab | Platform::CircleCI) {
+        return;
+    }
+    let secrets: BTreeSet<&str> = jobs
+        .iter()
+        .flat_map(|job| job.secrets.iter().map(String::as_str))
+        .collect();
+    if !secrets.is_empty() {
+        let names = secrets.into_iter().collect::<Vec<_>>().join(", ");
+        content.insert_str(0, &format!("# Required CI variables: {names}\n"));
     }
 }
 

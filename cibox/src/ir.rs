@@ -1,7 +1,7 @@
 //! Platform-neutral intermediate representation of CI jobs.
 //!
-//! Rules describe their jobs once as [`Job`]s; the lowering layer in
-//! `crate::platforms::lower` turns them into each platform's config model.
+//! Rules describe their jobs once as [`Job`]s; the per-platform backends in
+//! `crate::platforms` lower them into each platform's config model.
 
 /// Pipeline phase; variant order is the GitLab stage order
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
