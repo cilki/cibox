@@ -185,13 +185,14 @@ fn merge_github(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
         conform_jobs_map(jobs, &job_keys, canonical_jobs, resolved);
 
     // Only `jobs` is managed; user-tuned triggers/env/permissions are kept.
-    // Scaffold `name`/`on` solely when the workflow lacks them.
-    for key in ["name", "on"] {
-        if !doc.contains_key(key) {
-            if let Some(value) = canonical.get(key) {
-                doc.insert(Value::from(key), value.clone());
-            }
-        }
+    // Scaffold `name`/`on`/`permissions` solely when the workflow lacks them.
+    let scaffold: Vec<(Value, Value)> = ["name", "on", "permissions"]
+        .iter()
+        .filter(|key| !doc.contains_key(**key))
+        .filter_map(|key| Some((Value::from(*key), canonical.get(key)?.clone())))
+        .collect();
+    if !scaffold.is_empty() {
+        doc = insert_before_jobs(doc, scaffold);
     }
 
     Ok(Merged {
@@ -201,6 +202,22 @@ fn merge_github(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
         removed,
         preserved,
     })
+}
+
+/// Add top-level entries ahead of `jobs`, where a workflow's preamble
+/// belongs. `Mapping` only appends, so the document is rebuilt in order.
+fn insert_before_jobs(doc: Mapping, entries: Vec<(Value, Value)>) -> Mapping {
+    let mut rebuilt = Mapping::with_capacity(doc.len() + entries.len());
+    let mut entries = Some(entries);
+    for (key, value) in doc {
+        if key.as_str() == Some("jobs") {
+            rebuilt.extend(entries.take().into_iter().flatten());
+        }
+        rebuilt.insert(key, value);
+    }
+    // No `jobs` key to anchor against (the caller rejects that), so append
+    rebuilt.extend(entries.into_iter().flatten());
+    rebuilt
 }
 
 /// Top-level `.gitlab-ci.yml` keys that are configuration, not jobs.
@@ -536,6 +553,53 @@ jobs:
             merge_file(Platform::GitHub, &file, &resolved, existing).unwrap(),
             MergeOutcome::WouldEmpty
         ));
+    }
+
+    #[test]
+    fn test_github_scaffolds_permissions_but_never_overrides_them() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+
+        // A workflow predating the permissions block gets the read-only
+        // default, so the update actually fixes an over-privileged token
+        let without = r#"
+name: CI
+on: [push]
+jobs:
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+"#;
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitHub, &file, &resolved, without).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(doc["permissions"]["contents"].as_str(), Some("read"));
+        // Scaffolded keys land in the preamble, not after the job list
+        assert!(
+            content.find("permissions:").unwrap() < content.find("jobs:").unwrap(),
+            "{content}"
+        );
+
+        // A user who widened the token on purpose keeps their choice
+        let with = r#"
+name: CI
+on: [push]
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+"#;
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitHub, &file, &resolved, with).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(doc["permissions"]["contents"].as_str(), Some("write"));
+        assert_eq!(doc["permissions"]["id-token"].as_str(), Some("write"));
     }
 
     #[test]

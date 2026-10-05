@@ -54,9 +54,19 @@ pub fn lower_github(jobs: &[Job], kind: WorkflowKind) -> GitHubWorkflow {
             WorkflowKind::Release => "Release".to_string(),
         },
         on,
+        // Least privilege: checking out the code is all any job gets unless
+        // it asks for more. Without this key the token inherits the
+        // repository default, which on older repos and organizations is
+        // write-all — handing every `run:` step push access.
+        permissions: Some(base_permissions()),
         env: None,
         jobs: lowered,
     }
+}
+
+/// The scopes every job needs: read the repository so checkout works
+fn base_permissions() -> BTreeMap<String, String> {
+    BTreeMap::from([("contents".to_string(), "read".to_string())])
 }
 
 fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
@@ -129,6 +139,14 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
         env.insert(secret.clone(), format!("${{{{ secrets.{secret} }}}}"));
     }
 
+    // A job-level block replaces the workflow-level one rather than adding to
+    // it, so the extra scopes have to be spelled out alongside the base ones
+    let permissions = (!job.permissions.is_empty()).then(|| {
+        let mut permissions = base_permissions();
+        permissions.extend(job.permissions.iter().cloned());
+        permissions
+    });
+
     GitHubJob {
         runs_on: match job.runs_on {
             RunnerOs::Linux => "ubuntu-latest",
@@ -147,6 +165,7 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
         } else {
             job.image.clone()
         },
+        permissions,
         env: (!env.is_empty()).then_some(env),
         steps,
         needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
@@ -264,6 +283,37 @@ mod tests {
         let linux = &workflow.jobs["docker-release-linux"];
         assert_eq!(linux.runs_on, "ubuntu-latest");
         assert_eq!(linux.defaults, None);
+    }
+
+    #[test]
+    fn test_workflow_token_is_read_only_by_default() {
+        for kind in [WorkflowKind::Ci, WorkflowKind::Release] {
+            let workflow = lower_github(&[Job::new("rust-test", "Cargo test", Stage::Test)], kind);
+            assert_eq!(
+                workflow.permissions.as_ref().unwrap()["contents"],
+                "read",
+                "{kind:?}"
+            );
+            // Nothing declared, so the job inherits the workflow scopes
+            assert_eq!(workflow.jobs["rust-test"].permissions, None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_declared_permissions_are_added_to_the_base_scopes() {
+        let workflow = lower_github(
+            &[Job::new("docker-release", "Docker push", Stage::Deploy)
+                .with_permission("packages", "write")],
+            WorkflowKind::Release,
+        );
+        let permissions = workflow.jobs["docker-release"]
+            .permissions
+            .as_ref()
+            .unwrap();
+        assert_eq!(permissions["packages"], "write");
+        // A job-level block overrides the workflow one outright, so checkout
+        // would break without the base scope repeated here
+        assert_eq!(permissions["contents"], "read");
     }
 
     #[test]

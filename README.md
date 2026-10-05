@@ -68,6 +68,16 @@ whose rule you disabled, and leaves everything else alone: jobs you deleted
 stay deleted, and jobs you added are kept. Pass `--force` to rewrite the
 files from scratch instead.
 
+### Token permissions
+
+GitHub and Gitea workflows are generated with `permissions: contents: read`,
+so the ambient CI token can check out the code and nothing else — without
+that key the token inherits the repository or organization default, which can
+be write-all. Jobs that genuinely need more ask for it individually:
+`docker-release` adds `packages: write` when the image lives on `ghcr.io`.
+`cibox update` only scaffolds the block into a workflow that has none, so if
+you widen the token yourself your version is kept.
+
 ## `cibox.ron`
 
 `cibox.ron` holds only your *overrides* from the detected defaults — no file
