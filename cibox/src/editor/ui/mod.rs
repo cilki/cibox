@@ -14,6 +14,16 @@ enum DiffType {
     Removed,
 }
 
+impl DiffType {
+    fn background(self) -> Option<Color> {
+        match self {
+            DiffType::Added => Some(Color::Green),
+            DiffType::Removed => Some(Color::Red),
+            DiffType::Unchanged => None,
+        }
+    }
+}
+
 pub fn render_ui(f: &mut Frame, state: &EditorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -228,22 +238,12 @@ fn rule_line(row: &RuleRow, is_selected: bool) -> Line<'static> {
 }
 
 fn render_preview_panel(f: &mut Frame, area: Rect, state: &EditorState) {
-    let preview = if let Some(error) = &state.generation_error {
-        Paragraph::new(format!("Error: {}", error))
-            .style(Style::default().fg(Color::Red))
-            .wrap(Wrap { trim: true })
-            .scroll((state.preview_scroll, 0))
-    } else {
-        // Apply syntax highlighting to YAML with diff support
-        let lines = if let Some(existing) = &state.existing_yaml {
-            highlight_yaml_with_diff(&state.yaml_preview, existing)
-        } else {
-            highlight_yaml(&state.yaml_preview)
-        };
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((state.preview_scroll, 0))
-    };
+    let preview = Paragraph::new(highlight_yaml(
+        &state.yaml_preview,
+        state.existing_yaml.as_deref(),
+    ))
+    .wrap(Wrap { trim: false })
+    .scroll((state.preview_scroll, 0));
 
     let output_path = state.platform.output_path();
     let filename = output_path.to_str().unwrap_or("config.yml");
@@ -379,223 +379,78 @@ fn compute_diff(old: &str, new: &str) -> Vec<(String, DiffType)> {
     result
 }
 
-/// Highlight YAML with diff information
-fn highlight_yaml_with_diff(new_yaml: &str, old_yaml: &str) -> Vec<Line<'static>> {
-    let diff = compute_diff(old_yaml, new_yaml);
-    let mut lines = Vec::new();
-
-    for (line_text, diff_type) in diff {
-        let bg_color = match diff_type {
-            DiffType::Added => Some(Color::Green),
-            DiffType::Removed => Some(Color::Red),
-            DiffType::Unchanged => None,
-        };
-
-        // Apply YAML syntax highlighting to the line
-        let highlighted_line = highlight_yaml_line_owned(line_text, bg_color);
-        lines.push(highlighted_line);
+/// Syntax-highlight the preview. With `existing` present, every line also
+/// carries the background color of its diff status against the file on disk.
+fn highlight_yaml(yaml: &str, existing: Option<&str>) -> Vec<Line<'static>> {
+    match existing {
+        Some(old) => compute_diff(old, yaml)
+            .into_iter()
+            .map(|(line, diff)| highlight_line(&line, diff.background()))
+            .collect(),
+        None => yaml
+            .lines()
+            .map(|line| highlight_line(line, None))
+            .collect(),
     }
-
-    lines
 }
 
-/// Highlight a single YAML line with optional background color (owned version for diff)
-fn highlight_yaml_line_owned(line: String, bg_color: Option<Color>) -> Line<'static> {
-    let trimmed_start = line.trim_start();
-
-    if trimmed_start.is_empty() {
+/// Syntax-highlight one YAML line over an optional diff background color
+fn highlight_line(line: &str, bg: Option<Color>) -> Line<'static> {
+    let body = line.trim_start();
+    if body.is_empty() {
         return Line::from("");
     }
 
-    // Comment lines
-    if trimmed_start.starts_with('#') {
-        let mut style = Style::default().fg(Color::DarkGray);
-        if let Some(bg) = bg_color {
+    let span = |text: String, fg: Option<Color>| {
+        let mut style = Style::default();
+        if let Some(fg) = fg {
+            style = style.fg(fg);
+        }
+        if let Some(bg) = bg {
             style = style.bg(bg);
         }
-        return Line::from(Span::styled(line, style));
+        Span::styled(text, style)
+    };
+
+    if body.starts_with('#') {
+        return Line::from(span(line.to_string(), Some(Color::DarkGray)));
     }
 
-    // Parse the line into spans
     let mut spans = Vec::new();
-    let indent = line.len() - trimmed_start.len();
-
-    // Add indentation
+    let indent = line.len() - body.len();
     if indent > 0 {
-        let mut style = Style::default();
-        if let Some(bg) = bg_color {
-            style = style.bg(bg);
-        }
-        spans.push(Span::styled(" ".repeat(indent), style));
+        spans.push(span(" ".repeat(indent), None));
     }
 
-    // Key-value pairs
-    if let Some(colon_pos) = trimmed_start.find(':') {
-        let key = trimmed_start[..colon_pos].to_string();
-        let rest = &trimmed_start[colon_pos..];
-
-        // Key (cyan)
-        let mut key_style = Style::default().fg(Color::Cyan);
-        if let Some(bg) = bg_color {
-            key_style = key_style.bg(bg);
+    if let Some((key, rest)) = body.split_once(':') {
+        spans.push(span(key.to_string(), Some(Color::Cyan)));
+        spans.push(span(":".to_string(), None));
+        let value = rest.trim_start();
+        if !value.is_empty() {
+            spans.push(span(" ".to_string(), None));
+            spans.push(span(value.to_string(), value_color(value)));
         }
-        spans.push(Span::styled(key, key_style));
-
-        // Colon
-        let mut colon_style = Style::default();
-        if let Some(bg) = bg_color {
-            colon_style = colon_style.bg(bg);
-        }
-        spans.push(Span::styled(":".to_string(), colon_style));
-
-        if rest.len() > 1 {
-            let value = rest[1..].trim_start();
-
-            // Space before value
-            let mut space_style = Style::default();
-            if let Some(bg) = bg_color {
-                space_style = space_style.bg(bg);
-            }
-            spans.push(Span::styled(" ".to_string(), space_style));
-
-            // Check for special values
-            let mut value_style = if value.starts_with('"') || value.starts_with('\'') {
-                // String value (green)
-                Style::default().fg(Color::Green)
-            } else if value == "true" || value == "false" {
-                // Boolean (magenta)
-                Style::default().fg(Color::Magenta)
-            } else if value.parse::<f64>().is_ok() {
-                // Number (yellow)
-                Style::default().fg(Color::Yellow)
-            } else {
-                // Other value
-                Style::default()
-            };
-
-            if let Some(bg) = bg_color {
-                value_style = value_style.bg(bg);
-            }
-
-            if !value.is_empty() {
-                spans.push(Span::styled(value.to_string(), value_style));
-            }
-        }
-    } else if let Some(rest) = trimmed_start.strip_prefix("- ") {
-        // List item
-        let mut bullet_style = Style::default().fg(Color::Yellow);
-        if let Some(bg) = bg_color {
-            bullet_style = bullet_style.bg(bg);
-        }
-        spans.push(Span::styled("- ".to_string(), bullet_style));
-
-        let mut text_style = Style::default();
-        if let Some(bg) = bg_color {
-            text_style = text_style.bg(bg);
-        }
-        spans.push(Span::styled(rest.to_string(), text_style));
+    } else if let Some(rest) = body.strip_prefix("- ") {
+        spans.push(span("- ".to_string(), Some(Color::Yellow)));
+        spans.push(span(rest.to_string(), None));
     } else {
-        // Other lines
-        let mut style = Style::default();
-        if let Some(bg) = bg_color {
-            style = style.bg(bg);
-        }
-        spans.push(Span::styled(trimmed_start.to_string(), style));
+        spans.push(span(body.to_string(), None));
     }
 
     Line::from(spans)
 }
 
-fn highlight_yaml(yaml: &str) -> Vec<Line<'_>> {
-    let mut lines = Vec::new();
-
-    for line in yaml.lines() {
-        let trimmed = line.trim_start();
-
-        if trimmed.is_empty() {
-            lines.push(Line::from(""));
-            continue;
-        }
-
-        // Comment lines
-        if trimmed.starts_with('#') {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
-            continue;
-        }
-
-        // Parse the line into spans
-        let mut spans = Vec::new();
-        let indent = line.len() - trimmed.len();
-
-        // Add indentation
-        if indent > 0 {
-            spans.push(Span::raw(" ".repeat(indent)));
-        }
-
-        // Key-value pairs
-        if let Some(colon_pos) = trimmed.find(':') {
-            let key = &trimmed[..colon_pos];
-            let rest = &trimmed[colon_pos..];
-
-            // Key (cyan)
-            spans.push(Span::styled(
-                key.to_string(),
-                Style::default().fg(Color::Cyan),
-            ));
-
-            // Colon
-            spans.push(Span::raw(":"));
-
-            if rest.len() > 1 {
-                let value = &rest[1..].trim_start();
-
-                // Check for special values
-                if value.starts_with('"') || value.starts_with('\'') {
-                    // String value (green)
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        value.to_string(),
-                        Style::default().fg(Color::Green),
-                    ));
-                } else if *value == "true" || *value == "false" {
-                    // Boolean (magenta)
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        value.to_string(),
-                        Style::default().fg(Color::Magenta),
-                    ));
-                } else if value.parse::<f64>().is_ok() {
-                    // Number (yellow)
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        value.to_string(),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                } else if !value.is_empty() {
-                    // Other value
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::raw(value.to_string()));
-                }
-            }
-        } else if let Some(rest) = trimmed.strip_prefix("- ") {
-            // List item
-            spans.push(Span::styled(
-                "- ".to_string(),
-                Style::default().fg(Color::Yellow),
-            ));
-            spans.push(Span::raw(rest.to_string()));
-        } else {
-            // Other lines
-            spans.push(Span::raw(trimmed.to_string()));
-        }
-
-        lines.push(Line::from(spans));
+/// Color for a scalar value: quoted strings, booleans and numbers stand out
+fn value_color(value: &str) -> Option<Color> {
+    if value.starts_with('"') || value.starts_with('\'') {
+        Some(Color::Green)
+    } else if value == "true" || value == "false" {
+        Some(Color::Magenta)
+    } else if value.parse::<f64>().is_ok() {
+        Some(Color::Yellow)
+    } else {
+        None
     }
-
-    lines
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &EditorState) {
@@ -639,4 +494,101 @@ fn render_footer(f: &mut Frame, area: Rect, state: &EditorState) {
         Paragraph::new(Line::from(help_text)).block(Block::default().borders(Borders::ALL));
 
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (text, foreground, background) of every span on a line
+    fn spans(line: &Line<'static>) -> Vec<(String, Option<Color>, Option<Color>)> {
+        line.spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.fg, s.style.bg))
+            .collect()
+    }
+
+    #[test]
+    fn test_key_value_lines_keep_indentation() {
+        let lines = highlight_yaml("jobs:\n    timeout-minutes: 30\n", None);
+        assert_eq!(
+            spans(&lines[0]),
+            vec![
+                ("jobs".to_string(), Some(Color::Cyan), None),
+                (":".to_string(), None, None),
+            ]
+        );
+        assert_eq!(
+            spans(&lines[1]),
+            vec![
+                ("    ".to_string(), None, None),
+                ("timeout-minutes".to_string(), Some(Color::Cyan), None),
+                (":".to_string(), None, None),
+                (" ".to_string(), None, None),
+                ("30".to_string(), Some(Color::Yellow), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scalar_values_are_colored_by_kind() {
+        assert_eq!(value_color("\"quoted\""), Some(Color::Green));
+        assert_eq!(value_color("'quoted'"), Some(Color::Green));
+        assert_eq!(value_color("true"), Some(Color::Magenta));
+        assert_eq!(value_color("false"), Some(Color::Magenta));
+        assert_eq!(value_color("1.5"), Some(Color::Yellow));
+        assert_eq!(value_color("ubuntu-latest"), None);
+    }
+
+    #[test]
+    fn test_comments_blanks_and_list_items() {
+        let lines = highlight_yaml("# a comment\n\n  - cargo test\n  bare\n", None);
+        assert_eq!(
+            spans(&lines[0]),
+            vec![("# a comment".to_string(), Some(Color::DarkGray), None)]
+        );
+        assert!(lines[1].spans.is_empty());
+        assert_eq!(
+            spans(&lines[2]),
+            vec![
+                ("  ".to_string(), None, None),
+                ("- ".to_string(), Some(Color::Yellow), None),
+                ("cargo test".to_string(), None, None),
+            ]
+        );
+        // A line with neither a colon nor a bullet is emitted unstyled
+        assert_eq!(
+            spans(&lines[3]),
+            vec![
+                ("  ".to_string(), None, None),
+                ("bare".to_string(), None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_diff_marks_added_and_removed_lines() {
+        let lines = highlight_yaml("a: 1\nc: 3\n", Some("a: 1\nb: 2\n"));
+        let backgrounds: Vec<(String, Option<Color>)> = lines
+            .iter()
+            .map(|l| {
+                (
+                    l.spans.iter().map(|s| s.content.as_ref()).collect(),
+                    l.spans.first().and_then(|s| s.style.bg),
+                )
+            })
+            .collect();
+        assert_eq!(
+            backgrounds,
+            vec![
+                ("a: 1".to_string(), None),
+                ("b: 2".to_string(), Some(Color::Red)),
+                ("c: 3".to_string(), Some(Color::Green)),
+            ]
+        );
+        // The background covers the whole line, syntax colors and all
+        let added = lines.last().unwrap();
+        assert!(added.spans.iter().all(|s| s.style.bg == Some(Color::Green)));
+        assert_eq!(added.spans[0].style.fg, Some(Color::Cyan));
+    }
 }

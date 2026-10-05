@@ -82,7 +82,6 @@ pub struct EditorState {
     pub platform_menu_cursor: usize,
     pub preview_scroll: u16,
     pub yaml_preview: String,
-    pub generation_error: Option<String>,
     pub existing_yaml: Option<String>,
     pub current_item_description: String,
 
@@ -133,7 +132,6 @@ impl EditorState {
                 .unwrap_or(0),
             preview_scroll: 0,
             yaml_preview: String::new(),
-            generation_error: None,
             existing_yaml,
             current_item_description: String::new(),
             should_quit: false,
@@ -214,24 +212,18 @@ impl EditorState {
         }
 
         self.preview_scroll = 0;
-        match crate::generator::generate(&self.facts, &resolved, self.platform) {
-            Ok(outputs) => {
-                self.yaml_preview = if outputs.len() == 1 {
-                    outputs.into_iter().next().unwrap().1
-                } else {
-                    outputs
-                        .into_iter()
-                        .map(|(path, content)| format!("# ==> {} <==\n{}", path.display(), content))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                self.generation_error = None;
-            }
-            Err(e) => {
-                self.yaml_preview = format!("# {e}");
-                self.generation_error = None;
-            }
-        }
+        self.yaml_preview = match crate::generator::generate(&self.facts, &resolved, self.platform)
+        {
+            // A single file is previewed verbatim; several get path banners
+            Ok(outputs) if outputs.len() == 1 => outputs.into_iter().next().unwrap().1,
+            Ok(outputs) => outputs
+                .into_iter()
+                .map(|(path, content)| format!("# ==> {} <==\n{}", path.display(), content))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            // Nothing enabled, or the platform refuses a job: say so inline
+            Err(e) => format!("# {e}"),
+        };
     }
 
     pub fn current_row(&self) -> Option<&Row> {
