@@ -559,13 +559,14 @@ mod tests {
     fn test_expand_shows_config_option_rows() {
         let dir = docker_dir();
         let mut state = state_for(dir.path());
+        let collapsed_len = state.rows.len();
 
         // Only expandable rules react to expand
         state.cursor = rule_index(&state, "rust-test");
         state.expand_current();
         assert_eq!(
             state.rows.len(),
-            16,
+            collapsed_len,
             "non-expandable rule must not grow the list"
         );
 
@@ -578,13 +579,13 @@ mod tests {
             Row::TextKnob { label: "image_name", .. }
         ));
         // image_name + one row per DockerPlatform
-        assert_eq!(state.rows.len(), 16 + 1 + DockerPlatform::ALL.len());
+        assert_eq!(state.rows.len(), collapsed_len + 1 + DockerPlatform::ALL.len());
 
         // Collapsing from a child row jumps back to the parent
         state.cursor = idx + 2;
         state.collapse_current();
         assert_eq!(state.cursor, rule_index(&state, "docker-release"));
-        assert_eq!(state.rows.len(), 16);
+        assert_eq!(state.rows.len(), collapsed_len);
     }
 
     #[test]

@@ -159,6 +159,11 @@ impl Job {
         self
     }
 
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
     pub fn with_secrets(mut self, secrets: Vec<String>) -> Self {
         self.secrets = secrets;
         self

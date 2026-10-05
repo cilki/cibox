@@ -11,6 +11,10 @@ pub struct RustFacts {
     /// The root package exists and is not `publish = false`
     pub publishable: bool,
     pub package_name: Option<String>,
+    /// The `rust-version` of the root package, if declared
+    pub msrv: Option<String>,
+    /// The root manifest declares at least one feature
+    pub has_features: bool,
 }
 
 pub(super) fn gather(path: &Path) -> Option<RustFacts> {
@@ -25,11 +29,18 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
         Err(_) => true,
     });
 
+    let msrv = package
+        .and_then(|p| p.rust_version.as_ref())
+        .and_then(|v| v.get().ok())
+        .cloned();
+
     Some(RustFacts {
         is_workspace: manifest.workspace.is_some(),
         has_package: package.is_some(),
         publishable,
         package_name: package.map(|p| p.name().to_string()),
+        msrv,
+        has_features: !manifest.features.is_empty(),
     })
 }
 
@@ -66,6 +77,30 @@ mod tests {
             facts_for("[package]\nname = \"app\"\nversion = \"0.1.0\"\npublish = false\n")
                 .unwrap();
         assert!(!facts.publishable);
+    }
+
+    #[test]
+    fn test_msrv_from_rust_version() {
+        let facts = facts_for(
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nrust-version = \"1.74.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(facts.msrv.as_deref(), Some("1.74.0"));
+
+        let facts = facts_for("[package]\nname = \"lib\"\nversion = \"0.1.0\"\n").unwrap();
+        assert_eq!(facts.msrv, None);
+    }
+
+    #[test]
+    fn test_has_features() {
+        let facts = facts_for(
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\n\n[features]\nfoo = []\n",
+        )
+        .unwrap();
+        assert!(facts.has_features);
+
+        let facts = facts_for("[package]\nname = \"lib\"\nversion = \"0.1.0\"\n").unwrap();
+        assert!(!facts.has_features);
     }
 
     #[test]

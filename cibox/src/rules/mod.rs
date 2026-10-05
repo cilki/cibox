@@ -20,7 +20,10 @@ pub use docker::{DockerBuild, DockerRelease};
 pub use gitleaks::Gitleaks;
 pub use go::{GoAudit, GoBuild, GoLint, GoTest};
 pub use python::{PythonFmt, PythonLint, PythonRelease, PythonTest};
-pub use rust::{RustAudit, RustClippy, RustFmt, RustRelease, RustTest};
+pub use rust::{
+    RustAudit, RustClippy, RustDoc, RustFmt, RustFeatureCombos, RustMinimalVersions, RustMsrv,
+    RustRelease, RustTest,
+};
 
 /// Docker image with all dependencies needed by generated CI jobs
 pub(crate) const CIBOX_IMAGE: &str = "fossable/cibox:latest";
@@ -77,6 +80,10 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         Box::new(RustFmt),
         Box::new(RustClippy),
         Box::new(RustAudit),
+        Box::new(RustDoc),
+        Box::new(RustMsrv),
+        Box::new(RustFeatureCombos),
+        Box::new(RustMinimalVersions),
         Box::new(RustRelease),
         Box::new(PythonTest),
         Box::new(PythonLint),

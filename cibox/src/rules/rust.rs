@@ -147,6 +147,184 @@ impl Rule for RustAudit {
     }
 }
 
+/// Build documentation on nightly with docsrs cfg
+pub struct RustDoc;
+
+impl Rule for RustDoc {
+    fn id(&self) -> &'static str {
+        "rust-doc"
+    }
+
+    fn name(&self) -> &'static str {
+        "Cargo doc"
+    }
+
+    fn description(&self) -> &'static str {
+        "Build documentation on nightly with RUSTDOCFLAGS=--cfg docsrs"
+    }
+
+    fn detect(&self, facts: &ProjectFacts) -> bool {
+        is_rust(facts)
+    }
+
+    fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
+        vec![Job::new(self.id(), self.name(), Stage::Lint)
+            // docsrs cfg (e.g. doc_cfg annotations) needs a nightly toolchain
+            .with_image("rustlang/rust:nightly")
+            .with_timeout(15)
+            .with_env("RUSTDOCFLAGS", "--cfg docsrs")
+            // Nightly artifacts don't mix with the shared stable rust-cache
+            .with_cache(
+                "rust-doc-cache",
+                vec!["target/".to_string(), ".cargo/".to_string()],
+            )
+            .with_steps(vec![
+                Step::checkout(),
+                Step::run("Build docs", "cargo doc --no-deps --all-features"),
+            ])]
+    }
+}
+
+/// Check the build with the minimum supported rust version
+pub struct RustMsrv;
+
+impl Rule for RustMsrv {
+    fn id(&self) -> &'static str {
+        "rust-msrv"
+    }
+
+    fn name(&self) -> &'static str {
+        "MSRV check"
+    }
+
+    fn description(&self) -> &'static str {
+        "Check the build with the rust-version declared in Cargo.toml"
+    }
+
+    fn detect(&self, facts: &ProjectFacts) -> bool {
+        facts.rust.as_ref().is_some_and(|r| r.msrv.is_some())
+    }
+
+    fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
+        let steps = match facts.rust.as_ref().and_then(|r| r.msrv.as_deref()) {
+            Some(msrv) => vec![
+                Step::checkout(),
+                Step::run(
+                    "Install MSRV toolchain",
+                    format!("rustup toolchain install {msrv} --profile minimal"),
+                ),
+                Step::run("Check with MSRV", format!("cargo +{msrv} check")),
+            ],
+            // Force-enabled without a rust-version fact: derive it in shell
+            None => vec![
+                Step::checkout(),
+                Step::run(
+                    "Check with MSRV",
+                    "MSRV=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' Cargo.toml | head -n1) \
+                     && rustup toolchain install \"$MSRV\" --profile minimal \
+                     && cargo \"+$MSRV\" check",
+                ),
+            ],
+        };
+        vec![Job::new(self.id(), self.name(), Stage::Lint)
+            .with_image(IMAGE)
+            .with_timeout(15)
+            .with_cache(
+                "rust-msrv-cache",
+                vec!["target/".to_string(), ".cargo/".to_string()],
+            )
+            .with_steps(steps)]
+    }
+}
+
+/// Check every feature combination with cargo-hack
+pub struct RustFeatureCombos;
+
+impl Rule for RustFeatureCombos {
+    fn id(&self) -> &'static str {
+        "rust-feature-combos"
+    }
+
+    fn name(&self) -> &'static str {
+        "Feature combinations"
+    }
+
+    fn description(&self) -> &'static str {
+        "Check all feature combinations are additive with cargo-hack"
+    }
+
+    fn detect(&self, facts: &ProjectFacts) -> bool {
+        facts.rust.as_ref().is_some_and(|r| r.has_features)
+    }
+
+    fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
+        vec![Job::new(self.id(), self.name(), Stage::Lint)
+            .with_image(IMAGE)
+            .with_timeout(30)
+            .with_cache(
+                "rust-cache",
+                vec!["target/".to_string(), ".cargo/".to_string()],
+            )
+            .with_steps(vec![
+                Step::checkout(),
+                // Prebuilt binary; `cargo install` would compile for minutes
+                Step::run(
+                    "Install cargo-hack",
+                    "curl -fsSL https://github.com/taiki-e/cargo-hack/releases/latest/download/cargo-hack-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin",
+                ),
+                Step::run("Check feature powerset", "cargo hack --feature-powerset check"),
+            ])]
+    }
+}
+
+/// Test against the minimal versions of all dependencies
+pub struct RustMinimalVersions;
+
+impl Rule for RustMinimalVersions {
+    fn id(&self) -> &'static str {
+        "rust-minimal-versions"
+    }
+
+    fn name(&self) -> &'static str {
+        "Minimal versions"
+    }
+
+    fn description(&self) -> &'static str {
+        "Test with the minimal dependency versions Cargo.toml permits"
+    }
+
+    fn detect(&self, facts: &ProjectFacts) -> bool {
+        // A library-hygiene check: catches version requirements that are
+        // lower than what the code actually needs
+        facts.rust.as_ref().is_some_and(|r| r.publishable)
+    }
+
+    fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
+        vec![Job::new(self.id(), self.name(), Stage::Test)
+            .with_image(IMAGE)
+            .with_timeout(30)
+            .with_cache(
+                "rust-minimal-cache",
+                vec!["target/".to_string(), ".cargo/".to_string()],
+            )
+            .with_steps(vec![
+                Step::checkout(),
+                Step::run(
+                    "Install nightly for -Zminimal-versions",
+                    "rustup toolchain install nightly --profile minimal",
+                ),
+                Step::run(
+                    "Downgrade to minimal versions",
+                    "cargo +nightly update -Zminimal-versions",
+                ),
+                Step::run(
+                    "Run tests",
+                    "cargo test --locked --all-features --all-targets",
+                ),
+            ])]
+    }
+}
+
 /// Publish to crates.io when a version tag is pushed
 pub struct RustRelease;
 
@@ -202,6 +380,83 @@ mod tests {
         assert!(RustClippy.detect(&facts));
         assert!(RustAudit.detect(&facts));
         assert!(!RustTest.detect(&ProjectFacts::default()));
+    }
+
+    #[test]
+    fn test_doc_detects_any_rust_project() {
+        let facts = facts("[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = false\n");
+        assert!(RustDoc.detect(&facts));
+        assert!(!RustDoc.detect(&ProjectFacts::default()));
+
+        let jobs = RustDoc.jobs(&facts);
+        assert_eq!(jobs[0].id, "rust-doc");
+        assert_eq!(jobs[0].stage, Stage::Lint);
+        assert!(jobs[0]
+            .env
+            .contains(&("RUSTDOCFLAGS".to_string(), "--cfg docsrs".to_string())));
+    }
+
+    #[test]
+    fn test_msrv_detects_rust_version() {
+        let with_msrv = facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nrust-version = \"1.74.0\"\n",
+        );
+        assert!(RustMsrv.detect(&with_msrv));
+        assert!(!RustMsrv.detect(&facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
+        )));
+
+        // The detected version is baked into the commands
+        let jobs = RustMsrv.jobs(&with_msrv);
+        assert_eq!(jobs[0].id, "rust-msrv");
+        assert!(jobs[0].steps.iter().any(
+            |s| matches!(s, Step::Run { command, .. } if command == "cargo +1.74.0 check")
+        ));
+    }
+
+    #[test]
+    fn test_msrv_force_enabled_derives_version_in_shell() {
+        let jobs = RustMsrv.jobs(&ProjectFacts::default());
+        assert!(jobs[0].steps.iter().any(
+            |s| matches!(s, Step::Run { command, .. }
+                if command.contains("rust-version") && command.contains("$MSRV"))
+        ));
+    }
+
+    #[test]
+    fn test_feature_combos_detects_features() {
+        let with_features = facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[features]\nfoo = []\n",
+        );
+        assert!(RustFeatureCombos.detect(&with_features));
+        assert!(!RustFeatureCombos.detect(&facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
+        )));
+
+        let jobs = RustFeatureCombos.jobs(&with_features);
+        assert_eq!(jobs[0].id, "rust-feature-combos");
+        assert!(jobs[0].steps.iter().any(
+            |s| matches!(s, Step::Run { command, .. }
+                if command == "cargo hack --feature-powerset check")
+        ));
+    }
+
+    #[test]
+    fn test_minimal_versions_requires_publishable_package() {
+        assert!(RustMinimalVersions.detect(&facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
+        )));
+        assert!(!RustMinimalVersions.detect(&facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = false\n"
+        )));
+
+        let jobs = RustMinimalVersions.jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].id, "rust-minimal-versions");
+        assert_eq!(jobs[0].stage, Stage::Test);
+        assert!(jobs[0].steps.iter().any(
+            |s| matches!(s, Step::Run { command, .. }
+                if command == "cargo +nightly update -Zminimal-versions")
+        ));
     }
 
     #[test]

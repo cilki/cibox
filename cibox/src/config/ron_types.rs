@@ -23,6 +23,18 @@ pub struct CiboxConfig {
     /// Audit dependencies for known vulnerabilities
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub rust_audit: RuleToggle,
+    /// Build documentation on nightly with RUSTDOCFLAGS=--cfg docsrs
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_doc: RuleToggle,
+    /// Check the build with the rust-version declared in Cargo.toml
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_msrv: RuleToggle,
+    /// Check all feature combinations are additive with cargo-hack
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_feature_combos: RuleToggle,
+    /// Test with the minimal dependency versions Cargo.toml permits
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub rust_minimal_versions: RuleToggle,
     /// Publish to crates.io on version tags (requires CARGO_REGISTRY_TOKEN)
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub rust_release: RuleToggle,
@@ -176,6 +188,10 @@ impl CiboxConfig {
             "rust-fmt" => self.rust_fmt.enabled,
             "rust-clippy" => self.rust_clippy.enabled,
             "rust-audit" => self.rust_audit.enabled,
+            "rust-doc" => self.rust_doc.enabled,
+            "rust-msrv" => self.rust_msrv.enabled,
+            "rust-feature-combos" => self.rust_feature_combos.enabled,
+            "rust-minimal-versions" => self.rust_minimal_versions.enabled,
             "rust-release" => self.rust_release.enabled,
             "python-test" => self.python_test.enabled,
             "python-lint" => self.python_lint.enabled,
@@ -199,6 +215,10 @@ impl CiboxConfig {
             "rust-fmt" => self.rust_fmt.enabled = enabled,
             "rust-clippy" => self.rust_clippy.enabled = enabled,
             "rust-audit" => self.rust_audit.enabled = enabled,
+            "rust-doc" => self.rust_doc.enabled = enabled,
+            "rust-msrv" => self.rust_msrv.enabled = enabled,
+            "rust-feature-combos" => self.rust_feature_combos.enabled = enabled,
+            "rust-minimal-versions" => self.rust_minimal_versions.enabled = enabled,
             "rust-release" => self.rust_release.enabled = enabled,
             "python-test" => self.python_test.enabled = enabled,
             "python-lint" => self.python_lint.enabled = enabled,
