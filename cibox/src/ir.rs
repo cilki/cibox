@@ -95,6 +95,11 @@ pub struct Job {
     /// Secret names the job reads as env vars. GitHub maps each to
     /// `${{ secrets.NAME }}`; other platforms expect CI-level variables.
     pub secrets: Vec<String>,
+    /// Extra scopes the job's ambient CI token needs, beyond reading the
+    /// repository (e.g. `("packages", "write")` to push to ghcr.io). Honored
+    /// by the GitHub/Gitea backends, which otherwise emit a read-only token;
+    /// the other platforms have no per-job token scoping.
+    pub permissions: Vec<(String, String)>,
     /// Ids of other jobs this one depends on
     pub needs: Vec<String>,
     /// Runner operating system; Linux unless the job can only run on Windows
@@ -116,6 +121,7 @@ impl Job {
             artifacts: Vec::new(),
             env: Vec::new(),
             secrets: Vec::new(),
+            permissions: Vec::new(),
             needs: Vec::new(),
             runs_on: RunnerOs::default(),
         }
@@ -166,6 +172,11 @@ impl Job {
 
     pub fn with_secrets(mut self, secrets: Vec<String>) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    pub fn with_permission(mut self, scope: impl Into<String>, level: impl Into<String>) -> Self {
+        self.permissions.push((scope.into(), level.into()));
         self
     }
 

@@ -144,10 +144,17 @@ impl DockerRelease {
 
     fn release_job(&self, suffix: &str, name: &str) -> Job {
         let id = format!("{}{suffix}", self.id());
-        Job::new(id, name, Stage::Deploy)
+        let job = Job::new(id, name, Stage::Deploy)
             .with_docker()
             .tags_only()
-            .with_secrets(self.secrets())
+            .with_secrets(self.secrets());
+        if self.uses_ghcr() {
+            // ghcr.io authenticates with the ambient CI token, which can't
+            // push packages unless the job asks for the scope
+            job.with_permission("packages", "write")
+        } else {
+            job
+        }
     }
 }
 
@@ -425,5 +432,40 @@ mod tests {
         assert!(job.steps.iter().any(
             |s| matches!(s, Step::Run { command, .. } if command.contains("docker login ghcr.io"))
         ));
+        // The default token can't push packages without this scope
+        assert_eq!(
+            job.permissions,
+            vec![("packages".to_string(), "write".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_ghcr_permission_covers_every_pushing_job() {
+        let rule = DockerRelease {
+            image: "ghcr.io/owner/app".to_string(),
+            platforms: vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxArm64],
+        };
+        for job in rule.jobs(&docker_facts()) {
+            assert_eq!(
+                job.permissions,
+                vec![("packages".to_string(), "write".to_string())],
+                "{}",
+                job.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_ghcr_release_needs_no_extra_permissions() {
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![],
+        };
+        assert!(rule.jobs(&docker_facts())[0].permissions.is_empty());
+        // Neither does a build that never pushes
+        let build = DockerBuild {
+            image: "ghcr.io/owner/app".to_string(),
+        };
+        assert!(build.jobs(&docker_facts())[0].permissions.is_empty());
     }
 }

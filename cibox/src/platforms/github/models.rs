@@ -5,6 +5,11 @@ use std::collections::BTreeMap;
 pub struct GitHubWorkflow {
     pub name: String,
     pub on: GitHubTriggers,
+    /// Scopes granted to the ambient CI token for every job that doesn't
+    /// override it. Omitting this inherits the repository/organization
+    /// default, which may be write-all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
     pub jobs: BTreeMap<String, GitHubJob>,
@@ -33,6 +38,9 @@ pub struct GitHubJob {
     pub defaults: Option<GitHubDefaults>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// Replaces the workflow-level scopes for this job alone
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
     pub steps: Vec<GitHubStep>,
@@ -79,6 +87,7 @@ mod tests {
         let workflow = GitHubWorkflow {
             name: "CI".to_string(),
             on: GitHubTriggers::Simple(vec!["push".to_string()]),
+            permissions: None,
             env: None,
             jobs: BTreeMap::from([(
                 "test".to_string(),
@@ -86,6 +95,7 @@ mod tests {
                     runs_on: "ubuntu-latest".to_string(),
                     defaults: None,
                     container: None,
+                    permissions: None,
                     env: None,
                     steps: vec![GitHubStep {
                         name: Some("Checkout".to_string()),
