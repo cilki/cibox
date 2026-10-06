@@ -6,24 +6,30 @@
 //! default; `cibox.ron` overrides flip individual rules on or off and set the
 //! few knobs some rules have.
 
+pub mod cmake;
 pub mod docker;
 pub mod gitleaks;
 pub mod go;
+pub mod node;
 pub mod python;
 pub mod rust;
+pub mod zig;
 
 use crate::config::CiboxConfig;
 use crate::detection::ProjectFacts;
 use crate::ir::Job;
 
+pub use cmake::{CmakeBuild, CmakeFmt, CmakeTest};
 pub use docker::{DockerBuild, DockerRelease};
 pub use gitleaks::Gitleaks;
 pub use go::{GoAudit, GoBuild, GoLint, GoTest};
+pub use node::{NodeFmt, NodeLint, NodeTest, NodeTypecheck};
 pub use python::{PythonFmt, PythonLint, PythonRelease, PythonTest};
 pub use rust::{
     RustAudit, RustClippy, RustDoc, RustFmt, RustFeatureCombos, RustMinimalVersions, RustMsrv,
     RustRelease, RustTest,
 };
+pub use zig::{ZigBuild, ZigFmt, ZigTest};
 
 /// Docker image with all dependencies needed by generated CI jobs
 pub(crate) const CIBOX_IMAGE: &str = "fossable/cibox:latest";
@@ -93,6 +99,16 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         Box::new(GoBuild),
         Box::new(GoLint),
         Box::new(GoAudit),
+        Box::new(NodeTest),
+        Box::new(NodeLint),
+        Box::new(NodeTypecheck),
+        Box::new(NodeFmt),
+        Box::new(ZigTest),
+        Box::new(ZigFmt),
+        Box::new(ZigBuild),
+        Box::new(CmakeTest),
+        Box::new(CmakeBuild),
+        Box::new(CmakeFmt),
         Box::new(DockerBuild {
             image: docker_image.clone(),
         }),

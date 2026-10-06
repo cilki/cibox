@@ -144,28 +144,3 @@ file-types = ["ron", { glob = "cibox.ron" }]
 language-servers = ["cibox-lsp"]
 ```
 
-## Rules
-
-| Rule | Triggered by | Jobs |
-|---|---|---|
-| `rust-test` | `Cargo.toml` | `cargo test --all-features` |
-| `rust-fmt` | `Cargo.toml` | `cargo fmt -- --check` |
-| `rust-clippy` | `Cargo.toml` | `cargo clippy --all-features -- -D warnings` |
-| `rust-audit` | `Cargo.toml` | `cargo audit` |
-| `rust-release` | publishable `[package]` | `cargo publish` on `v*` tags (needs `CARGO_REGISTRY_TOKEN`) |
-| `python-test` | `pyproject.toml` / `requirements.txt` | `pytest` |
-| `python-lint` | " | `ruff check .` |
-| `python-fmt` | " | `ruff format --check .` |
-| `python-release` | `[project]` in pyproject.toml | build + `twine upload` on `v*` tags (needs `TWINE_PASSWORD`) |
-| `go-test` | `go.mod` | `go test -v ./...` |
-| `go-build` | `go.mod` | `go build -v ./...` |
-| `go-lint` | `go.mod` | `golangci-lint run` |
-| `go-audit` | `go.mod` | `gosec ./...` |
-| `docker-build` | `Dockerfile` / `dockerfile` / `Containerfile` | `docker build` |
-| `docker-release` | " | build + push on `v*` tags (`ghcr.io/` images use `GITHUB_TOKEN`, others Docker Hub credentials) |
-| `gitleaks` | git repository | `gitleaks detect` over full history |
-
-On GitHub/Gitea, tag-triggered rules land in a `release.yml` next to
-`ci.yml`; other platforms gate them within the single pipeline file. Platforms
-other than GitHub read the required secrets from their own CI variable
-mechanisms — the generated file lists them in a header comment.

@@ -15,6 +15,8 @@ pub struct RustFacts {
     pub msrv: Option<String>,
     /// The root manifest declares at least one feature
     pub has_features: bool,
+    /// The root package is a library crate ([lib] section or src/lib.rs)
+    pub is_library: bool,
 }
 
 pub(super) fn gather(path: &Path) -> Option<RustFacts> {
@@ -41,6 +43,7 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
         package_name: package.map(|p| p.name().to_string()),
         msrv,
         has_features: !manifest.features.is_empty(),
+        is_library: manifest.lib.is_some() || path.join("src/lib.rs").is_file(),
     })
 }
 
@@ -101,6 +104,30 @@ mod tests {
 
         let facts = facts_for("[package]\nname = \"lib\"\nversion = \"0.1.0\"\n").unwrap();
         assert!(!facts.has_features);
+    }
+
+    #[test]
+    fn test_library_detected_from_lib_rs() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert!(!gather(dir.path()).unwrap().is_library);
+
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        assert!(gather(dir.path()).unwrap().is_library);
+    }
+
+    #[test]
+    fn test_library_detected_from_lib_section() {
+        let facts = facts_for(
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"foo\"\n",
+        )
+        .unwrap();
+        assert!(facts.is_library);
     }
 
     #[test]

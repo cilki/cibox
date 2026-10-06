@@ -21,8 +21,9 @@ impl Rule for Gitleaks {
         "Scan the full git history for hardcoded secrets"
     }
 
-    fn detect(&self, facts: &ProjectFacts) -> bool {
-        facts.is_git_repo
+    fn detect(&self, _facts: &ProjectFacts) -> bool {
+        // Off by default
+        false
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
@@ -41,13 +42,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_detects_git_repos_only() {
+    fn test_disabled_by_default() {
         assert!(!Gitleaks.detect(&ProjectFacts::default()));
         let facts = ProjectFacts {
             is_git_repo: true,
             ..ProjectFacts::default()
         };
-        assert!(Gitleaks.detect(&facts));
+        assert!(!Gitleaks.detect(&facts));
     }
 
     #[test]

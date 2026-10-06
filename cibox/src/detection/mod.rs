@@ -4,20 +4,26 @@
 //! missing or unparseable file simply means the fact is absent. Rules consult
 //! the collected [`ProjectFacts`] to decide whether they apply.
 
+mod cmake;
 mod docker;
 mod git;
 mod go;
+mod node;
 mod python;
 mod rust;
+mod zig;
 
 use crate::config::Platform;
 use std::path::Path;
 
+pub use cmake::CmakeFacts;
 pub use docker::DockerFacts;
 pub use git::RemoteHost;
 pub use go::GoFacts;
+pub use node::{NodeFacts, NodePackageManager};
 pub use python::PythonFacts;
 pub use rust::RustFacts;
+pub use zig::ZigFacts;
 
 /// Everything cibox knows about the project directory
 #[derive(Debug, Clone, Default)]
@@ -25,6 +31,9 @@ pub struct ProjectFacts {
     pub rust: Option<RustFacts>,
     pub python: Option<PythonFacts>,
     pub go: Option<GoFacts>,
+    pub node: Option<NodeFacts>,
+    pub zig: Option<ZigFacts>,
+    pub cmake: Option<CmakeFacts>,
     pub docker: Option<DockerFacts>,
     pub is_git_repo: bool,
     /// "owner/repo" parsed from the origin remote URL
@@ -50,6 +59,9 @@ pub fn gather_facts(path: &Path) -> ProjectFacts {
         rust: rust::gather(path),
         python: python::gather(path),
         go: go::gather(path),
+        node: node::gather(path),
+        zig: zig::gather(path),
+        cmake: cmake::gather(path),
         docker: docker::gather(path),
         is_git_repo: git.is_repo,
         repo_slug: git.repo_slug,
@@ -85,6 +97,9 @@ mod tests {
         assert!(facts.rust.is_none());
         assert!(facts.python.is_none());
         assert!(facts.go.is_none());
+        assert!(facts.node.is_none());
+        assert!(facts.zig.is_none());
+        assert!(facts.cmake.is_none());
         assert!(facts.docker.is_none());
         assert!(!facts.is_git_repo);
         assert!(facts.existing_ci.is_empty());

@@ -191,6 +191,17 @@ pub fn handle_detect(dir: &str) -> Result<()> {
                 .unwrap_or_default()
         );
     }
+    if let Some(node) = &facts.node {
+        println!("  {} Node ({})", "✓".green(), node.package_manager.as_str());
+        println!("    typescript: {}", yes_no(node.has_tsconfig));
+    }
+    if facts.zig.is_some() {
+        println!("  {} Zig", "✓".green());
+    }
+    if let Some(cmake) = &facts.cmake {
+        println!("  {} CMake", "✓".green());
+        println!("    tests: {}", yes_no(cmake.has_tests));
+    }
     if let Some(docker) = &facts.docker {
         println!("  {} Docker ({})", "✓".green(), docker.dockerfile);
     }

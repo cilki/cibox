@@ -254,7 +254,12 @@ impl Rule for RustFeatureCombos {
     }
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
-        facts.rust.as_ref().is_some_and(|r| r.has_features)
+        // Additive features matter to downstream crates; binaries pick their
+        // own features and can force-enable if wanted
+        facts
+            .rust
+            .as_ref()
+            .is_some_and(|r| r.has_features && r.is_library)
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
@@ -296,7 +301,10 @@ impl Rule for RustMinimalVersions {
     fn detect(&self, facts: &ProjectFacts) -> bool {
         // A library-hygiene check: catches version requirements that are
         // lower than what the code actually needs
-        facts.rust.as_ref().is_some_and(|r| r.publishable)
+        facts
+            .rust
+            .as_ref()
+            .is_some_and(|r| r.publishable && r.is_library)
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
@@ -372,6 +380,14 @@ mod tests {
         crate::detection::gather_facts(dir.path())
     }
 
+    fn library_facts(cargo_toml: &str) -> ProjectFacts {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), cargo_toml).unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        crate::detection::gather_facts(dir.path())
+    }
+
     #[test]
     fn test_rules_detect_any_rust_project() {
         let facts = facts("[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = false\n");
@@ -424,13 +440,17 @@ mod tests {
     }
 
     #[test]
-    fn test_feature_combos_detects_features() {
-        let with_features = facts(
+    fn test_feature_combos_detects_features_in_libraries() {
+        let with_features = library_facts(
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[features]\nfoo = []\n",
         );
         assert!(RustFeatureCombos.detect(&with_features));
-        assert!(!RustFeatureCombos.detect(&facts(
+        assert!(!RustFeatureCombos.detect(&library_facts(
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
+        )));
+        // Binary crates don't get the rule by default
+        assert!(!RustFeatureCombos.detect(&facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[features]\nfoo = []\n"
         )));
 
         let jobs = RustFeatureCombos.jobs(&with_features);
@@ -442,12 +462,16 @@ mod tests {
     }
 
     #[test]
-    fn test_minimal_versions_requires_publishable_package() {
-        assert!(RustMinimalVersions.detect(&facts(
+    fn test_minimal_versions_requires_publishable_library() {
+        assert!(RustMinimalVersions.detect(&library_facts(
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
         )));
-        assert!(!RustMinimalVersions.detect(&facts(
+        assert!(!RustMinimalVersions.detect(&library_facts(
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = false\n"
+        )));
+        // Binary crates don't get the rule by default
+        assert!(!RustMinimalVersions.detect(&facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
         )));
 
         let jobs = RustMinimalVersions.jobs(&ProjectFacts::default());

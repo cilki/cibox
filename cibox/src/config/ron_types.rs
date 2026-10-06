@@ -62,6 +62,36 @@ pub struct CiboxConfig {
     /// Scan for security problems with gosec
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub go_audit: RuleToggle,
+    /// Install dependencies and run the package.json test script
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub node_test: RuleToggle,
+    /// Run the package.json lint script
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub node_lint: RuleToggle,
+    /// Type-check TypeScript with tsc --noEmit
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub node_typecheck: RuleToggle,
+    /// Check formatting with prettier
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub node_fmt: RuleToggle,
+    /// Run zig build test on every push
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub zig_test: RuleToggle,
+    /// Check formatting with zig fmt
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub zig_fmt: RuleToggle,
+    /// Compile the project with zig build
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub zig_build: RuleToggle,
+    /// Configure, build, and run ctest
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub cmake_test: RuleToggle,
+    /// Configure and build with CMake in Release mode
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub cmake_build: RuleToggle,
+    /// Check formatting with clang-format (requires .clang-format)
+    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    pub cmake_fmt: RuleToggle,
     /// Build the Dockerfile on every push
     #[serde(skip_serializing_if = "DockerRule::is_default")]
     pub docker_build: DockerRule,
@@ -201,6 +231,16 @@ impl CiboxConfig {
             "go-build" => self.go_build.enabled,
             "go-lint" => self.go_lint.enabled,
             "go-audit" => self.go_audit.enabled,
+            "node-test" => self.node_test.enabled,
+            "node-lint" => self.node_lint.enabled,
+            "node-typecheck" => self.node_typecheck.enabled,
+            "node-fmt" => self.node_fmt.enabled,
+            "zig-test" => self.zig_test.enabled,
+            "zig-fmt" => self.zig_fmt.enabled,
+            "zig-build" => self.zig_build.enabled,
+            "cmake-test" => self.cmake_test.enabled,
+            "cmake-build" => self.cmake_build.enabled,
+            "cmake-fmt" => self.cmake_fmt.enabled,
             "docker-build" => self.docker_build.enabled,
             "docker-release" => self.docker_release.enabled,
             "gitleaks" => self.gitleaks.enabled,
@@ -228,6 +268,16 @@ impl CiboxConfig {
             "go-build" => self.go_build.enabled = enabled,
             "go-lint" => self.go_lint.enabled = enabled,
             "go-audit" => self.go_audit.enabled = enabled,
+            "node-test" => self.node_test.enabled = enabled,
+            "node-lint" => self.node_lint.enabled = enabled,
+            "node-typecheck" => self.node_typecheck.enabled = enabled,
+            "node-fmt" => self.node_fmt.enabled = enabled,
+            "zig-test" => self.zig_test.enabled = enabled,
+            "zig-fmt" => self.zig_fmt.enabled = enabled,
+            "zig-build" => self.zig_build.enabled = enabled,
+            "cmake-test" => self.cmake_test.enabled = enabled,
+            "cmake-build" => self.cmake_build.enabled = enabled,
+            "cmake-fmt" => self.cmake_fmt.enabled = enabled,
             "docker-build" => self.docker_build.enabled = enabled,
             "docker-release" => self.docker_release.enabled = enabled,
             "gitleaks" => self.gitleaks.enabled = enabled,
