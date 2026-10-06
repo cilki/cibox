@@ -100,12 +100,9 @@ pub struct Job {
     /// Toolchain versions to run this job against, lowered to the platform's
     /// native job matrix. Replaces `image`; the backends substitute each
     /// entry's image in their own interpolation syntax and suffix the cache
-    /// key with the version. Incompatible with `needs_docker` and `artifacts`
-    /// (artifact names would collide across matrix legs).
+    /// key with the version. Incompatible with `needs_docker`.
     pub matrix: Option<Vec<MatrixEntry>>,
     pub cache: Option<Cache>,
-    /// Paths preserved as build artifacts
-    pub artifacts: Vec<String>,
     pub env: Vec<(String, String)>,
     /// Secret names the job reads as env vars. GitHub maps each to
     /// `${{ secrets.NAME }}`; other platforms expect CI-level variables.
@@ -134,7 +131,6 @@ impl Job {
             tags_only: false,
             matrix: None,
             cache: None,
-            artifacts: Vec::new(),
             env: Vec::new(),
             secrets: Vec::new(),
             permissions: Vec::new(),
@@ -181,11 +177,6 @@ impl Job {
             key: key.into(),
             paths,
         });
-        self
-    }
-
-    pub fn with_artifacts(mut self, paths: Vec<String>) -> Self {
-        self.artifacts = paths;
         self
     }
 

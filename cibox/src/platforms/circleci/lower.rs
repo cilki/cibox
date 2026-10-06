@@ -1,8 +1,8 @@
 use crate::ir::{Job, Step};
 use crate::platforms::circleci::models::{
     CircleCICache, CircleCICacheSave, CircleCIConfig, CircleCIDocker, CircleCIFilterPattern,
-    CircleCIFilters, CircleCIJob, CircleCIParameter, CircleCIRun, CircleCIStep,
-    CircleCIStoreArtifacts, CircleCIWorkflow, CircleCIWorkflowJob, CircleCIWorkflowJobDetail,
+    CircleCIFilters, CircleCIJob, CircleCIParameter, CircleCIRun, CircleCIStep, CircleCIWorkflow,
+    CircleCIWorkflowJob, CircleCIWorkflowJobDetail,
 };
 use std::collections::BTreeMap;
 
@@ -67,7 +67,6 @@ pub fn lower_circleci(jobs: &[Job]) -> CircleCIConfig {
 
     CircleCIConfig {
         version: "2.1".to_string(),
-        orbs: None,
         jobs: lowered,
         workflows: BTreeMap::from([(
             "main".to_string(),
@@ -113,7 +112,7 @@ fn lower_job(job: &Job) -> CircleCIJob {
             }
             Step::Run { name, command } => {
                 steps.push(CircleCIStep::Command {
-                    run: CircleCIRun::Detailed {
+                    run: CircleCIRun {
                         name: name.clone(),
                         command: command.clone(),
                     },
@@ -128,11 +127,6 @@ fn lower_job(job: &Job) -> CircleCIJob {
                 key: cache_key(&cache.key),
                 paths: cache.paths.clone(),
             },
-        });
-    }
-    for path in &job.artifacts {
-        steps.push(CircleCIStep::StoreArtifacts {
-            store_artifacts: CircleCIStoreArtifacts { path: path.clone() },
         });
     }
 

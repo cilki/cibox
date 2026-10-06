@@ -1,6 +1,6 @@
 use crate::ir::{Job, Stage, Step};
 use crate::platforms::gitlab::models::{
-    GitLabArtifacts, GitLabCI, GitLabCache, GitLabJob, GitLabMatrixCell, GitLabParallel, GitLabRule,
+    GitLabCI, GitLabCache, GitLabJob, GitLabMatrixCell, GitLabParallel, GitLabRule,
 };
 use std::collections::BTreeMap;
 
@@ -25,7 +25,6 @@ pub fn lower_gitlab(jobs: &[Job]) -> GitLabCI {
     GitLabCI {
         stages: (!stages.is_empty())
             .then(|| stages.iter().map(|s| s.as_str().to_string()).collect()),
-        cache: None,
         jobs: lowered,
     }
 }
@@ -68,8 +67,6 @@ fn lower_job(job: &Job) -> GitLabJob {
         },
         variables: (!variables.is_empty()).then_some(variables),
         script,
-        before_script: None,
-        after_script: None,
         needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
         cache: job.cache.as_ref().map(|cache| GitLabCache {
             // Matrix legs run different toolchains; sharing one cache key
@@ -79,10 +76,6 @@ fn lower_job(job: &Job) -> GitLabJob {
                 None => cache.key.clone(),
             },
             paths: cache.paths.clone(),
-        }),
-        artifacts: (!job.artifacts.is_empty()).then(|| GitLabArtifacts {
-            paths: job.artifacts.clone(),
-            name: None,
         }),
         rules: job.tags_only.then(|| {
             vec![GitLabRule {

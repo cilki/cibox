@@ -1,7 +1,7 @@
 use crate::ir::{Job, RunnerOs, Step};
 use crate::platforms::github::models::{
     GitHubDefaults, GitHubJob, GitHubMatrix, GitHubMatrixInclude, GitHubRunDefaults, GitHubStep,
-    GitHubStrategy, GitHubTriggerConfig, GitHubTriggers, GitHubWorkflow,
+    GitHubStrategy, GitHubTriggerConfig, GitHubWorkflow,
 };
 use std::collections::BTreeMap;
 
@@ -22,7 +22,7 @@ pub fn lower_github(jobs: &[Job], kind: WorkflowKind) -> GitHubWorkflow {
     let on = match kind {
         WorkflowKind::Ci => {
             let branches = Some(vec!["main".to_string(), "master".to_string()]);
-            GitHubTriggers::Detailed(BTreeMap::from([
+            BTreeMap::from([
                 (
                     "push".to_string(),
                     GitHubTriggerConfig {
@@ -37,15 +37,15 @@ pub fn lower_github(jobs: &[Job], kind: WorkflowKind) -> GitHubWorkflow {
                         tags: None,
                     },
                 ),
-            ]))
+            ])
         }
-        WorkflowKind::Release => GitHubTriggers::Detailed(BTreeMap::from([(
+        WorkflowKind::Release => BTreeMap::from([(
             "push".to_string(),
             GitHubTriggerConfig {
                 branches: None,
                 tags: Some(vec!["v*".to_string()]),
             },
-        )])),
+        )]),
     };
 
     GitHubWorkflow {
@@ -59,7 +59,6 @@ pub fn lower_github(jobs: &[Job], kind: WorkflowKind) -> GitHubWorkflow {
         // repository default, which on older repos and organizations is
         // write-all — handing every `run:` step push access.
         permissions: Some(base_permissions()),
-        env: None,
         jobs: lowered,
     }
 }
@@ -98,7 +97,6 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
                     uses: Some("actions/checkout@v4".to_string()),
                     run: None,
                     with: Some(with),
-                    env: None,
                 });
                 if let Some(cache) = &job.cache {
                     // Matrix legs run different toolchains; sharing one cache
@@ -118,7 +116,6 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
                             ),
                             ("key".to_string(), serde_yaml::Value::String(key)),
                         ])),
-                        env: None,
                     });
                 }
             }
@@ -128,26 +125,9 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
                     uses: None,
                     run: Some(command.clone()),
                     with: None,
-                    env: None,
                 });
             }
         }
-    }
-
-    for path in &job.artifacts {
-        steps.push(GitHubStep {
-            name: Some("Upload artifacts".to_string()),
-            uses: Some("actions/upload-artifact@v4".to_string()),
-            run: None,
-            with: Some(BTreeMap::from([
-                (
-                    "name".to_string(),
-                    serde_yaml::Value::String(format!("{}-artifacts", job.id)),
-                ),
-                ("path".to_string(), serde_yaml::Value::String(path.clone())),
-            ])),
-            env: None,
-        });
     }
 
     let mut env: BTreeMap<String, String> = job.env.iter().cloned().collect();
@@ -204,7 +184,6 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
         steps,
         needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
         timeout_minutes: job.timeout_minutes,
-        continue_on_error: None,
         // A tags-only job inside a mixed CI workflow must not run on
         // branch pushes or PRs; the release workflow is already tag-gated
         if_expr: (job.tags_only && kind == WorkflowKind::Ci)
@@ -298,13 +277,10 @@ mod tests {
             &[Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only()],
             WorkflowKind::Release,
         );
-        let GitHubTriggers::Detailed(triggers) = &workflow.on else {
-            panic!("expected detailed triggers");
-        };
         assert_eq!(workflow.name, "Release");
-        assert_eq!(triggers["push"].tags, Some(vec!["v*".to_string()]));
-        assert_eq!(triggers["push"].branches, None);
-        assert!(!triggers.contains_key("pull_request"));
+        assert_eq!(workflow.on["push"].tags, Some(vec!["v*".to_string()]));
+        assert_eq!(workflow.on["push"].branches, None);
+        assert!(!workflow.on.contains_key("pull_request"));
         // No per-job guard needed in a tag-gated workflow
         assert_eq!(workflow.jobs["rust-release"].if_expr, None);
     }

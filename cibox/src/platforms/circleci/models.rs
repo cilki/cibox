@@ -4,8 +4,6 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CircleCIConfig {
     pub version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub orbs: Option<BTreeMap<String, String>>,
     pub jobs: BTreeMap<String, CircleCIJob>,
     pub workflows: BTreeMap<String, CircleCIWorkflow>,
 }
@@ -47,22 +45,12 @@ pub enum CircleCIStep {
         #[serde(rename = "save_cache")]
         save_cache: CircleCICacheSave,
     },
-    StoreArtifacts {
-        #[serde(rename = "store_artifacts")]
-        store_artifacts: CircleCIStoreArtifacts,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CircleCIStoreArtifacts {
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum CircleCIRun {
-    Simple(String),
-    Detailed { name: String, command: String },
+pub struct CircleCIRun {
+    pub name: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
