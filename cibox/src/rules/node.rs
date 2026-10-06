@@ -1,8 +1,8 @@
-use super::Rule;
+use super::{with_versions, Rule};
 use crate::detection::{NodeFacts, NodePackageManager, ProjectFacts};
-use crate::ir::{Job, MatrixEntry, Stage, Step};
+use crate::ir::{Job, Stage, Step};
 
-const IMAGE: &str = "node:22";
+pub(crate) const IMAGE: &str = "node:22";
 const BUN_IMAGE: &str = "oven/bun:1";
 
 /// Facts to build jobs from; force-enabled rules fall back to npm without a
@@ -117,27 +117,15 @@ impl Rule for NodeTest {
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
         let n = node(facts);
-        let mut job = base_job(self.id(), self.name(), Stage::Test, 30, &n).with_steps(
+        let job = base_job(self.id(), self.name(), Stage::Test, 30, &n).with_steps(
             steps_with_install(&n, Step::run("Run tests", run_script(&n, "test"))),
         );
-        if n.package_manager != NodePackageManager::Bun {
-            match self.versions.as_slice() {
-                [] => {}
-                [v] => job.image = Some(format!("node:{v}")),
-                vs => {
-                    job.image = None;
-                    job = job.with_matrix(
-                        vs.iter()
-                            .map(|v| MatrixEntry {
-                                version: v.clone(),
-                                image: format!("node:{v}"),
-                            })
-                            .collect(),
-                    );
-                }
-            }
-        }
-        vec![job]
+        // The bun toolchain comes with the bun image, so the knob can't apply
+        let versions: &[String] = match n.package_manager {
+            NodePackageManager::Bun => &[],
+            _ => &self.versions,
+        };
+        vec![with_versions(job, versions, |v| format!("node:{v}"))]
     }
 }
 

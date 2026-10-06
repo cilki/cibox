@@ -17,7 +17,7 @@ pub mod zig;
 
 use crate::config::CiboxConfig;
 use crate::detection::ProjectFacts;
-use crate::ir::Job;
+use crate::ir::{Job, MatrixEntry};
 
 pub use cmake::{CmakeBuild, CmakeFmt, CmakeTest};
 pub use docker::{DockerBuild, DockerRelease};
@@ -72,7 +72,7 @@ pub struct ResolvedRule {
 
 /// Normalize a configured versions list: trim, drop empties, dedupe
 /// preserving order. Duplicate matrix legs would waste CI time.
-fn clean_versions(versions: Option<&Vec<String>>) -> Vec<String> {
+pub(crate) fn clean_versions(versions: Option<&Vec<String>>) -> Vec<String> {
     let mut cleaned: Vec<String> = Vec::new();
     for v in versions.into_iter().flatten() {
         let v = v.trim();
@@ -81,6 +81,29 @@ fn clean_versions(versions: Option<&Vec<String>>) -> Vec<String> {
         }
     }
     cleaned
+}
+
+/// Apply a rule's toolchain-version knob to the job it emits: no versions
+/// keeps the rule's default image, a single version pins the image it maps
+/// to, and several become a job matrix. `image_for` maps a version string to
+/// the container image providing it.
+pub(crate) fn with_versions(
+    job: Job,
+    versions: &[String],
+    image_for: impl Fn(&str) -> String,
+) -> Job {
+    match versions {
+        [] => job,
+        [v] => job.with_image(image_for(v)),
+        vs => job.with_matrix(
+            vs.iter()
+                .map(|v| MatrixEntry {
+                    version: v.clone(),
+                    image: image_for(v),
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// Build every rule with its knobs resolved (facts-derived defaults overlaid

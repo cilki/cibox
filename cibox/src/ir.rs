@@ -168,9 +168,10 @@ impl Job {
         self
     }
 
+    /// Replaces any pinned image: each leg brings its own.
     pub fn with_matrix(mut self, entries: Vec<MatrixEntry>) -> Self {
-        debug_assert!(self.image.is_none(), "matrix replaces the pinned image");
         debug_assert!(!self.needs_docker, "matrix jobs run in containers");
+        self.image = None;
         self.matrix = Some(entries);
         self
     }
@@ -226,8 +227,8 @@ mod tests {
     }
 
     #[test]
-    fn test_with_matrix() {
-        let job = Job::new("a", "A", Stage::Test);
+    fn test_with_matrix_replaces_the_pinned_image() {
+        let job = Job::new("a", "A", Stage::Test).with_image("rust:latest");
         assert_eq!(job.matrix, None);
         let entries = vec![MatrixEntry {
             version: "1.90".to_string(),
@@ -235,5 +236,6 @@ mod tests {
         }];
         let job = job.with_matrix(entries.clone());
         assert_eq!(job.matrix, Some(entries));
+        assert_eq!(job.image, None);
     }
 }

@@ -1,8 +1,8 @@
-use super::Rule;
+use super::{with_versions, Rule};
 use crate::detection::ProjectFacts;
-use crate::ir::{Job, MatrixEntry, Stage, Step};
+use crate::ir::{Job, Stage, Step};
 
-const IMAGE: &str = "golang:1.23";
+pub(crate) const IMAGE: &str = "golang:1.23";
 
 /// Workspace-local directory holding both Go caches
 const CACHE_DIR: &str = ".go-cache";
@@ -61,6 +61,7 @@ impl Rule for GoTest {
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
         let job = cached(Job::new(self.id(), self.name(), Stage::Test))
+            .with_image(IMAGE)
             .with_timeout(30)
             .with_steps(vec![
                 Step::checkout(),
@@ -68,18 +69,7 @@ impl Rule for GoTest {
                 Step::run("Download dependencies", "go mod download"),
                 Step::run("Run tests", "go test -v ./..."),
             ]);
-        vec![match self.versions.as_slice() {
-            [] => job.with_image(IMAGE),
-            [v] => job.with_image(format!("golang:{v}")),
-            vs => job.with_matrix(
-                vs.iter()
-                    .map(|v| MatrixEntry {
-                        version: v.clone(),
-                        image: format!("golang:{v}"),
-                    })
-                    .collect(),
-            ),
-        }]
+        vec![with_versions(job, &self.versions, |v| format!("golang:{v}"))]
     }
 }
 

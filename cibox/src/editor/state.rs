@@ -1,29 +1,26 @@
 use crate::config::{infer_platform, serialize_config, CiboxConfig, DockerPlatform};
 use crate::detection::ProjectFacts;
 use crate::error::Result;
-use crate::rules::resolve;
+use crate::rules::{clean_versions, resolve};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub use crate::config::Platform;
 
-/// Rules whose config options can be expanded inline
-const EXPANDABLE_RULES: [&str; 6] = [
-    "docker-build",
-    "docker-release",
-    "rust-test",
-    "python-test",
-    "go-test",
-    "node-test",
-];
-
 /// Test rules with a versions knob, and the default image shown when unset
 const VERSIONED_RULES: [(&str, &str); 4] = [
-    ("rust-test", "rust:latest"),
-    ("python-test", "python:3.12"),
-    ("go-test", "golang:1.23"),
-    ("node-test", "node:22"),
+    ("rust-test", crate::rules::rust::IMAGE),
+    ("python-test", crate::rules::python::IMAGE),
+    ("go-test", crate::rules::go::IMAGE),
+    ("node-test", crate::rules::node::IMAGE),
 ];
+
+/// Rules whose config options can be expanded inline: the versioned test
+/// rules plus the two docker rules, which share an image-name knob
+fn expandable(rule_id: &str) -> bool {
+    matches!(rule_id, "docker-build" | "docker-release")
+        || VERSIONED_RULES.iter().any(|(id, _)| *id == rule_id)
+}
 
 /// A rule line in the checklist
 #[derive(Debug, Clone)]
@@ -202,7 +199,7 @@ impl EditorState {
         self.rows = Vec::new();
         for r in &resolved {
             let id = r.rule.id();
-            let expandable = EXPANDABLE_RULES.contains(&id);
+            let expandable = expandable(id);
             let expanded = expandable && self.expanded.contains(id);
             self.rows.push(Row::Rule(RuleRow {
                 id,
@@ -396,15 +393,9 @@ impl EditorState {
                     None if value.is_empty() => {}
                     None => versions.push(value),
                 }
-                let mut seen: Vec<String> = Vec::new();
-                versions.retain(|v| {
-                    if seen.contains(v) {
-                        false
-                    } else {
-                        seen.push(v.clone());
-                        true
-                    }
-                });
+                // Normalize exactly as rules::resolve would, so what the
+                // preview shows is what the file means
+                let versions = clean_versions(Some(&versions));
                 self.config
                     .set_versions_override(input.rule_id, (!versions.is_empty()).then_some(versions));
             }
