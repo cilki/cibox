@@ -281,6 +281,28 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_paths_stay_inside_the_project() {
+        // GitLab only archives cache paths under the project directory, so an
+        // absolute path means a cache that silently never survives a job
+        let facts = ProjectFacts::default();
+        let mut config = CiboxConfig::default();
+        for r in resolve(&facts, &config) {
+            config.set_enabled_override(r.rule.id(), Some(true));
+        }
+        for r in resolve(&facts, &config) {
+            for job in r.rule.jobs(&facts) {
+                for path in job.cache.iter().flat_map(|c| &c.paths) {
+                    assert!(
+                        !path.starts_with('/') && !path.starts_with('~'),
+                        "rule {} caches {path}, which is outside the project directory",
+                        r.rule.id()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_every_rule_has_an_enabled_override_slot() {
         let resolved = resolve(&ProjectFacts::default(), &CiboxConfig::default());
         for r in &resolved {
