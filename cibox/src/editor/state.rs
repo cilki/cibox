@@ -8,7 +8,22 @@ use std::path::PathBuf;
 pub use crate::config::Platform;
 
 /// Rules whose config options can be expanded inline
-const EXPANDABLE_RULES: [&str; 2] = ["docker-build", "docker-release"];
+const EXPANDABLE_RULES: [&str; 6] = [
+    "docker-build",
+    "docker-release",
+    "rust-test",
+    "python-test",
+    "go-test",
+    "node-test",
+];
+
+/// Test rules with a versions knob, and the default image shown when unset
+const VERSIONED_RULES: [(&str, &str); 4] = [
+    ("rust-test", "rust:latest"),
+    ("python-test", "python:3.12"),
+    ("go-test", "golang:1.23"),
+    ("node-test", "node:22"),
+];
 
 /// A rule line in the checklist
 #[derive(Debug, Clone)]
@@ -46,12 +61,32 @@ pub enum Row {
     },
     /// One target-platform checkbox under docker-release
     ArchOption { arch: DockerPlatform, selected: bool },
+    /// One configured toolchain version under an expanded test rule
+    VersionItem {
+        rule_id: &'static str,
+        index: usize,
+        value: String,
+    },
+    /// Trailing "add a version" action row under an expanded test rule
+    AddVersion {
+        rule_id: &'static str,
+        default_image: &'static str,
+    },
+}
+
+/// Which knob a text input edits
+#[derive(Debug, Clone, PartialEq)]
+pub enum KnobTarget {
+    ImageName,
+    /// Some(i) edits versions[i]; None appends a new version
+    Version(Option<usize>),
 }
 
 /// In-progress edit of a text knob
 #[derive(Debug, Clone)]
 pub struct KnobInput {
     pub rule_id: &'static str,
+    pub target: KnobTarget,
     pub buffer: String,
 }
 
@@ -179,30 +214,51 @@ impl EditorState {
                 expanded,
             }));
             if expanded {
-                let override_value = match id {
-                    "docker-build" => self.config.docker_build.image_name.clone(),
-                    _ => self.config.docker_release.image_name.clone(),
-                };
-                self.rows.push(Row::TextKnob {
-                    rule_id: id,
-                    label: "image_name",
-                    description: "Image name, e.g. \"fossable/cibox\"; applies to both docker \
-                                  rules. Press Enter to edit.",
-                    override_value,
-                    effective: self.effective_image(),
-                });
-                if id == "docker-release" {
-                    let selected = self
+                if let Some((_, default_image)) =
+                    VERSIONED_RULES.iter().find(|(vid, _)| *vid == id)
+                {
+                    let versions = self
                         .config
-                        .docker_release
-                        .platforms
-                        .clone()
+                        .versions_override(id)
+                        .cloned()
                         .unwrap_or_default();
-                    for arch in DockerPlatform::ALL {
-                        self.rows.push(Row::ArchOption {
-                            arch,
-                            selected: selected.contains(&arch),
+                    for (index, value) in versions.iter().enumerate() {
+                        self.rows.push(Row::VersionItem {
+                            rule_id: id,
+                            index,
+                            value: value.clone(),
                         });
+                    }
+                    self.rows.push(Row::AddVersion {
+                        rule_id: id,
+                        default_image,
+                    });
+                } else {
+                    let override_value = match id {
+                        "docker-build" => self.config.docker_build.image_name.clone(),
+                        _ => self.config.docker_release.image_name.clone(),
+                    };
+                    self.rows.push(Row::TextKnob {
+                        rule_id: id,
+                        label: "image_name",
+                        description: "Image name, e.g. \"fossable/cibox\"; applies to both docker \
+                                      rules. Press Enter to edit.",
+                        override_value,
+                        effective: self.effective_image(),
+                    });
+                    if id == "docker-release" {
+                        let selected = self
+                            .config
+                            .docker_release
+                            .platforms
+                            .clone()
+                            .unwrap_or_default();
+                        for arch in DockerPlatform::ALL {
+                            self.rows.push(Row::ArchOption {
+                                arch,
+                                selected: selected.contains(&arch),
+                            });
+                        }
                     }
                 }
             }
@@ -240,10 +296,29 @@ impl EditorState {
             }) => {
                 self.input = Some(KnobInput {
                     rule_id,
+                    target: KnobTarget::ImageName,
                     buffer: effective,
                 });
             }
             Some(Row::ArchOption { arch, .. }) => self.toggle_arch(arch),
+            Some(Row::VersionItem {
+                rule_id,
+                index,
+                value,
+            }) => {
+                self.input = Some(KnobInput {
+                    rule_id,
+                    target: KnobTarget::Version(Some(index)),
+                    buffer: value,
+                });
+            }
+            Some(Row::AddVersion { rule_id, .. }) => {
+                self.input = Some(KnobInput {
+                    rule_id,
+                    target: KnobTarget::Version(None),
+                    buffer: String::new(),
+                });
+            }
             None => {}
         }
     }
@@ -290,13 +365,74 @@ impl EditorState {
             return;
         };
         let value = input.buffer.trim().to_string();
-        let override_value = (!value.is_empty() && value != self.default_image()).then_some(value);
-        match input.rule_id {
-            "docker-build" => self.config.docker_build.image_name = override_value,
-            "docker-release" => self.config.docker_release.image_name = override_value,
-            _ => {}
+        match input.target {
+            KnobTarget::ImageName => {
+                let override_value =
+                    (!value.is_empty() && value != self.default_image()).then_some(value);
+                match input.rule_id {
+                    "docker-build" => self.config.docker_build.image_name = override_value,
+                    "docker-release" => self.config.docker_release.image_name = override_value,
+                    _ => {}
+                }
+            }
+            KnobTarget::Version(slot) => {
+                let mut versions = self
+                    .config
+                    .versions_override(input.rule_id)
+                    .cloned()
+                    .unwrap_or_default();
+                match slot {
+                    // Committing an empty value removes the entry
+                    Some(i) if value.is_empty() => {
+                        if i < versions.len() {
+                            versions.remove(i);
+                        }
+                    }
+                    Some(i) => {
+                        if i < versions.len() {
+                            versions[i] = value;
+                        }
+                    }
+                    None if value.is_empty() => {}
+                    None => versions.push(value),
+                }
+                let mut seen: Vec<String> = Vec::new();
+                versions.retain(|v| {
+                    if seen.contains(v) {
+                        false
+                    } else {
+                        seen.push(v.clone());
+                        true
+                    }
+                });
+                self.config
+                    .set_versions_override(input.rule_id, (!versions.is_empty()).then_some(versions));
+            }
         }
         self.refresh();
+        self.update_current_item_description();
+        self.auto_save_ron();
+    }
+
+    /// Remove the toolchain version under the cursor; an empty list collapses
+    /// back to "unset" so cibox.ron stays delta-only
+    pub fn delete_current_version(&mut self) {
+        let Some(Row::VersionItem { rule_id, index, .. }) = self.rows.get(self.cursor).cloned()
+        else {
+            return;
+        };
+        let mut versions = self
+            .config
+            .versions_override(rule_id)
+            .cloned()
+            .unwrap_or_default();
+        if index < versions.len() {
+            versions.remove(index);
+        }
+        self.config
+            .set_versions_override(rule_id, (!versions.is_empty()).then_some(versions));
+        self.refresh();
+        self.update_current_item_description();
         self.auto_save_ron();
     }
 
@@ -391,6 +527,12 @@ impl EditorState {
             Some(Row::ArchOption { arch, .. }) => format!(
                 "Include {} in the released multi-arch image",
                 arch.as_str()
+            ),
+            Some(Row::VersionItem { .. }) => {
+                "Toolchain version run as one matrix leg; Enter to edit, d to remove".to_string()
+            }
+            Some(Row::AddVersion { default_image, .. }) => format!(
+                "Add a toolchain version to test against; unset = default image {default_image}"
             ),
             None => String::new(),
         };
@@ -554,7 +696,7 @@ mod tests {
         let collapsed_len = state.rows.len();
 
         // Only expandable rules react to expand
-        state.cursor = rule_index(&state, "rust-test");
+        state.cursor = rule_index(&state, "rust-fmt");
         state.expand_current();
         assert_eq!(
             state.rows.len(),
@@ -578,6 +720,82 @@ mod tests {
         state.collapse_current();
         assert_eq!(state.cursor, rule_index(&state, "docker-release"));
         assert_eq!(state.rows.len(), collapsed_len);
+    }
+
+    #[test]
+    fn test_version_list_editing() {
+        let dir = rust_dir();
+        let mut state = state_for(dir.path());
+
+        // Expanding a versioned test rule shows only the add row
+        state.cursor = rule_index(&state, "rust-test");
+        state.expand_current();
+        let idx = rule_index(&state, "rust-test");
+        assert!(matches!(state.rows[idx + 1], Row::AddVersion { .. }));
+
+        // Adding a version through the add row
+        state.cursor = idx + 1;
+        state.activate_current();
+        assert_eq!(
+            state.input.as_ref().unwrap().target,
+            KnobTarget::Version(None)
+        );
+        for c in "1.85".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(
+            state.config.rust_test.versions,
+            Some(vec!["1.85".to_string()])
+        );
+        assert!(matches!(
+            &state.rows[idx + 1],
+            Row::VersionItem { value, .. } if value == "1.85"
+        ));
+
+        // A second version turns the preview into a matrix
+        state.cursor = idx + 2;
+        state.activate_current();
+        for c in "nightly".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert!(state.yaml_preview.contains("matrix"), "{}", state.yaml_preview);
+
+        // cibox.ron stays delta-only
+        let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
+        assert!(ron_str.contains("versions"), "{ron_str}");
+        assert!(!ron_str.contains("rust_fmt"), "{ron_str}");
+
+        // Editing in place replaces the entry; duplicates collapse
+        state.cursor = idx + 1;
+        state.activate_current();
+        let buffer_len = state.input.as_ref().unwrap().buffer.len();
+        for _ in 0..buffer_len {
+            state.input_backspace();
+        }
+        for c in "nightly".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(
+            state.config.rust_test.versions,
+            Some(vec!["nightly".to_string()])
+        );
+
+        // Removing the last version collapses the override entirely
+        state.cursor = idx + 1;
+        state.delete_current_version();
+        assert!(state.config.is_default());
+    }
+
+    #[test]
+    fn test_delete_only_acts_on_version_rows() {
+        let dir = rust_dir();
+        let mut state = state_for(dir.path());
+        state.cursor = rule_index(&state, "rust-test");
+        state.delete_current_version();
+        assert!(state.config.is_default());
     }
 
     #[test]

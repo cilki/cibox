@@ -1,6 +1,6 @@
 use super::Rule;
 use crate::detection::ProjectFacts;
-use crate::ir::{Job, Stage, Step};
+use crate::ir::{Job, MatrixEntry, Stage, Step};
 
 const IMAGE: &str = "python:3.12";
 
@@ -17,7 +17,11 @@ fn install_command(facts: &ProjectFacts) -> &'static str {
 }
 
 /// Run the test suite with pytest
-pub struct PythonTest;
+#[derive(Default)]
+pub struct PythonTest {
+    /// Toolchain versions to matrix over; empty = the default pinned image
+    pub versions: Vec<String>,
+}
 
 impl Rule for PythonTest {
     fn id(&self) -> &'static str {
@@ -37,15 +41,26 @@ impl Rule for PythonTest {
     }
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Test)
-            .with_image(IMAGE)
+        let job = Job::new(self.id(), self.name(), Stage::Test)
             .with_timeout(30)
             .with_steps(vec![
                 Step::checkout(),
                 Step::run("Install dependencies", install_command(facts)),
                 Step::run("Install pytest", "pip install pytest"),
                 Step::run("Run tests", "pytest"),
-            ])]
+            ]);
+        vec![match self.versions.as_slice() {
+            [] => job.with_image(IMAGE),
+            [v] => job.with_image(format!("python:{v}")),
+            vs => job.with_matrix(
+                vs.iter()
+                    .map(|v| MatrixEntry {
+                        version: v.clone(),
+                        image: format!("python:{v}"),
+                    })
+                    .collect(),
+            ),
+        }]
     }
 }
 
@@ -167,7 +182,7 @@ mod tests {
     #[test]
     fn test_detect_from_requirements() {
         let facts = facts_with(&[("requirements.txt", "requests\n")]);
-        assert!(PythonTest.detect(&facts));
+        assert!(PythonTest::default().detect(&facts));
         assert!(PythonLint.detect(&facts));
         assert!(!PythonRelease.detect(&facts));
     }

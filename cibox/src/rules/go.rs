@@ -1,6 +1,6 @@
 use super::Rule;
 use crate::detection::ProjectFacts;
-use crate::ir::{Job, Stage, Step};
+use crate::ir::{Job, MatrixEntry, Stage, Step};
 
 const IMAGE: &str = "golang:1.23";
 
@@ -9,7 +9,11 @@ fn is_go(facts: &ProjectFacts) -> bool {
 }
 
 /// Run the test suite with `go test`
-pub struct GoTest;
+#[derive(Default)]
+pub struct GoTest {
+    /// Toolchain versions to matrix over; empty = the default pinned image
+    pub versions: Vec<String>,
+}
 
 impl Rule for GoTest {
     fn id(&self) -> &'static str {
@@ -29,15 +33,26 @@ impl Rule for GoTest {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Test)
-            .with_image(IMAGE)
+        let job = Job::new(self.id(), self.name(), Stage::Test)
             .with_timeout(30)
             .with_cache("go-cache", vec!["/go/pkg/mod".to_string()])
             .with_steps(vec![
                 Step::checkout(),
                 Step::run("Download dependencies", "go mod download"),
                 Step::run("Run tests", "go test -v ./..."),
-            ])]
+            ]);
+        vec![match self.versions.as_slice() {
+            [] => job.with_image(IMAGE),
+            [v] => job.with_image(format!("golang:{v}")),
+            vs => job.with_matrix(
+                vs.iter()
+                    .map(|v| MatrixEntry {
+                        version: v.clone(),
+                        image: format!("golang:{v}"),
+                    })
+                    .collect(),
+            ),
+        }]
     }
 }
 
@@ -154,18 +169,39 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("go.mod"), "module example.com/m\n\ngo 1.23\n").unwrap();
         let facts = crate::detection::gather_facts(dir.path());
-        assert!(GoTest.detect(&facts));
+        assert!(GoTest::default().detect(&facts));
         assert!(GoBuild.detect(&facts));
         assert!(GoLint.detect(&facts));
         assert!(GoAudit.detect(&facts));
-        assert!(!GoTest.detect(&ProjectFacts::default()));
+        assert!(!GoTest::default().detect(&ProjectFacts::default()));
     }
 
     #[test]
     fn test_job_shapes() {
-        let jobs = GoTest.jobs(&ProjectFacts::default());
+        let jobs = GoTest::default().jobs(&ProjectFacts::default());
         assert_eq!(jobs[0].id, "go-test");
         assert_eq!(jobs[0].image.as_deref(), Some("golang:1.23"));
         assert_eq!(GoBuild.jobs(&ProjectFacts::default())[0].stage, Stage::Build);
+    }
+
+    #[test]
+    fn test_versions_pin_or_matrix() {
+        let one = GoTest {
+            versions: vec!["1.24".to_string()],
+        };
+        let jobs = one.jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].image.as_deref(), Some("golang:1.24"));
+        assert_eq!(jobs[0].matrix, None);
+
+        let two = GoTest {
+            versions: vec!["1.23".to_string(), "1.24".to_string()],
+        };
+        let jobs = two.jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].image, None);
+        let entries = jobs[0].matrix.as_ref().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].version, "1.23");
+        assert_eq!(entries[0].image, "golang:1.23");
+        assert_eq!(entries[1].image, "golang:1.24");
     }
 }

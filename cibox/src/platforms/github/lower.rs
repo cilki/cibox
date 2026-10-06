@@ -1,7 +1,7 @@
 use crate::ir::{Job, RunnerOs, Step};
 use crate::platforms::github::models::{
-    GitHubDefaults, GitHubJob, GitHubRunDefaults, GitHubStep, GitHubTriggerConfig, GitHubTriggers,
-    GitHubWorkflow,
+    GitHubDefaults, GitHubJob, GitHubMatrix, GitHubMatrixInclude, GitHubRunDefaults, GitHubStep,
+    GitHubStrategy, GitHubTriggerConfig, GitHubTriggers, GitHubWorkflow,
 };
 use std::collections::BTreeMap;
 
@@ -88,6 +88,12 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
                     env: None,
                 });
                 if let Some(cache) = &job.cache {
+                    // Matrix legs run different toolchains; sharing one cache
+                    // key would make them overwrite each other
+                    let key = match &job.matrix {
+                        Some(_) => format!("{}-${{{{ matrix.version }}}}", cache.key),
+                        None => cache.key.clone(),
+                    };
                     steps.push(GitHubStep {
                         name: Some("Cache".to_string()),
                         uses: Some("actions/cache@v4".to_string()),
@@ -97,10 +103,7 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
                                 "path".to_string(),
                                 serde_yaml::Value::String(cache.paths.join("\n")),
                             ),
-                            (
-                                "key".to_string(),
-                                serde_yaml::Value::String(cache.key.clone()),
-                            ),
+                            ("key".to_string(), serde_yaml::Value::String(key)),
                         ])),
                         env: None,
                     });
@@ -148,11 +151,27 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
     });
 
     GitHubJob {
+        name: job
+            .matrix
+            .as_ref()
+            .map(|_| format!("{} (${{{{ matrix.version }}}})", job.name)),
         runs_on: match job.runs_on {
             RunnerOs::Linux => "ubuntu-latest",
             RunnerOs::Windows => "windows-latest",
         }
         .to_string(),
+        strategy: job.matrix.as_ref().map(|entries| GitHubStrategy {
+            fail_fast: false,
+            matrix: GitHubMatrix {
+                include: entries
+                    .iter()
+                    .map(|e| GitHubMatrixInclude {
+                        version: e.version.clone(),
+                        image: e.image.clone(),
+                    })
+                    .collect(),
+            },
+        }),
         // Generated commands are POSIX shell; windows-latest ships Git Bash
         defaults: (job.runs_on == RunnerOs::Windows).then(|| GitHubDefaults {
             run: GitHubRunDefaults {
@@ -162,6 +181,8 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
         // Docker-daemon jobs run directly on the host runner
         container: if job.needs_docker {
             None
+        } else if job.matrix.is_some() {
+            Some("${{ matrix.image }}".to_string())
         } else {
             job.image.clone()
         },
@@ -181,7 +202,7 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Job, Stage, Step};
+    use crate::ir::{Job, MatrixEntry, Stage, Step};
 
     #[test]
     fn test_job_keys_are_rule_ids() {
@@ -314,6 +335,51 @@ mod tests {
         // A job-level block overrides the workflow one outright, so checkout
         // would break without the base scope repeated here
         assert_eq!(permissions["contents"], "read");
+    }
+
+    #[test]
+    fn test_matrix_job() {
+        let entries = vec![
+            MatrixEntry {
+                version: "1.85".to_string(),
+                image: "rust:1.85".to_string(),
+            },
+            MatrixEntry {
+                version: "nightly".to_string(),
+                image: "rustlang/rust:nightly".to_string(),
+            },
+        ];
+        let workflow = lower_github(
+            &[Job::new("rust-test", "Cargo test", Stage::Test)
+                .with_steps(vec![Step::checkout(), Step::run("Run tests", "cargo test")])
+                .with_cache("rust-cache", vec!["target/".to_string()])
+                .with_matrix(entries)],
+            WorkflowKind::Ci,
+        );
+        let job = &workflow.jobs["rust-test"];
+        assert_eq!(job.name.as_deref(), Some("Cargo test (${{ matrix.version }})"));
+        assert_eq!(job.container.as_deref(), Some("${{ matrix.image }}"));
+        let strategy = job.strategy.as_ref().unwrap();
+        assert!(!strategy.fail_fast);
+        assert_eq!(strategy.matrix.include.len(), 2);
+        assert_eq!(strategy.matrix.include[1].image, "rustlang/rust:nightly");
+        // Each leg caches under its own key
+        assert_eq!(
+            job.steps[1].with.as_ref().unwrap()["key"],
+            serde_yaml::Value::String("rust-cache-${{ matrix.version }}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_non_matrix_job_has_no_strategy_or_name() {
+        let workflow = lower_github(
+            &[Job::new("rust-test", "Cargo test", Stage::Test).with_image("rust:latest")],
+            WorkflowKind::Ci,
+        );
+        let yaml = serde_yaml::to_string(&workflow).unwrap();
+        assert!(!yaml.contains("strategy"), "{yaml}");
+        assert!(!yaml.contains("fail-fast"), "{yaml}");
+        assert_eq!(workflow.jobs["rust-test"].name, None);
     }
 
     #[test]

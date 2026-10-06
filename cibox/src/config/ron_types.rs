@@ -11,9 +11,10 @@ use crate::error::Result;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CiboxConfig {
-    /// Run cargo test with all features on every push
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
-    pub rust_test: RuleToggle,
+    /// Run cargo test with all features on every push. Accepts toolchain
+    /// versions: "stable", "nightly", or "x.y[.z]".
+    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    pub rust_test: VersionedRule,
     /// Check code formatting with cargo fmt
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub rust_fmt: RuleToggle,
@@ -38,9 +39,10 @@ pub struct CiboxConfig {
     /// Publish to crates.io on version tags (requires CARGO_REGISTRY_TOKEN)
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub rust_release: RuleToggle,
-    /// Install the package and run pytest on every push
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
-    pub python_test: RuleToggle,
+    /// Install the package and run pytest on every push. Accepts toolchain
+    /// versions as tags of the official python image, e.g. "3.13".
+    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    pub python_test: VersionedRule,
     /// Lint with ruff
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub python_lint: RuleToggle,
@@ -50,9 +52,10 @@ pub struct CiboxConfig {
     /// Build and upload to PyPI on version tags (requires TWINE_PASSWORD)
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub python_release: RuleToggle,
-    /// Run go test on every push
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
-    pub go_test: RuleToggle,
+    /// Run go test on every push. Accepts toolchain versions as tags of the
+    /// official golang image, e.g. "1.24".
+    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    pub go_test: VersionedRule,
     /// Compile all packages
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub go_build: RuleToggle,
@@ -62,9 +65,11 @@ pub struct CiboxConfig {
     /// Scan for security problems with gosec
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub go_audit: RuleToggle,
-    /// Install dependencies and run the package.json test script
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
-    pub node_test: RuleToggle,
+    /// Install dependencies and run the package.json test script. Accepts
+    /// toolchain versions as tags of the official node image, e.g. "22";
+    /// ignored for bun projects.
+    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    pub node_test: VersionedRule,
     /// Run the package.json lint script
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub node_lint: RuleToggle,
@@ -110,6 +115,25 @@ pub struct RuleToggle {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+}
+
+/// Override for a test rule that supports a toolchain-version matrix
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VersionedRule {
+    /// Force this rule on or off; omit to let detection decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Toolchain versions to test against, lowered to the platform's native
+    /// job matrix. A single version pins the image; omit for the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versions: Option<Vec<String>>,
+}
+
+impl VersionedRule {
+    pub fn is_default(&self) -> bool {
+        self.enabled.is_none() && self.versions.is_none()
+    }
 }
 
 /// Override for the docker-build rule: toggle plus image name
@@ -245,6 +269,28 @@ impl CiboxConfig {
             "docker-release" => self.docker_release.enabled,
             "gitleaks" => self.gitleaks.enabled,
             _ => None,
+        }
+    }
+
+    /// The `versions` override for a test rule by its kebab-case id
+    pub fn versions_override(&self, rule_id: &str) -> Option<&Vec<String>> {
+        match rule_id {
+            "rust-test" => self.rust_test.versions.as_ref(),
+            "python-test" => self.python_test.versions.as_ref(),
+            "go-test" => self.go_test.versions.as_ref(),
+            "node-test" => self.node_test.versions.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Set the `versions` override for a test rule by its kebab-case id
+    pub fn set_versions_override(&mut self, rule_id: &str, versions: Option<Vec<String>>) {
+        match rule_id {
+            "rust-test" => self.rust_test.versions = versions,
+            "python-test" => self.python_test.versions = versions,
+            "go-test" => self.go_test.versions = versions,
+            "node-test" => self.node_test.versions = versions,
+            _ => {}
         }
     }
 
@@ -413,6 +459,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("old pipeline-list format"));
+    }
+
+    #[test]
+    fn test_parse_versions() {
+        let config = parse_config(r#"(rust_test: (versions: ["1.90", "nightly"]))"#).unwrap();
+        assert_eq!(
+            config.rust_test.versions,
+            Some(vec!["1.90".to_string(), "nightly".to_string()])
+        );
+        // Versions alone leave detection in charge of enablement
+        assert_eq!(config.rust_test.enabled, None);
+    }
+
+    #[test]
+    fn test_versions_round_trip_is_delta_only() {
+        let mut config = CiboxConfig::default();
+        config.go_test.versions = Some(vec!["1.23".to_string(), "1.24".to_string()]);
+        let ron_str = serialize_config(&config).unwrap();
+        assert!(ron_str.contains("versions"), "{ron_str}");
+        assert!(!ron_str.contains("enabled"), "{ron_str}");
+        assert!(!ron_str.contains("rust_test"), "{ron_str}");
+        assert_eq!(parse_config(&ron_str).unwrap(), config);
+    }
+
+    #[test]
+    fn test_versions_override_round_trip() {
+        let mut config = CiboxConfig::default();
+        config.set_versions_override("node-test", Some(vec!["22".to_string()]));
+        assert_eq!(
+            config.versions_override("node-test"),
+            Some(&vec!["22".to_string()])
+        );
+        config.set_versions_override("node-test", None);
+        assert!(config.is_default());
     }
 
     #[test]

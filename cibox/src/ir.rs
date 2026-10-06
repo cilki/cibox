@@ -41,6 +41,14 @@ pub struct Cache {
     pub paths: Vec<String>,
 }
 
+/// One leg of a toolchain-version matrix: the user-facing version string and
+/// the container image that provides it
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatrixEntry {
+    pub version: String,
+    pub image: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     /// Fetch the repository. Implicit on GitLab; `full_history`
@@ -88,6 +96,12 @@ pub struct Job {
     /// Only run for version tags (GitLab only:refs:[tags]; adds a v* tag
     /// trigger on GitHub)
     pub tags_only: bool,
+    /// Toolchain versions to run this job against, lowered to the platform's
+    /// native job matrix. Replaces `image`; the backends substitute each
+    /// entry's image in their own interpolation syntax and suffix the cache
+    /// key with the version. Incompatible with `needs_docker` and `artifacts`
+    /// (artifact names would collide across matrix legs).
+    pub matrix: Option<Vec<MatrixEntry>>,
     pub cache: Option<Cache>,
     /// Paths preserved as build artifacts
     pub artifacts: Vec<String>,
@@ -117,6 +131,7 @@ impl Job {
             steps: Vec::new(),
             timeout_minutes: None,
             tags_only: false,
+            matrix: None,
             cache: None,
             artifacts: Vec::new(),
             env: Vec::new(),
@@ -149,6 +164,13 @@ impl Job {
 
     pub fn tags_only(mut self) -> Self {
         self.tags_only = true;
+        self
+    }
+
+    pub fn with_matrix(mut self, entries: Vec<MatrixEntry>) -> Self {
+        debug_assert!(self.image.is_none(), "matrix replaces the pinned image");
+        debug_assert!(!self.needs_docker, "matrix jobs run in containers");
+        self.matrix = Some(entries);
         self
     }
 
@@ -200,5 +222,17 @@ mod tests {
         assert!(Stage::Test < Stage::Lint);
         assert!(Stage::Security < Stage::Build);
         assert!(Stage::Build < Stage::Deploy);
+    }
+
+    #[test]
+    fn test_with_matrix() {
+        let job = Job::new("a", "A", Stage::Test);
+        assert_eq!(job.matrix, None);
+        let entries = vec![MatrixEntry {
+            version: "1.90".to_string(),
+            image: "rust:1.90".to_string(),
+        }];
+        let job = job.with_matrix(entries.clone());
+        assert_eq!(job.matrix, Some(entries));
     }
 }

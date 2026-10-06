@@ -33,6 +33,23 @@ pub struct GitLabJob {
     pub only: Option<GitLabOnly>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<GitLabParallel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitLabParallel {
+    pub matrix: Vec<GitLabMatrixCell>,
+}
+
+/// One matrix combination. A struct rather than a map so VERSION serializes
+/// first — GitLab derives the leg's display name from the variable order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitLabMatrixCell {
+    #[serde(rename = "VERSION")]
+    pub version: String,
+    #[serde(rename = "IMAGE")]
+    pub image: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

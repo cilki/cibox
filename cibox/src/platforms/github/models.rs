@@ -32,8 +32,13 @@ pub struct GitHubTriggerConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitHubJob {
+    /// Display name; set for matrix jobs so each leg shows its version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(rename = "runs-on")]
     pub runs_on: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<GitHubStrategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defaults: Option<GitHubDefaults>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,6 +57,25 @@ pub struct GitHubJob {
     pub continue_on_error: Option<bool>,
     #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
     pub if_expr: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitHubStrategy {
+    /// One failing toolchain must not cancel the other matrix legs
+    #[serde(rename = "fail-fast")]
+    pub fail_fast: bool,
+    pub matrix: GitHubMatrix,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitHubMatrix {
+    pub include: Vec<GitHubMatrixInclude>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitHubMatrixInclude {
+    pub version: String,
+    pub image: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,7 +116,9 @@ mod tests {
             jobs: BTreeMap::from([(
                 "test".to_string(),
                 GitHubJob {
+                    name: None,
                     runs_on: "ubuntu-latest".to_string(),
+                    strategy: None,
                     defaults: None,
                     container: None,
                     permissions: None,

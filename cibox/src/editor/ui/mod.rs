@@ -1,4 +1,4 @@
-use crate::editor::state::{EditorState, Platform, Row, RuleRow};
+use crate::editor::state::{EditorState, KnobTarget, Platform, Row, RuleRow};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -122,10 +122,9 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
                 effective,
                 ..
             } => {
-                let editing = state
-                    .input
-                    .as_ref()
-                    .filter(|input| input.rule_id == *rule_id);
+                let editing = state.input.as_ref().filter(|input| {
+                    input.rule_id == *rule_id && input.target == KnobTarget::ImageName
+                });
                 if let Some(input) = editing {
                     Line::from(vec![
                         Span::styled(
@@ -176,6 +175,64 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
                     ),
                     Span::styled(arch.as_str(), Style::default().fg(text_color)),
                 ])
+            }
+            Row::VersionItem {
+                rule_id,
+                index,
+                value,
+            } => {
+                let editing = state.input.as_ref().filter(|input| {
+                    input.rule_id == *rule_id
+                        && input.target == KnobTarget::Version(Some(*index))
+                });
+                let prefix =
+                    Span::styled("       - ".to_string(), Style::default().fg(Color::DarkGray));
+                if let Some(input) = editing {
+                    Line::from(vec![
+                        prefix,
+                        Span::styled(
+                            format!("{}▏", input.buffer),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ])
+                } else {
+                    let color = if is_selected {
+                        Color::Yellow
+                    } else {
+                        Color::White
+                    };
+                    Line::from(vec![
+                        prefix,
+                        Span::styled(value.clone(), Style::default().fg(color)),
+                    ])
+                }
+            }
+            Row::AddVersion { rule_id, .. } => {
+                let editing = state.input.as_ref().filter(|input| {
+                    input.rule_id == *rule_id && input.target == KnobTarget::Version(None)
+                });
+                if let Some(input) = editing {
+                    Line::from(vec![
+                        Span::styled(
+                            "       + ".to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{}▏", input.buffer),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ])
+                } else {
+                    let color = if is_selected {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    };
+                    Line::from(Span::styled(
+                        "       [+] add version…".to_string(),
+                        Style::default().fg(color),
+                    ))
+                }
             }
         };
 
@@ -477,6 +534,8 @@ fn render_footer(f: &mut Frame, area: Rect, state: &EditorState) {
             Span::raw(" toggle/edit | "),
             Span::styled("←→/hl", Style::default().fg(Color::Yellow)),
             Span::raw(" options | "),
+            Span::styled("d", Style::default().fg(Color::Red)),
+            Span::raw(" remove | "),
             Span::styled("↑↓/jk", Style::default().fg(Color::Blue)),
             Span::raw(" navigate | "),
             Span::styled("JK", Style::default().fg(Color::Magenta)),

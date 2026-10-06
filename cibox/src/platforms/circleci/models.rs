@@ -12,10 +12,19 @@ pub struct CircleCIConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CircleCIJob {
+    /// Declared inputs for a matrix job; referenced as << parameters.x >>
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<BTreeMap<String, CircleCIParameter>>,
     pub docker: Vec<CircleCIDocker>,
     pub steps: Vec<CircleCIStep>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CircleCIParameter {
+    #[serde(rename = "type")]
+    pub param_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,10 +93,17 @@ pub enum CircleCIWorkflowJob {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CircleCIWorkflowJobDetail {
+    /// Distinct display name; required when one job is invoked several
+    /// times (once per matrix leg)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requires: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filters: Option<CircleCIFilters>,
+    /// Parameter values for this invocation, inlined next to the other keys
+    #[serde(flatten)]
+    pub params: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

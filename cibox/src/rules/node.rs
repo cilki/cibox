@@ -1,6 +1,6 @@
 use super::Rule;
 use crate::detection::{NodeFacts, NodePackageManager, ProjectFacts};
-use crate::ir::{Job, Stage, Step};
+use crate::ir::{Job, MatrixEntry, Stage, Step};
 
 const IMAGE: &str = "node:22";
 const BUN_IMAGE: &str = "oven/bun:1";
@@ -91,7 +91,12 @@ fn steps_with_install(n: &NodeFacts, final_step: Step) -> Vec<Step> {
 }
 
 /// Run the package.json test script
-pub struct NodeTest;
+#[derive(Default)]
+pub struct NodeTest {
+    /// Toolchain versions to matrix over; empty = the default pinned image.
+    /// Ignored for bun projects, whose toolchain comes with the bun image.
+    pub versions: Vec<String>,
+}
 
 impl Rule for NodeTest {
     fn id(&self) -> &'static str {
@@ -112,12 +117,27 @@ impl Rule for NodeTest {
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
         let n = node(facts);
-        vec![
-            base_job(self.id(), self.name(), Stage::Test, 30, &n).with_steps(steps_with_install(
-                &n,
-                Step::run("Run tests", run_script(&n, "test")),
-            )),
-        ]
+        let mut job = base_job(self.id(), self.name(), Stage::Test, 30, &n).with_steps(
+            steps_with_install(&n, Step::run("Run tests", run_script(&n, "test"))),
+        );
+        if n.package_manager != NodePackageManager::Bun {
+            match self.versions.as_slice() {
+                [] => {}
+                [v] => job.image = Some(format!("node:{v}")),
+                vs => {
+                    job.image = None;
+                    job = job.with_matrix(
+                        vs.iter()
+                            .map(|v| MatrixEntry {
+                                version: v.clone(),
+                                image: format!("node:{v}"),
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        vec![job]
     }
 }
 
@@ -234,11 +254,11 @@ mod tests {
             "package.json",
             r#"{"scripts": {"test": "vitest", "lint": "eslint ."}}"#,
         )]);
-        assert!(NodeTest.detect(&facts));
+        assert!(NodeTest::default().detect(&facts));
         assert!(NodeLint.detect(&facts));
         assert!(!NodeTypecheck.detect(&facts));
         assert!(!NodeFmt.detect(&facts));
-        assert!(!NodeTest.detect(&ProjectFacts::default()));
+        assert!(!NodeTest::default().detect(&ProjectFacts::default()));
     }
 
     #[test]
@@ -247,7 +267,7 @@ mod tests {
             "package.json",
             r#"{"scripts": {"test": "echo \"Error: no test specified\" && exit 1"}}"#,
         )]);
-        assert!(!NodeTest.detect(&facts));
+        assert!(!NodeTest::default().detect(&facts));
     }
 
     #[test]
@@ -263,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_npm_without_lockfile_uses_npm_install() {
-        let jobs = NodeTest.jobs(&ProjectFacts::default());
+        let jobs = NodeTest::default().jobs(&ProjectFacts::default());
         assert_eq!(jobs[0].id, "node-test");
         assert_eq!(jobs[0].image.as_deref(), Some("node:22"));
         assert!(jobs[0].steps.iter().any(|s| matches!(
@@ -278,7 +298,7 @@ mod tests {
             ("package.json", r#"{"scripts": {"test": "vitest"}}"#),
             ("package-lock.json", "{}"),
         ]);
-        let jobs = NodeTest.jobs(&facts);
+        let jobs = NodeTest::default().jobs(&facts);
         assert!(jobs[0].steps.iter().any(|s| matches!(
             s,
             Step::Run { command, .. } if command == "npm ci"
@@ -291,12 +311,45 @@ mod tests {
             ("package.json", r#"{"scripts": {"test": "bun test"}}"#),
             ("bun.lockb", ""),
         ]);
-        let jobs = NodeTest.jobs(&facts);
+        let jobs = NodeTest::default().jobs(&facts);
         assert_eq!(jobs[0].image.as_deref(), Some("oven/bun:1"));
         assert!(jobs[0].steps.iter().any(|s| matches!(
             s,
             Step::Run { command, .. } if command == "bun install --frozen-lockfile"
         )));
+    }
+
+    #[test]
+    fn test_versions_pin_or_matrix() {
+        let one = NodeTest {
+            versions: vec!["20".to_string()],
+        };
+        let jobs = one.jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].image.as_deref(), Some("node:20"));
+        assert_eq!(jobs[0].matrix, None);
+
+        let two = NodeTest {
+            versions: vec!["20".to_string(), "22".to_string()],
+        };
+        let jobs = two.jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].image, None);
+        let entries = jobs[0].matrix.as_ref().unwrap();
+        assert_eq!(entries[0].image, "node:20");
+        assert_eq!(entries[1].image, "node:22");
+    }
+
+    #[test]
+    fn test_versions_ignored_for_bun() {
+        let facts = facts_with(&[
+            ("package.json", r#"{"scripts": {"test": "bun test"}}"#),
+            ("bun.lockb", ""),
+        ]);
+        let rule = NodeTest {
+            versions: vec!["20".to_string(), "22".to_string()],
+        };
+        let jobs = rule.jobs(&facts);
+        assert_eq!(jobs[0].image.as_deref(), Some("oven/bun:1"));
+        assert_eq!(jobs[0].matrix, None);
     }
 
     #[test]
@@ -312,7 +365,7 @@ mod tests {
     #[test]
     fn test_job_stages() {
         assert_eq!(
-            NodeTest.jobs(&ProjectFacts::default())[0].stage,
+            NodeTest::default().jobs(&ProjectFacts::default())[0].stage,
             Stage::Test
         );
         assert_eq!(

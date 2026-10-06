@@ -1,6 +1,6 @@
 use crate::ir::{Job, Stage, Step};
 use crate::platforms::gitlab::models::{
-    GitLabArtifacts, GitLabCI, GitLabCache, GitLabJob, GitLabOnly,
+    GitLabArtifacts, GitLabCI, GitLabCache, GitLabJob, GitLabMatrixCell, GitLabOnly, GitLabParallel,
 };
 use std::collections::BTreeMap;
 
@@ -53,6 +53,9 @@ fn lower_job(job: &Job) -> GitLabJob {
         stage: job.stage.as_str().to_string(),
         image: if job.needs_docker {
             Some("docker:latest".to_string())
+        } else if job.matrix.is_some() {
+            // Expanded per leg from the parallel:matrix variables
+            Some("$IMAGE".to_string())
         } else {
             job.image.clone()
         },
@@ -61,7 +64,12 @@ fn lower_job(job: &Job) -> GitLabJob {
         after_script: None,
         needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
         cache: job.cache.as_ref().map(|cache| GitLabCache {
-            key: cache.key.clone(),
+            // Matrix legs run different toolchains; sharing one cache key
+            // would make them overwrite each other
+            key: match &job.matrix {
+                Some(_) => format!("{}-$VERSION", cache.key),
+                None => cache.key.clone(),
+            },
             paths: cache.paths.clone(),
         }),
         artifacts: (!job.artifacts.is_empty()).then(|| GitLabArtifacts {
@@ -72,13 +80,22 @@ fn lower_job(job: &Job) -> GitLabJob {
             refs: Some(vec!["tags".to_string()]),
         }),
         timeout: job.timeout_minutes.map(|minutes| format!("{minutes}m")),
+        parallel: job.matrix.as_ref().map(|entries| GitLabParallel {
+            matrix: entries
+                .iter()
+                .map(|e| GitLabMatrixCell {
+                    version: e.version.clone(),
+                    image: e.image.clone(),
+                })
+                .collect(),
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Job, Stage, Step};
+    use crate::ir::{Job, MatrixEntry, Stage, Step};
 
     #[test]
     fn test_stages_union_in_order() {
@@ -112,6 +129,36 @@ mod tests {
             job.only.as_ref().unwrap().refs,
             Some(vec!["tags".to_string()])
         );
+    }
+
+    #[test]
+    fn test_matrix_job() {
+        let entries = vec![
+            MatrixEntry {
+                version: "1.85".to_string(),
+                image: "rust:1.85".to_string(),
+            },
+            MatrixEntry {
+                version: "nightly".to_string(),
+                image: "rustlang/rust:nightly".to_string(),
+            },
+        ];
+        let config = lower_gitlab(&[Job::new("rust-test", "Cargo test", Stage::Test)
+            .with_cache("rust-cache", vec!["target/".to_string()])
+            .with_matrix(entries)]);
+        let job = &config.jobs["rust-test"];
+        assert_eq!(job.image.as_deref(), Some("$IMAGE"));
+        assert_eq!(job.cache.as_ref().unwrap().key, "rust-cache-$VERSION");
+        let cells = &job.parallel.as_ref().unwrap().matrix;
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].version, "1.85");
+        assert_eq!(cells[1].image, "rustlang/rust:nightly");
+        // VERSION must serialize before IMAGE: GitLab derives the leg name
+        // from variable order
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let version_pos = yaml.find("VERSION: '1.85'").unwrap();
+        let image_pos = yaml.find("IMAGE: rust:1.85").unwrap();
+        assert!(version_pos < image_pos, "{yaml}");
     }
 
     #[test]

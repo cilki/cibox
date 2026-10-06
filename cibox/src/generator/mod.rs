@@ -247,6 +247,32 @@ mod tests {
     }
 
     #[test]
+    fn test_versioned_config_renders_valid_output_everywhere() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_test.versions = Some(vec!["1.85".to_string(), "nightly".to_string()]);
+        let resolved = resolve(&facts, &config);
+
+        for platform in Platform::all() {
+            let marker = match platform {
+                Platform::GitHub | Platform::Gitea => "matrix:",
+                Platform::GitLab => "parallel:",
+                Platform::CircleCI => "<< parameters.image >>",
+            };
+            let outputs = generate(&facts, &resolved, platform).unwrap();
+            let ci = outputs
+                .iter()
+                .find(|(_, content)| content.contains("rust-test"))
+                .unwrap_or_else(|| panic!("{platform:?} has no rust-test"));
+            serde_yaml::from_str::<serde_yaml::Value>(&ci.1)
+                .unwrap_or_else(|e| panic!("{platform:?} invalid YAML: {e}"));
+            assert!(ci.1.contains(marker), "{platform:?}: {}", ci.1);
+            // The job key stays the bare rule id
+            assert!(ci.1.contains("rust-test"), "{platform:?}");
+        }
+    }
+
+    #[test]
     fn test_mixed_docker_platforms_on_github() {
         let facts = full_facts();
         let mut config = CiboxConfig::default();

@@ -1,6 +1,6 @@
 use super::Rule;
 use crate::detection::ProjectFacts;
-use crate::ir::{Job, Stage, Step};
+use crate::ir::{Job, MatrixEntry, Stage, Step};
 
 /// The official image tracks stable; "rust:stable" is not a docker tag
 const IMAGE: &str = "rust:latest";
@@ -9,8 +9,21 @@ fn is_rust(facts: &ProjectFacts) -> bool {
     facts.rust.is_some()
 }
 
+/// The image providing a user-selected toolchain version
+fn toolchain_image(version: &str) -> String {
+    match version {
+        "stable" => IMAGE.to_string(),
+        "nightly" => "rustlang/rust:nightly".to_string(),
+        v => format!("rust:{v}"),
+    }
+}
+
 /// Run the test suite with `cargo test`
-pub struct RustTest;
+#[derive(Default)]
+pub struct RustTest {
+    /// Toolchain versions to matrix over; empty = the default pinned image
+    pub versions: Vec<String>,
+}
 
 impl Rule for RustTest {
     fn id(&self) -> &'static str {
@@ -30,8 +43,7 @@ impl Rule for RustTest {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Test)
-            .with_image(IMAGE)
+        let job = Job::new(self.id(), self.name(), Stage::Test)
             .with_timeout(30)
             .with_cache(
                 "rust-cache",
@@ -40,7 +52,19 @@ impl Rule for RustTest {
             .with_steps(vec![
                 Step::checkout(),
                 Step::run("Run tests", "cargo test --all-features"),
-            ])]
+            ]);
+        vec![match self.versions.as_slice() {
+            [] => job.with_image(IMAGE),
+            [v] => job.with_image(toolchain_image(v)),
+            vs => job.with_matrix(
+                vs.iter()
+                    .map(|v| MatrixEntry {
+                        version: v.clone(),
+                        image: toolchain_image(v),
+                    })
+                    .collect(),
+            ),
+        }]
     }
 }
 
@@ -391,11 +415,11 @@ mod tests {
     #[test]
     fn test_rules_detect_any_rust_project() {
         let facts = facts("[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = false\n");
-        assert!(RustTest.detect(&facts));
+        assert!(RustTest::default().detect(&facts));
         assert!(RustFmt.detect(&facts));
         assert!(RustClippy.detect(&facts));
         assert!(RustAudit.detect(&facts));
-        assert!(!RustTest.detect(&ProjectFacts::default()));
+        assert!(!RustTest::default().detect(&ProjectFacts::default()));
     }
 
     #[test]
@@ -410,6 +434,37 @@ mod tests {
         assert!(jobs[0]
             .env
             .contains(&("RUSTDOCFLAGS".to_string(), "--cfg docsrs".to_string())));
+    }
+
+    #[test]
+    fn test_versions_pin_or_matrix() {
+        // Empty = today's default image, no matrix
+        let jobs = RustTest::default().jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].image.as_deref(), Some("rust:latest"));
+        assert_eq!(jobs[0].matrix, None);
+
+        // One version pins the image without a matrix
+        let one = RustTest {
+            versions: vec!["1.85".to_string()],
+        };
+        let jobs = one.jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].image.as_deref(), Some("rust:1.85"));
+        assert_eq!(jobs[0].matrix, None);
+
+        // Several versions become matrix entries with mapped images
+        let many = RustTest {
+            versions: vec![
+                "stable".to_string(),
+                "nightly".to_string(),
+                "1.85".to_string(),
+            ],
+        };
+        let jobs = many.jobs(&ProjectFacts::default());
+        assert_eq!(jobs[0].image, None);
+        let entries = jobs[0].matrix.as_ref().unwrap();
+        assert_eq!(entries[0].image, "rust:latest");
+        assert_eq!(entries[1].image, "rustlang/rust:nightly");
+        assert_eq!(entries[2].image, "rust:1.85");
     }
 
     #[test]
@@ -509,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_test_job_shape() {
-        let jobs = RustTest.jobs(&ProjectFacts::default());
+        let jobs = RustTest::default().jobs(&ProjectFacts::default());
         assert_eq!(jobs[0].id, "rust-test");
         assert_eq!(jobs[0].image.as_deref(), Some("rust:latest"));
         assert!(jobs[0].cache.is_some());

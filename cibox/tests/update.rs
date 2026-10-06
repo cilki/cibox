@@ -92,6 +92,45 @@ fn test_update_lifecycle() {
 }
 
 #[test]
+fn test_version_matrix_lifecycle() {
+    let dir = project();
+    let ci_path = dir.path().join(".github/workflows/ci.yml");
+
+    update(dir.path()).assert().success();
+    let job_count = read_yaml(&ci_path)["jobs"].as_mapping().unwrap().len();
+
+    // Configuring versions turns rust-test into a matrix job in place
+    fs::write(
+        dir.path().join("cibox.ron"),
+        r#"(rust_test: (versions: ["1.85", "nightly"]))"#,
+    )
+    .unwrap();
+    update(dir.path()).assert().success();
+    let doc = read_yaml(&ci_path);
+    let jobs = doc["jobs"].as_mapping().unwrap();
+    assert_eq!(jobs.len(), job_count, "job keys unchanged");
+    let rust_test = &jobs["rust-test"];
+    assert_eq!(rust_test["strategy"]["fail-fast"], Value::Bool(false));
+    assert_eq!(
+        rust_test["strategy"]["matrix"]["include"][1]["image"],
+        Value::String("rustlang/rust:nightly".to_string())
+    );
+
+    // Idempotent on a second run
+    update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+
+    // Reverting the config conforms the matrix away again
+    fs::write(dir.path().join("cibox.ron"), "()").unwrap();
+    update(dir.path()).assert().success();
+    let content = fs::read_to_string(&ci_path).unwrap();
+    assert!(!content.contains("strategy"), "{content}");
+    assert!(content.contains("rust:latest"), "{content}");
+}
+
+#[test]
 fn test_generate_subcommand_is_gone() {
     let dir = project();
     Command::cargo_bin("cibox")

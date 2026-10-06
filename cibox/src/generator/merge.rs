@@ -351,16 +351,28 @@ fn merge_circleci(
                 continue;
             };
             let had_entries = !entries.is_empty();
-            *entries = entries
-                .iter()
-                .filter_map(|entry| match entry_id(entry) {
-                    Some(id) if is_owned(resolved, &id) => canonical_entries
-                        .iter()
-                        .find(|c| entry_id(c).as_deref() == Some(&id))
-                        .map(|c| (*c).clone()),
-                    _ => Some(entry.clone()),
-                })
-                .collect();
+            // A matrix job is invoked once per leg, so one owned id can map
+            // to several canonical entries: the first existing entry expands
+            // to all of them, later ones with the same id are dropped
+            let mut expanded: Vec<String> = Vec::new();
+            let mut conformed = Vec::new();
+            for entry in entries.iter() {
+                match entry_id(entry) {
+                    Some(id) if is_owned(resolved, &id) => {
+                        if !expanded.contains(&id) {
+                            expanded.push(id.clone());
+                            conformed.extend(
+                                canonical_entries
+                                    .iter()
+                                    .filter(|c| entry_id(c).as_deref() == Some(&id))
+                                    .map(|c| (*c).clone()),
+                            );
+                        }
+                    }
+                    _ => conformed.push(entry.clone()),
+                }
+            }
+            *entries = conformed;
             // CircleCI rejects a workflow with no jobs
             if had_entries && entries.is_empty() {
                 workflows.shift_remove(&name);
@@ -692,6 +704,123 @@ my-job:
         let (content, _, _, _) =
             merged(merge_file(Platform::GitHub, &file, &resolved, existing).unwrap());
         assert!(!content.contains("Required CI variables"), "{content}");
+    }
+
+    #[test]
+    fn test_merge_is_idempotent_with_versions() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_test.versions = Some(vec!["1.85".to_string(), "nightly".to_string()]);
+        let resolved = resolve(&facts, &config);
+        for platform in Platform::all() {
+            for file in plan(&facts, &resolved, platform).unwrap() {
+                let canonical = render_file(platform, &file).unwrap();
+                assert!(
+                    matches!(
+                        merge_file(platform, &file, &resolved, &canonical).unwrap(),
+                        MergeOutcome::Unchanged
+                    ),
+                    "{platform:?} {} not idempotent",
+                    file.path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_github_matrix_body_conforms() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_test.versions = Some(vec!["1.85".to_string(), "nightly".to_string()]);
+        let resolved = resolve(&facts, &config);
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+
+        let existing = "name: CI\non: [push]\njobs:\n  rust-test:\n    \
+                        runs-on: ubuntu-latest\n    steps:\n      - run: echo stale\n";
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitHub, &file, &resolved, existing).unwrap());
+        assert!(content.contains("strategy:"), "{content}");
+        assert!(content.contains("fail-fast: false"), "{content}");
+        assert!(content.contains("rustlang/rust:nightly"), "{content}");
+        assert!(!content.contains("echo stale"), "{content}");
+    }
+
+    #[test]
+    fn test_circleci_matrix_expands_workflow_invocations() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_test.versions = Some(vec!["1.85".to_string(), "nightly".to_string()]);
+        let resolved = resolve(&facts, &config);
+        let file = planned_file(Platform::CircleCI, &resolved, 0);
+
+        let existing = r#"
+version: "2.1"
+jobs:
+  rust-test:
+    docker: [{image: old}]
+    steps: [checkout]
+  my-job:
+    docker: [{image: mine}]
+    steps: [checkout]
+workflows:
+  main:
+    jobs:
+      - rust-test
+      - my-job
+"#;
+
+        let (content, _, _, _) =
+            merged(merge_file(Platform::CircleCI, &file, &resolved, existing).unwrap());
+        assert!(content.contains("rust-test-1.85"), "{content}");
+        assert!(content.contains("rust-test-nightly"), "{content}");
+        assert!(content.contains("my-job"), "{content}");
+        assert!(content.contains("<< parameters.image >>"), "{content}");
+        // Merging the merged output again is a no-op: the expanded
+        // invocations map back onto the same canonical entries
+        assert!(matches!(
+            merge_file(Platform::CircleCI, &file, &resolved, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn test_circleci_stale_matrix_invocations_collapse() {
+        let facts = full_facts();
+        // One version left: the job collapses back to a single invocation
+        let mut config = CiboxConfig::default();
+        config.rust_test.versions = Some(vec!["1.85".to_string()]);
+        let resolved = resolve(&facts, &config);
+        let file = planned_file(Platform::CircleCI, &resolved, 0);
+
+        let existing = r#"
+version: "2.1"
+jobs:
+  rust-test:
+    parameters:
+      image: {type: string}
+      version: {type: string}
+    docker: [{image: << parameters.image >>}]
+    steps: [checkout]
+workflows:
+  main:
+    jobs:
+      - rust-test:
+          name: rust-test-1.85
+          version: "1.85"
+          image: rust:1.85
+      - rust-test:
+          name: rust-test-nightly
+          version: nightly
+          image: rustlang/rust:nightly
+"#;
+
+        let (content, _, _, _) =
+            merged(merge_file(Platform::CircleCI, &file, &resolved, existing).unwrap());
+        assert!(!content.contains("rust-test-nightly"), "{content}");
+        assert!(!content.contains("parameters"), "{content}");
+        assert!(content.contains("rust:1.85"), "{content}");
+        // Exactly one workflow invocation remains
+        assert_eq!(content.matches("- rust-test").count(), 1, "{content}");
     }
 
     #[test]

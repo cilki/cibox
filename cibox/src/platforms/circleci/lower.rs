@@ -1,8 +1,8 @@
 use crate::ir::{Job, Step};
 use crate::platforms::circleci::models::{
     CircleCICache, CircleCICacheSave, CircleCIConfig, CircleCIDocker, CircleCIFilterPattern,
-    CircleCIFilters, CircleCIJob, CircleCIRun, CircleCIStep, CircleCIStoreArtifacts,
-    CircleCIWorkflow, CircleCIWorkflowJob, CircleCIWorkflowJobDetail,
+    CircleCIFilters, CircleCIJob, CircleCIParameter, CircleCIRun, CircleCIStep,
+    CircleCIStoreArtifacts, CircleCIWorkflow, CircleCIWorkflowJob, CircleCIWorkflowJobDetail,
 };
 use std::collections::BTreeMap;
 
@@ -28,15 +28,37 @@ pub fn lower_circleci(jobs: &[Job]) -> CircleCIConfig {
             }),
         });
 
-        if job.needs.is_empty() && filters.is_none() {
+        if let Some(entries) = &job.matrix {
+            // One invocation per matrix leg: CircleCI's `matrix:` keyword
+            // cross-products parameters, which is wrong for paired
+            // version/image values
+            for entry in entries {
+                workflow_jobs.push(CircleCIWorkflowJob::Detailed {
+                    job: BTreeMap::from([(
+                        job.id.clone(),
+                        CircleCIWorkflowJobDetail {
+                            name: Some(format!("{}-{}", job.id, entry.version)),
+                            requires: (!job.needs.is_empty()).then(|| job.needs.clone()),
+                            filters: filters.clone(),
+                            params: BTreeMap::from([
+                                ("version".to_string(), entry.version.clone()),
+                                ("image".to_string(), entry.image.clone()),
+                            ]),
+                        },
+                    )]),
+                });
+            }
+        } else if job.needs.is_empty() && filters.is_none() {
             workflow_jobs.push(CircleCIWorkflowJob::Simple(job.id.clone()));
         } else {
             workflow_jobs.push(CircleCIWorkflowJob::Detailed {
                 job: BTreeMap::from([(
                     job.id.clone(),
                     CircleCIWorkflowJobDetail {
+                        name: None,
                         requires: (!job.needs.is_empty()).then(|| job.needs.clone()),
                         filters,
+                        params: BTreeMap::new(),
                     },
                 )]),
             });
@@ -59,8 +81,17 @@ pub fn lower_circleci(jobs: &[Job]) -> CircleCIConfig {
 fn lower_job(job: &Job) -> CircleCIJob {
     let image = if job.needs_docker {
         DEFAULT_IMAGE.to_string()
+    } else if job.matrix.is_some() {
+        "<< parameters.image >>".to_string()
     } else {
         job.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string())
+    };
+
+    // Matrix legs run different toolchains; sharing one cache key would
+    // make them overwrite each other
+    let cache_key = |key: &str| match &job.matrix {
+        Some(_) => format!("{key}-<< parameters.version >>"),
+        None => key.to_string(),
     };
 
     let mut steps = Vec::new();
@@ -75,7 +106,7 @@ fn lower_job(job: &Job) -> CircleCIJob {
                 if let Some(cache) = &job.cache {
                     steps.push(CircleCIStep::Cache {
                         restore_cache: CircleCICache {
-                            keys: vec![cache.key.clone()],
+                            keys: vec![cache_key(&cache.key)],
                         },
                     });
                 }
@@ -94,7 +125,7 @@ fn lower_job(job: &Job) -> CircleCIJob {
     if let Some(cache) = &job.cache {
         steps.push(CircleCIStep::SaveCache {
             save_cache: CircleCICacheSave {
-                key: cache.key.clone(),
+                key: cache_key(&cache.key),
                 paths: cache.paths.clone(),
             },
         });
@@ -107,6 +138,12 @@ fn lower_job(job: &Job) -> CircleCIJob {
 
     let env: BTreeMap<String, String> = job.env.iter().cloned().collect();
     CircleCIJob {
+        parameters: job.matrix.as_ref().map(|_| {
+            let string = || CircleCIParameter {
+                param_type: "string".to_string(),
+            };
+            BTreeMap::from([("version".to_string(), string()), ("image".to_string(), string())])
+        }),
         docker: vec![CircleCIDocker { image }],
         steps,
         environment: (!env.is_empty()).then_some(env),
@@ -116,7 +153,7 @@ fn lower_job(job: &Job) -> CircleCIJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Job, Stage, Step};
+    use crate::ir::{Job, MatrixEntry, Stage, Step};
 
     #[test]
     fn test_single_main_workflow() {
@@ -151,6 +188,54 @@ mod tests {
         let steps = &config.jobs["rust-test"].steps;
         assert!(matches!(steps[1], CircleCIStep::Cache { .. }));
         assert!(matches!(steps.last(), Some(CircleCIStep::SaveCache { .. })));
+    }
+
+    #[test]
+    fn test_matrix_job_enumerates_invocations() {
+        let entries = vec![
+            MatrixEntry {
+                version: "1.85".to_string(),
+                image: "rust:1.85".to_string(),
+            },
+            MatrixEntry {
+                version: "nightly".to_string(),
+                image: "rustlang/rust:nightly".to_string(),
+            },
+        ];
+        let config = lower_circleci(&[Job::new("rust-test", "Cargo test", Stage::Test)
+            .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")])
+            .with_cache("rust-cache", vec!["target/".to_string()])
+            .with_matrix(entries)]);
+
+        let job = &config.jobs["rust-test"];
+        assert_eq!(job.docker[0].image, "<< parameters.image >>");
+        let params = job.parameters.as_ref().unwrap();
+        assert_eq!(params["version"].param_type, "string");
+        assert_eq!(params["image"].param_type, "string");
+        assert!(matches!(
+            &job.steps[1],
+            CircleCIStep::Cache { restore_cache }
+                if restore_cache.keys == vec!["rust-cache-<< parameters.version >>"]
+        ));
+
+        let invocations: Vec<&CircleCIWorkflowJobDetail> = config.workflows["main"]
+            .jobs
+            .iter()
+            .filter_map(|j| match j {
+                CircleCIWorkflowJob::Detailed { job } => job.get("rust-test"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].name.as_deref(), Some("rust-test-1.85"));
+        assert_eq!(invocations[0].params["image"], "rust:1.85");
+        assert_eq!(invocations[1].params["version"], "nightly");
+
+        // The YAML round-trips through the typed model despite flatten +
+        // the untagged workflow-job enum
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let reparsed: CircleCIConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reparsed, config);
     }
 
     #[test]

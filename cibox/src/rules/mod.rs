@@ -70,6 +70,19 @@ pub struct ResolvedRule {
     pub enabled: bool,
 }
 
+/// Normalize a configured versions list: trim, drop empties, dedupe
+/// preserving order. Duplicate matrix legs would waste CI time.
+fn clean_versions(versions: Option<&Vec<String>>) -> Vec<String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for v in versions.into_iter().flatten() {
+        let v = v.trim();
+        if !v.is_empty() && !cleaned.iter().any(|c| c == v) {
+            cleaned.push(v.to_string());
+        }
+    }
+    cleaned
+}
+
 /// Build every rule with its knobs resolved (facts-derived defaults overlaid
 /// with config overrides) and compute its enabled state.
 pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> {
@@ -82,7 +95,9 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         .unwrap_or_else(|| facts.dir_name.clone());
 
     let rules: Vec<Box<dyn Rule>> = vec![
-        Box::new(RustTest),
+        Box::new(RustTest {
+            versions: clean_versions(config.rust_test.versions.as_ref()),
+        }),
         Box::new(RustFmt),
         Box::new(RustClippy),
         Box::new(RustAudit),
@@ -91,15 +106,21 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         Box::new(RustFeatureCombos),
         Box::new(RustMinimalVersions),
         Box::new(RustRelease),
-        Box::new(PythonTest),
+        Box::new(PythonTest {
+            versions: clean_versions(config.python_test.versions.as_ref()),
+        }),
         Box::new(PythonLint),
         Box::new(PythonFmt),
         Box::new(PythonRelease),
-        Box::new(GoTest),
+        Box::new(GoTest {
+            versions: clean_versions(config.go_test.versions.as_ref()),
+        }),
         Box::new(GoBuild),
         Box::new(GoLint),
         Box::new(GoAudit),
-        Box::new(NodeTest),
+        Box::new(NodeTest {
+            versions: clean_versions(config.node_test.versions.as_ref()),
+        }),
         Box::new(NodeLint),
         Box::new(NodeTypecheck),
         Box::new(NodeFmt),
@@ -171,6 +192,26 @@ mod tests {
         )
         .unwrap();
         crate::detection::gather_facts(dir.path())
+    }
+
+    #[test]
+    fn test_versions_knob_flows_into_jobs() {
+        let mut config = CiboxConfig::default();
+        config.rust_test.enabled = Some(true);
+        config.rust_test.versions = Some(vec![
+            " 1.85 ".to_string(),
+            String::new(),
+            "nightly".to_string(),
+            "1.85".to_string(),
+        ]);
+        let resolved = resolve(&ProjectFacts::default(), &config);
+        let jobs = enabled_jobs(&ProjectFacts::default(), &resolved);
+        let job = jobs.iter().find(|j| j.id == "rust-test").unwrap();
+        // Trimmed, de-duped, empties dropped
+        let entries = job.matrix.as_ref().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].version, "1.85");
+        assert_eq!(entries[1].version, "nightly");
     }
 
     #[test]

@@ -72,6 +72,11 @@ pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
             state.collapse_current();
         }
 
+        // Remove the toolchain version under the cursor
+        KeyCode::Char('d') | KeyCode::Delete => {
+            state.delete_current_version();
+        }
+
         // Shift-J/K scroll the preview
         KeyCode::Char('K') => {
             state.scroll_preview_up();
