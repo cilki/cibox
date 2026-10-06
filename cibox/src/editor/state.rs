@@ -177,20 +177,12 @@ impl EditorState {
 
     /// The image name detection would use without any override
     fn default_image(&self) -> String {
-        self.facts
-            .repo_slug
-            .clone()
-            .unwrap_or_else(|| self.facts.dir_name.clone())
+        crate::rules::docker_image(&self.facts, &CiboxConfig::default())
     }
 
-    /// The image name in effect, mirroring the precedence in rules::resolve
+    /// The image name in effect, as the docker rules will see it
     fn effective_image(&self) -> String {
-        self.config
-            .docker_build
-            .image_name
-            .clone()
-            .or_else(|| self.config.docker_release.image_name.clone())
-            .unwrap_or_else(|| self.default_image())
+        crate::rules::docker_image(&self.facts, &self.config)
     }
 
     /// Re-resolve rules against the current config and regenerate the preview
@@ -364,8 +356,12 @@ impl EditorState {
         let value = input.buffer.trim().to_string();
         match input.target {
             KnobTarget::ImageName => {
-                let override_value =
-                    (!value.is_empty() && value != self.default_image()).then_some(value);
+                // The typed name is written to cibox.ron and from there into
+                // a shell command, so coerce it into a valid reference rather
+                // than saving something the config parser would reject
+                let override_value = (!value.is_empty())
+                    .then(|| crate::config::image::coerce_reference(&value))
+                    .filter(|value| *value != self.default_image());
                 match input.rule_id {
                     "docker-build" => self.config.docker_build.image_name = override_value,
                     "docker-release" => self.config.docker_release.image_name = override_value,
@@ -859,5 +855,32 @@ mod tests {
         }
         state.commit_input();
         assert!(state.config.is_default());
+    }
+
+    #[test]
+    fn test_typed_image_name_is_coerced_to_a_valid_reference() {
+        let dir = docker_dir();
+        let mut state = state_for(dir.path());
+
+        state.cursor = rule_index(&state, "docker-build");
+        state.expand_current();
+        state.cursor = rule_index(&state, "docker-build") + 1;
+        state.activate_current();
+        for _ in 0..state.input.as_ref().unwrap().buffer.len() {
+            state.input_backspace();
+        }
+        for c in "Owner/App; id".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+
+        assert_eq!(
+            state.config.docker_build.image_name.as_deref(),
+            Some("owner/app-id")
+        );
+        // What the editor saves has to be something it can read back
+        let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
+        crate::config::parse_config(&ron_str).unwrap();
+        assert!(!state.yaml_preview.contains("; id"), "{}", state.yaml_preview);
     }
 }

@@ -1,3 +1,4 @@
+pub mod image;
 pub mod infer;
 pub mod platform;
 pub mod ron_types;

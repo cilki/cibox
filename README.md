@@ -108,6 +108,13 @@ charge while still applying the knobs. The target platform is not part of
 the file — `cibox update` can generate for any platform, so pass
 `--platform` or let cibox infer it.
 
+`image_name` has to be a valid docker reference, because it ends up as a
+literal argument to `docker build -t`: lowercase alphanumerics separated by
+`.`, `-` or `_`, optionally prefixed with a registry host and suffixed with a
+`:tag`. Anything else is rejected by `cibox validate`. The default is derived
+from the git remote (or the directory name) and normalized to fit, so a
+`Fossable/CiBox` remote becomes `fossable/cibox`.
+
 ### Multi-arch docker images
 
 `docker-release` builds a single image for the runner's own architecture by

