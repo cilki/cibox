@@ -75,16 +75,29 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
     for step in &job.steps {
         match step {
             Step::Checkout { full_history } => {
+                // actions/checkout leaves the job's token in .git/config as an
+                // auth header unless told not to, where every later `run:`
+                // step — build scripts, test suites, any dependency code they
+                // execute — can read it. Nothing cibox generates talks to git
+                // after the clone, so the credential is pure exposure: at
+                // minimum read access to a private repository, and whatever
+                // the job's extra scopes grant (e.g. `packages: write` on a
+                // ghcr.io push).
+                let mut with = BTreeMap::from([(
+                    "persist-credentials".to_string(),
+                    serde_yaml::Value::Bool(false),
+                )]);
+                if *full_history {
+                    with.insert(
+                        "fetch-depth".to_string(),
+                        serde_yaml::Value::Number(0.into()),
+                    );
+                }
                 steps.push(GitHubStep {
                     name: Some("Checkout code".to_string()),
                     uses: Some("actions/checkout@v4".to_string()),
                     run: None,
-                    with: full_history.then(|| {
-                        BTreeMap::from([(
-                            "fetch-depth".to_string(),
-                            serde_yaml::Value::Number(0.into()),
-                        )])
-                    }),
+                    with: Some(with),
                     env: None,
                 });
                 if let Some(cache) = &job.cache {
@@ -226,6 +239,26 @@ mod tests {
             step.with.as_ref().unwrap()["fetch-depth"],
             serde_yaml::Value::Number(0.into())
         );
+    }
+
+    #[test]
+    fn test_checkout_does_not_persist_credentials() {
+        let workflow = lower_github(
+            &[
+                Job::new("rust-test", "Cargo test", Stage::Test).with_steps(vec![Step::checkout()]),
+                Job::new("gitleaks", "Gitleaks", Stage::Security)
+                    .with_steps(vec![Step::checkout_full_history()]),
+            ],
+            WorkflowKind::Ci,
+        );
+        for id in ["rust-test", "gitleaks"] {
+            let with = workflow.jobs[id].steps[0].with.as_ref().unwrap();
+            assert_eq!(
+                with["persist-credentials"],
+                serde_yaml::Value::Bool(false),
+                "{id} keeps the token in .git/config"
+            );
+        }
     }
 
     #[test]

@@ -78,6 +78,12 @@ be write-all. Jobs that genuinely need more ask for it individually:
 `cibox update` only scaffolds the block into a workflow that has none, so if
 you widen the token yourself your version is kept.
 
+The generated checkout also passes `persist-credentials: false`. By default
+`actions/checkout` writes the token into `.git/config` as an auth header,
+where every later step can read it — including build scripts and test suites
+running third-party code. Nothing cibox generates uses git after the clone,
+so the credential is dropped.
+
 ## `cibox.ron`
 
 `cibox.ron` holds only your *overrides* from the detected defaults — no file
