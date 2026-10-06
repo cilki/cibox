@@ -30,7 +30,7 @@ pub struct GitLabJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<GitLabArtifacts>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub only: Option<GitLabOnly>,
+    pub rules: Option<Vec<GitLabRule>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,8 +65,11 @@ pub struct GitLabArtifacts {
     pub name: Option<String>,
 }
 
+/// One `rules:` entry. `only:refs` can express "tags" or a ref regex but not
+/// both at once (a regex there matches branch names too), so release gating
+/// needs a `rules:` condition on `$CI_COMMIT_TAG`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitLabOnly {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refs: Option<Vec<String>>,
+pub struct GitLabRule {
+    #[serde(rename = "if")]
+    pub if_expr: String,
 }
