@@ -1,9 +1,9 @@
-use super::Rule;
+use super::{with_versions, Rule};
 use crate::detection::ProjectFacts;
-use crate::ir::{Job, MatrixEntry, Stage, Step};
+use crate::ir::{Job, Stage, Step};
 
 /// The official image tracks stable; "rust:stable" is not a docker tag
-const IMAGE: &str = "rust:latest";
+pub(crate) const IMAGE: &str = "rust:latest";
 
 /// Where cargo keeps its registry/git downloads and `cargo install` binaries.
 /// The official images point CARGO_HOME at /usr/local/cargo, which no backend
@@ -62,7 +62,9 @@ impl Rule for RustTest {
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
         let job = with_cargo_cache(
-            Job::new(self.id(), self.name(), Stage::Test).with_timeout(30),
+            Job::new(self.id(), self.name(), Stage::Test)
+                .with_image(IMAGE)
+                .with_timeout(30),
             "rust-cache",
             &["target/", ".cargo/"],
         )
@@ -70,18 +72,7 @@ impl Rule for RustTest {
             Step::checkout(),
             Step::run("Run tests", "cargo test --all-features"),
         ]);
-        vec![match self.versions.as_slice() {
-            [] => job.with_image(IMAGE),
-            [v] => job.with_image(toolchain_image(v)),
-            vs => job.with_matrix(
-                vs.iter()
-                    .map(|v| MatrixEntry {
-                        version: v.clone(),
-                        image: toolchain_image(v),
-                    })
-                    .collect(),
-            ),
-        }]
+        vec![with_versions(job, &self.versions, toolchain_image)]
     }
 }
 

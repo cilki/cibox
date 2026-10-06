@@ -1,8 +1,8 @@
-use super::Rule;
+use super::{with_versions, Rule};
 use crate::detection::ProjectFacts;
-use crate::ir::{Job, MatrixEntry, Stage, Step};
+use crate::ir::{Job, Stage, Step};
 
-const IMAGE: &str = "python:3.12";
+pub(crate) const IMAGE: &str = "python:3.12";
 
 fn is_python(facts: &ProjectFacts) -> bool {
     facts.python.is_some()
@@ -42,6 +42,7 @@ impl Rule for PythonTest {
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
         let job = Job::new(self.id(), self.name(), Stage::Test)
+            .with_image(IMAGE)
             .with_timeout(30)
             .with_steps(vec![
                 Step::checkout(),
@@ -49,18 +50,7 @@ impl Rule for PythonTest {
                 Step::run("Install pytest", "pip install pytest"),
                 Step::run("Run tests", "pytest"),
             ]);
-        vec![match self.versions.as_slice() {
-            [] => job.with_image(IMAGE),
-            [v] => job.with_image(format!("python:{v}")),
-            vs => job.with_matrix(
-                vs.iter()
-                    .map(|v| MatrixEntry {
-                        version: v.clone(),
-                        image: format!("python:{v}"),
-                    })
-                    .collect(),
-            ),
-        }]
+        vec![with_versions(job, &self.versions, |v| format!("python:{v}"))]
     }
 }
 
@@ -149,19 +139,18 @@ impl Rule for PythonRelease {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        let mut job = Job::new(self.id(), self.name(), Stage::Deploy)
+        vec![Job::new(self.id(), self.name(), Stage::Deploy)
             .with_image(IMAGE)
             .with_timeout(15)
             .tags_only()
+            .with_env("TWINE_USERNAME", "__token__")
             .with_secrets(vec!["TWINE_PASSWORD".to_string()])
             .with_steps(vec![
                 Step::checkout(),
                 Step::run("Install build tools", "pip install build twine"),
                 Step::run("Build distribution", "python -m build"),
                 Step::run("Upload to PyPI", "twine upload dist/*"),
-            ]);
-        job.env.push(("TWINE_USERNAME".to_string(), "__token__".to_string()));
-        vec![job]
+            ])]
     }
 }
 
