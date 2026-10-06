@@ -5,8 +5,26 @@ use crate::ir::{Job, MatrixEntry, Stage, Step};
 /// The official image tracks stable; "rust:stable" is not a docker tag
 const IMAGE: &str = "rust:latest";
 
+/// Where cargo keeps its registry/git downloads and `cargo install` binaries.
+/// The official images point CARGO_HOME at /usr/local/cargo, which no backend
+/// can cache: GitLab rejects cache paths outside the project directory, and
+/// the others would need an absolute path that differs per image. Moving it
+/// into the checkout makes one project-relative path work everywhere.
+const CARGO_HOME: &str = ".cargo";
+
 fn is_rust(facts: &ProjectFacts) -> bool {
     facts.rust.is_some()
+}
+
+/// Cache `paths` under `key` and relocate CARGO_HOME, so the `.cargo/` entry
+/// among them is the directory cargo actually writes to.
+fn with_cargo_cache(job: Job, key: &str, paths: &[&str]) -> Job {
+    debug_assert!(
+        paths.contains(&".cargo/"),
+        "{key}: only jobs caching cargo's home need CARGO_HOME moved"
+    );
+    job.with_env("CARGO_HOME", CARGO_HOME)
+        .with_cache(key, paths.iter().map(|p| p.to_string()).collect())
 }
 
 /// The image providing a user-selected toolchain version
@@ -43,16 +61,15 @@ impl Rule for RustTest {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        let job = Job::new(self.id(), self.name(), Stage::Test)
-            .with_timeout(30)
-            .with_cache(
-                "rust-cache",
-                vec!["target/".to_string(), ".cargo/".to_string()],
-            )
-            .with_steps(vec![
-                Step::checkout(),
-                Step::run("Run tests", "cargo test --all-features"),
-            ]);
+        let job = with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Test).with_timeout(30),
+            "rust-cache",
+            &["target/", ".cargo/"],
+        )
+        .with_steps(vec![
+            Step::checkout(),
+            Step::run("Run tests", "cargo test --all-features"),
+        ]);
         vec![match self.versions.as_slice() {
             [] => job.with_image(IMAGE),
             [v] => job.with_image(toolchain_image(v)),
@@ -122,19 +139,19 @@ impl Rule for RustClippy {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Lint)
-            .with_image(IMAGE)
-            .with_timeout(15)
-            .with_cache(
-                "rust-cache",
-                vec!["target/".to_string(), ".cargo/".to_string()],
-            )
-            .with_steps(vec![
-                Step::checkout(),
-                // The official rust image ships rustup's minimal profile
-                Step::run("Install clippy", "rustup component add clippy"),
-                Step::run("Run clippy", "cargo clippy --all-features -- -D warnings"),
-            ])]
+        vec![with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Lint)
+                .with_image(IMAGE)
+                .with_timeout(15),
+            "rust-cache",
+            &["target/", ".cargo/"],
+        )
+        .with_steps(vec![
+            Step::checkout(),
+            // The official rust image ships rustup's minimal profile
+            Step::run("Install clippy", "rustup component add clippy"),
+            Step::run("Run clippy", "cargo clippy --all-features -- -D warnings"),
+        ])]
     }
 }
 
@@ -159,15 +176,20 @@ impl Rule for RustAudit {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Security)
-            .with_image(IMAGE)
-            .with_timeout(10)
-            .with_cache("cargo-audit-cache", vec![".cargo/".to_string()])
-            .with_steps(vec![
-                Step::checkout(),
-                Step::run("Install cargo-audit", "cargo install cargo-audit"),
-                Step::run("Run audit", "cargo audit"),
-            ])]
+        vec![with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Security)
+                .with_image(IMAGE)
+                .with_timeout(10),
+            "cargo-audit-cache",
+            &[".cargo/"],
+        )
+        .with_steps(vec![
+            Step::checkout(),
+            // Lands in .cargo/bin, which cargo searches for subcommands, so
+            // a cache hit turns this into a no-op instead of a rebuild
+            Step::run("Install cargo-audit", "cargo install cargo-audit"),
+            Step::run("Run audit", "cargo audit"),
+        ])]
     }
 }
 
@@ -192,20 +214,21 @@ impl Rule for RustDoc {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Lint)
-            // docsrs cfg (e.g. doc_cfg annotations) needs a nightly toolchain
-            .with_image("rustlang/rust:nightly")
-            .with_timeout(15)
-            .with_env("RUSTDOCFLAGS", "--cfg docsrs")
+        vec![with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Lint)
+                // docsrs cfg (e.g. doc_cfg annotations) needs a nightly
+                // toolchain
+                .with_image("rustlang/rust:nightly")
+                .with_timeout(15)
+                .with_env("RUSTDOCFLAGS", "--cfg docsrs"),
             // Nightly artifacts don't mix with the shared stable rust-cache
-            .with_cache(
-                "rust-doc-cache",
-                vec!["target/".to_string(), ".cargo/".to_string()],
-            )
-            .with_steps(vec![
-                Step::checkout(),
-                Step::run("Build docs", "cargo doc --no-deps --all-features"),
-            ])]
+            "rust-doc-cache",
+            &["target/", ".cargo/"],
+        )
+        .with_steps(vec![
+            Step::checkout(),
+            Step::run("Build docs", "cargo doc --no-deps --all-features"),
+        ])]
     }
 }
 
@@ -250,14 +273,14 @@ impl Rule for RustMsrv {
                 ),
             ],
         };
-        vec![Job::new(self.id(), self.name(), Stage::Lint)
-            .with_image(IMAGE)
-            .with_timeout(15)
-            .with_cache(
-                "rust-msrv-cache",
-                vec!["target/".to_string(), ".cargo/".to_string()],
-            )
-            .with_steps(steps)]
+        vec![with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Lint)
+                .with_image(IMAGE)
+                .with_timeout(15),
+            "rust-msrv-cache",
+            &["target/", ".cargo/"],
+        )
+        .with_steps(steps)]
     }
 }
 
@@ -287,22 +310,22 @@ impl Rule for RustFeatureCombos {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Lint)
-            .with_image(IMAGE)
-            .with_timeout(30)
-            .with_cache(
-                "rust-cache",
-                vec!["target/".to_string(), ".cargo/".to_string()],
-            )
-            .with_steps(vec![
-                Step::checkout(),
-                // Prebuilt binary; `cargo install` would compile for minutes
-                Step::run(
-                    "Install cargo-hack",
-                    "curl -fsSL https://github.com/taiki-e/cargo-hack/releases/latest/download/cargo-hack-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin",
-                ),
-                Step::run("Check feature powerset", "cargo hack --feature-powerset check"),
-            ])]
+        vec![with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Lint)
+                .with_image(IMAGE)
+                .with_timeout(30),
+            "rust-cache",
+            &["target/", ".cargo/"],
+        )
+        .with_steps(vec![
+            Step::checkout(),
+            // Prebuilt binary; `cargo install` would compile for minutes
+            Step::run(
+                "Install cargo-hack",
+                "curl -fsSL https://github.com/taiki-e/cargo-hack/releases/latest/download/cargo-hack-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin",
+            ),
+            Step::run("Check feature powerset", "cargo hack --feature-powerset check"),
+        ])]
     }
 }
 
@@ -332,28 +355,28 @@ impl Rule for RustMinimalVersions {
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
-        vec![Job::new(self.id(), self.name(), Stage::Test)
-            .with_image(IMAGE)
-            .with_timeout(30)
-            .with_cache(
-                "rust-minimal-cache",
-                vec!["target/".to_string(), ".cargo/".to_string()],
-            )
-            .with_steps(vec![
-                Step::checkout(),
-                Step::run(
-                    "Install nightly for -Zminimal-versions",
-                    "rustup toolchain install nightly --profile minimal",
-                ),
-                Step::run(
-                    "Downgrade to minimal versions",
-                    "cargo +nightly update -Zminimal-versions",
-                ),
-                Step::run(
-                    "Run tests",
-                    "cargo test --locked --all-features --all-targets",
-                ),
-            ])]
+        vec![with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Test)
+                .with_image(IMAGE)
+                .with_timeout(30),
+            "rust-minimal-cache",
+            &["target/", ".cargo/"],
+        )
+        .with_steps(vec![
+            Step::checkout(),
+            Step::run(
+                "Install nightly for -Zminimal-versions",
+                "rustup toolchain install nightly --profile minimal",
+            ),
+            Step::run(
+                "Downgrade to minimal versions",
+                "cargo +nightly update -Zminimal-versions",
+            ),
+            Step::run(
+                "Run tests",
+                "cargo test --locked --all-features --all-targets",
+            ),
+        ])]
     }
 }
 
@@ -560,6 +583,68 @@ mod tests {
         assert!(jobs[0].steps.iter().any(
             |s| matches!(s, Step::Run { command, .. } if command == "cargo publish")
         ));
+    }
+
+    /// Every rust rule, with facts rich enough that each one emits its job
+    fn all_rust_jobs() -> Vec<Job> {
+        let facts = library_facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nrust-version = \"1.74.0\"\n\n\
+             [features]\nfoo = []\n",
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(RustTest::default()),
+            Box::new(RustFmt),
+            Box::new(RustClippy),
+            Box::new(RustAudit),
+            Box::new(RustDoc),
+            Box::new(RustMsrv),
+            Box::new(RustFeatureCombos),
+            Box::new(RustMinimalVersions),
+            Box::new(RustRelease),
+        ];
+        for rule in &rules {
+            assert!(rule.detect(&facts), "{} should have detected", rule.id());
+        }
+        rules.iter().flat_map(|r| r.jobs(&facts)).collect()
+    }
+
+    /// `.cargo/` is only worth caching if cargo writes there: the official
+    /// images keep CARGO_HOME at /usr/local/cargo, so without the env the
+    /// backends archive a directory that never exists.
+    #[test]
+    fn test_cached_cargo_home_is_the_one_cargo_uses() {
+        let jobs = all_rust_jobs();
+        assert!(jobs.iter().any(|j| j.id == "rust-test"));
+        for job in &jobs {
+            let caches_cargo_home = job
+                .cache
+                .as_ref()
+                .is_some_and(|c| c.paths.iter().any(|p| p == ".cargo/"));
+            let moves_cargo_home = job
+                .env
+                .iter()
+                .any(|(k, v)| k == "CARGO_HOME" && v == ".cargo");
+            assert_eq!(
+                caches_cargo_home, moves_cargo_home,
+                "{}: caching .cargo/ and setting CARGO_HOME must go together",
+                job.id
+            );
+        }
+    }
+
+    /// GitLab refuses cache paths outside the project directory, so the IR
+    /// may only ever name relative ones
+    #[test]
+    fn test_cache_paths_are_project_relative() {
+        for job in all_rust_jobs() {
+            for path in job.cache.iter().flat_map(|c| &c.paths) {
+                assert!(
+                    !path.starts_with('/'),
+                    "{}: cache path {path} is outside the project directory",
+                    job.id
+                );
+            }
+        }
     }
 
     #[test]
