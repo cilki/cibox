@@ -40,6 +40,10 @@ Docker rules, a publishable package enables its release rule — and contributes
 jobs to the generated pipeline. Release rules run only on `v*` git tags (e.g.
 `rust-release` runs `cargo publish`).
 
+Rules exist for Rust, Python, Go, Node (npm, yarn, pnpm, or bun), Zig, and
+CMake projects, plus Docker image builds and secret scanning. `cibox detect`
+lists every rule and whether it fired for your project.
+
 Running `cibox update` in a project with no configuration at all produces a
 working pipeline: detection picks the rules and the target platform is
 inferred from existing CI configuration, then from your git remote's host,
@@ -126,6 +130,31 @@ login is skipped, for registries that don't require any.
 description once the image is released, reusing the same two secrets. It is
 Docker Hub only — `ghcr.io` has no description API — and like the login it is
 skipped when the credentials aren't configured or there is no `README.md`.
+
+### Toolchain version matrices
+
+The test rules — `rust-test`, `python-test`, `go-test`, and `node-test` —
+take a list of toolchain versions and run against each one:
+
+```ron
+(
+    rust_test: (versions: ["1.85", "stable", "nightly"]),
+    go_test: (versions: ["1.23", "1.24"]),
+)
+```
+
+Each version selects an image tag: `python:3.13`, `golang:1.24`, `node:22`,
+and for Rust `rust:1.85`, with `stable` meaning `rust:latest` and `nightly`
+meaning `rustlang/rust:nightly`. Blank and duplicate entries are dropped.
+A single version just pins the job's image; omitting `versions` leaves the
+rule's default image in place.
+
+Several versions become the platform's own matrix: `strategy.matrix.include`
+with `fail-fast: false` on GitHub and Gitea Actions, `parallel.matrix` on
+GitLab, and a parameterized job expanded once per version in the CircleCI
+workflow. Cache keys carry the version, so the legs don't fight over one
+cache. `node-test` ignores `versions` for bun projects — there the toolchain
+comes with the `oven/bun:1` image.
 
 ### Multi-arch docker images
 
