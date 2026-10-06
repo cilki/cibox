@@ -66,7 +66,8 @@ The files cibox manages, per platform:
 conforms the jobs cibox manages to its current output, removes managed jobs
 whose rule you disabled, and leaves everything else alone: jobs you deleted
 stay deleted, and jobs you added are kept. Pass `--force` to rewrite the
-files from scratch instead.
+files from scratch instead — as the TUI does when it writes, see
+[Interactive editor](#interactive-editor).
 
 ### Token permissions
 
@@ -149,4 +150,37 @@ name = "ron"
 file-types = ["ron", { glob = "cibox.ron" }]
 language-servers = ["cibox-lsp"]
 ```
+
+## Interactive editor
+
+`cibox` with no arguments opens the TUI — `cibox editor --dir <path>` for a
+project somewhere else. Rules are on the left, the pipeline they generate on
+the right, with the lines that differ from the file already on disk
+highlighted.
+
+| Key | Action |
+|---|---|
+| `↑`/`↓`, `k`/`j` | move through the rules |
+| `Space`/`Enter` | toggle the rule under the cursor, or edit the knob |
+| `→`/`l`, `←`/`h` | show or hide a rule's knobs (the docker and test rules have them) |
+| `d`/`Del` | drop the toolchain version under the cursor |
+| `K`/`J` | scroll the preview |
+| `p` | pick the target platform (`Tab` cycles to the next one) |
+| `w` | write the pipeline files |
+| `q`/`Esc` | quit |
+
+Expanding `docker-build`/`docker-release` shows the image name and the target
+platforms; expanding a test rule shows its `versions` list, where `Enter` on
+the trailing add row appends a toolchain version and `d` removes the one
+under the cursor.
+
+Toggling a rule or changing a knob saves `cibox.ron` right away — there is no
+separate save key for it, and the file stays delta-only, so flipping a rule
+back to what detection says drops it from the file again. The platform you
+pick applies to the preview and to `w` for this session only; it is never
+recorded in `cibox.ron`, which holds nothing but rule overrides.
+
+`w` writes each file from scratch, the way `cibox update --force` does: jobs
+you added to a generated file by hand are dropped and jobs you deleted come
+back. Quit and run `cibox update` instead to keep those edits.
 
