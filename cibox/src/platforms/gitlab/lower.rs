@@ -1,8 +1,14 @@
 use crate::ir::{Job, Stage, Step};
 use crate::platforms::gitlab::models::{
-    GitLabArtifacts, GitLabCI, GitLabCache, GitLabJob, GitLabMatrixCell, GitLabOnly, GitLabParallel,
+    GitLabArtifacts, GitLabCI, GitLabCache, GitLabJob, GitLabMatrixCell, GitLabParallel, GitLabRule,
 };
 use std::collections::BTreeMap;
+
+/// Release jobs hold the registry credentials, so they must fire on the same
+/// `v*` tags as every other backend — not on any tag that happens to be
+/// pushed. Matched against `$CI_COMMIT_TAG`, which is only set in a tag
+/// pipeline, so branch pushes can't satisfy it.
+const TAG_CONDITION: &str = "$CI_COMMIT_TAG =~ /^v/";
 
 pub fn lower_gitlab(jobs: &[Job]) -> GitLabCI {
     let mut lowered = BTreeMap::new();
@@ -76,8 +82,10 @@ fn lower_job(job: &Job) -> GitLabJob {
             paths: job.artifacts.clone(),
             name: None,
         }),
-        only: job.tags_only.then(|| GitLabOnly {
-            refs: Some(vec!["tags".to_string()]),
+        rules: job.tags_only.then(|| {
+            vec![GitLabRule {
+                if_expr: TAG_CONDITION.to_string(),
+            }]
         }),
         timeout: job.timeout_minutes.map(|minutes| format!("{minutes}m")),
         parallel: job.matrix.as_ref().map(|entries| GitLabParallel {
@@ -120,15 +128,31 @@ mod tests {
 
     #[test]
     fn test_docker_job_uses_docker_image() {
-        let config = lower_gitlab(&[Job::new("docker-release", "Docker push", Stage::Deploy)
-            .with_docker()
-            .tags_only()]);
+        let config =
+            lower_gitlab(&[Job::new("docker-release", "Docker push", Stage::Deploy).with_docker()]);
         let job = &config.jobs["docker-release"];
         assert_eq!(job.image.as_deref(), Some("docker:latest"));
+    }
+
+    #[test]
+    fn test_release_job_runs_on_version_tags_only() {
+        let config = lower_gitlab(&[
+            Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only(),
+            Job::new("rust-test", "Cargo test", Stage::Test),
+        ]);
+        // A bare `tags` ref would publish on every tag pushed, not just the
+        // `v*` releases the other backends gate on
         assert_eq!(
-            job.only.as_ref().unwrap().refs,
-            Some(vec!["tags".to_string()])
+            config.jobs["rust-release"].rules.as_deref(),
+            Some(
+                [GitLabRule {
+                    if_expr: "$CI_COMMIT_TAG =~ /^v/".to_string(),
+                }]
+                .as_slice()
+            )
         );
+        // Everything else keeps GitLab's default "run in every pipeline"
+        assert_eq!(config.jobs["rust-test"].rules, None);
     }
 
     #[test]

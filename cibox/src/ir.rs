@@ -93,8 +93,9 @@ pub struct Job {
     pub needs_docker: bool,
     pub steps: Vec<Step>,
     pub timeout_minutes: Option<u32>,
-    /// Only run for version tags (GitLab only:refs:[tags]; adds a v* tag
-    /// trigger on GitHub)
+    /// Only run for `v*` version tags. The backends gate it their own way:
+    /// GitHub/Gitea move the job to `release.yml`, GitLab adds a
+    /// `$CI_COMMIT_TAG` rule, CircleCI a tag filter.
     pub tags_only: bool,
     /// Toolchain versions to run this job against, lowered to the platform's
     /// native job matrix. Replaces `image`; the backends substitute each

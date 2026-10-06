@@ -675,6 +675,31 @@ my-job:
     }
 
     #[test]
+    fn test_gitlab_update_narrows_any_tag_release_gating() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+
+        // A pipeline generated before release jobs were gated on `v*`
+        let existing = "stages: [deploy]\n\
+                        rust-release:\n  stage: deploy\n  script: [cargo publish]\n  \
+                        only:\n    refs: [tags]\n\
+                        my-release:\n  stage: deploy\n  script: [echo mine]\n  \
+                        only:\n    refs: [tags]\n";
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitLab, &file, &resolved, existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+
+        assert_eq!(
+            doc["rust-release"]["rules"][0]["if"].as_str(),
+            Some("$CI_COMMIT_TAG =~ /^v/")
+        );
+        assert!(doc["rust-release"]["only"].is_null(), "{content}");
+        // The user's own job is not cibox's to re-gate
+        assert_eq!(doc["my-release"]["only"]["refs"][0].as_str(), Some("tags"));
+    }
+
+    #[test]
     fn test_merge_lists_required_variables_only_where_needed() {
         let facts = full_facts();
         let resolved = resolve(&facts, &CiboxConfig::default());
