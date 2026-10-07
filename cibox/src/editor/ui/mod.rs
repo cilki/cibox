@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+use similar::{ChangeTag, TextDiff};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffType {
@@ -368,72 +369,19 @@ fn render_platform_menu(f: &mut Frame, state: &EditorState) {
     f.render_widget(list, menu_area);
 }
 
-/// Compute a simple line-based diff between old and new text
+/// Line-based diff between the file on disk and the previewed output
 fn compute_diff(old: &str, new: &str) -> Vec<(String, DiffType)> {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    let mut result = Vec::new();
-    let mut old_idx = 0;
-    let mut new_idx = 0;
-
-    while old_idx < old_lines.len() || new_idx < new_lines.len() {
-        if old_idx >= old_lines.len() {
-            // Remaining lines are added
-            result.push((new_lines[new_idx].to_string(), DiffType::Added));
-            new_idx += 1;
-        } else if new_idx >= new_lines.len() {
-            // Remaining lines are removed
-            result.push((old_lines[old_idx].to_string(), DiffType::Removed));
-            old_idx += 1;
-        } else if old_lines[old_idx] == new_lines[new_idx] {
-            // Lines match
-            result.push((new_lines[new_idx].to_string(), DiffType::Unchanged));
-            old_idx += 1;
-            new_idx += 1;
-        } else {
-            // Lines differ - look ahead to see if we can find a match
-            let mut found_match = false;
-
-            // Look ahead in new for current old line (removed line)
-            for i in (new_idx + 1)..(new_idx + 5).min(new_lines.len()) {
-                if old_lines[old_idx] == new_lines[i] {
-                    // Found old line later in new, so lines between are added
-                    while new_idx < i {
-                        result.push((new_lines[new_idx].to_string(), DiffType::Added));
-                        new_idx += 1;
-                    }
-                    found_match = true;
-                    break;
-                }
-            }
-
-            if !found_match {
-                // Look ahead in old for current new line (added line)
-                for i in (old_idx + 1)..(old_idx + 5).min(old_lines.len()) {
-                    if old_lines[i] == new_lines[new_idx] {
-                        // Found new line later in old, so lines between are removed
-                        while old_idx < i {
-                            result.push((old_lines[old_idx].to_string(), DiffType::Removed));
-                            old_idx += 1;
-                        }
-                        found_match = true;
-                        break;
-                    }
-                }
-            }
-
-            if !found_match {
-                // No match found, treat as changed (removed + added)
-                result.push((old_lines[old_idx].to_string(), DiffType::Removed));
-                result.push((new_lines[new_idx].to_string(), DiffType::Added));
-                old_idx += 1;
-                new_idx += 1;
-            }
-        }
-    }
-
-    result
+    TextDiff::from_lines(old, new)
+        .iter_all_changes()
+        .map(|change| {
+            let diff = match change.tag() {
+                ChangeTag::Equal => DiffType::Unchanged,
+                ChangeTag::Delete => DiffType::Removed,
+                ChangeTag::Insert => DiffType::Added,
+            };
+            (change.value().trim_end_matches('\n').to_string(), diff)
+        })
+        .collect()
 }
 
 /// Syntax-highlight the preview. With `existing` present, every line also
@@ -649,5 +597,35 @@ mod tests {
         let added = lines.last().unwrap();
         assert!(added.spans.iter().all(|s| s.style.bg == Some(Color::Green)));
         assert_eq!(added.spans[0].style.fg, Some(Color::Cyan));
+    }
+
+    /// Toggling a rule inserts or removes a whole job block. Only that block
+    /// may be highlighted: everything after it still lines up and has to come
+    /// back `Unchanged`, or the preview turns into a wall of red and green
+    /// the moment the user touches anything.
+    #[test]
+    fn test_only_the_changed_block_is_highlighted() {
+        let unchanged_tail = "tail-a: 1\ntail-b: 2\ntail-c: 3\ntail-d: 4\ntail-e: 5\n";
+        let block = "  rust-clippy:\n    runs-on: ubuntu-latest\n    container: rust:latest\n    \
+                     timeout-minutes: 15\n    steps:\n      - name: Checkout code\n        \
+                     uses: actions/checkout@v4\n      - name: Run clippy\n        \
+                     run: cargo clippy\n";
+        let old = format!("head: 1\n{block}{unchanged_tail}");
+        let new = format!("head: 1\n{unchanged_tail}");
+
+        let diff = compute_diff(&old, &new);
+        let removed: Vec<&str> = diff
+            .iter()
+            .filter(|(_, d)| *d == DiffType::Removed)
+            .map(|(line, _)| line.as_str())
+            .collect();
+        assert_eq!(removed, block.lines().collect::<Vec<_>>());
+        assert!(!diff.iter().any(|(_, d)| *d == DiffType::Added), "{diff:?}");
+        for line in unchanged_tail.lines() {
+            assert!(
+                diff.contains(&(line.to_string(), DiffType::Unchanged)),
+                "{line} should be unchanged: {diff:?}"
+            );
+        }
     }
 }

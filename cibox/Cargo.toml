@@ -24,6 +24,7 @@ cargo_toml = "1.0"
 colored = "3.0.0"
 ratatui = "0.30"
 crossterm = "0.29.0"
+similar = "3.2"
 
 [build-dependencies]
 roniker = { version = "0.4", features = ["analyze"] }
