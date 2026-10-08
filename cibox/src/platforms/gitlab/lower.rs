@@ -13,23 +13,10 @@ const TAG_CONDITION: &str = "$CI_COMMIT_TAG =~ /^v/";
 pub fn lower_gitlab(jobs: &[Job]) -> GitLabCI {
     let mut lowered = BTreeMap::new();
     let mut stages: Vec<Stage> = Vec::new();
-    let mut variables: BTreeMap<String, String> = BTreeMap::new();
 
     for job in jobs {
         if !stages.contains(&job.stage) {
             stages.push(job.stage);
-        }
-        for (key, value) in &job.env {
-            variables.entry(key.clone()).or_insert_with(|| value.clone());
-        }
-        // GitLab clones shallowly by default; a full-history checkout
-        // needs GIT_DEPTH=0
-        if job
-            .steps
-            .iter()
-            .any(|step| matches!(step, Step::Checkout { full_history } if *full_history))
-        {
-            variables.insert("GIT_DEPTH".to_string(), "0".to_string());
         }
         lowered.insert(job.id.clone(), lower_job(job));
     }
@@ -38,13 +25,27 @@ pub fn lower_gitlab(jobs: &[Job]) -> GitLabCI {
     GitLabCI {
         stages: (!stages.is_empty())
             .then(|| stages.iter().map(|s| s.as_str().to_string()).collect()),
-        variables: (!variables.is_empty()).then_some(variables),
         cache: None,
         jobs: lowered,
     }
 }
 
 fn lower_job(job: &Job) -> GitLabJob {
+    // Each job's environment stays on the job. Hoisted to the top level it
+    // would reach every other job: the nightly doc job's `RUSTDOCFLAGS=--cfg
+    // docsrs` would then be in force while `rust-test` builds its doctests on
+    // stable, and the full-history clone gitleaks needs would be paid by the
+    // whole pipeline.
+    let mut variables: BTreeMap<String, String> = job.env.iter().cloned().collect();
+    if job
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Checkout { full_history } if *full_history))
+    {
+        // GitLab clones shallowly by default
+        variables.insert("GIT_DEPTH".to_string(), "0".to_string());
+    }
+
     let script = job
         .steps
         .iter()
@@ -65,6 +66,7 @@ fn lower_job(job: &Job) -> GitLabJob {
         } else {
             job.image.clone()
         },
+        variables: (!variables.is_empty()).then_some(variables),
         script,
         before_script: None,
         after_script: None,
@@ -120,10 +122,37 @@ mod tests {
     }
 
     #[test]
-    fn test_full_history_sets_git_depth() {
-        let config = lower_gitlab(&[Job::new("gitleaks", "Gitleaks", Stage::Security)
-            .with_steps(vec![Step::checkout_full_history()])]);
-        assert_eq!(config.variables.unwrap()["GIT_DEPTH"], "0");
+    fn test_full_history_sets_git_depth_on_that_job_only() {
+        let config = lower_gitlab(&[
+            Job::new("gitleaks", "Gitleaks", Stage::Security)
+                .with_steps(vec![Step::checkout_full_history()]),
+            Job::new("rust-test", "Cargo test", Stage::Test)
+                .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")]),
+        ]);
+        assert_eq!(
+            config.jobs["gitleaks"].variables.as_ref().unwrap()["GIT_DEPTH"],
+            "0"
+        );
+        // Every other job keeps GitLab's shallow clone
+        assert_eq!(config.jobs["rust-test"].variables, None);
+    }
+
+    #[test]
+    fn test_job_env_stays_on_its_own_job() {
+        let config = lower_gitlab(&[
+            Job::new("rust-doc", "Cargo doc", Stage::Lint)
+                .with_env("RUSTDOCFLAGS", "--cfg docsrs")
+                .with_env("CARGO_HOME", ".cargo"),
+            Job::new("rust-test", "Cargo test", Stage::Test).with_env("CARGO_HOME", ".cargo"),
+        ]);
+        let doc = config.jobs["rust-doc"].variables.as_ref().unwrap();
+        assert_eq!(doc["RUSTDOCFLAGS"], "--cfg docsrs");
+        assert_eq!(doc["CARGO_HOME"], ".cargo");
+        // rust-test builds its doctests on stable, where `--cfg docsrs` can
+        // mean nightly-only attributes: it must not inherit the doc job's flags
+        let test = config.jobs["rust-test"].variables.as_ref().unwrap();
+        assert_eq!(test["CARGO_HOME"], ".cargo");
+        assert!(!test.contains_key("RUSTDOCFLAGS"), "{test:?}");
     }
 
     #[test]

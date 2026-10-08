@@ -225,6 +225,17 @@ const GITLAB_RESERVED: &[&str] = &[
     "after_script",
 ];
 
+/// Names of the variables cibox puts on its GitLab jobs, which an older cibox
+/// would have written into the top-level `variables:` instead
+fn gitlab_job_variable_names(planned: &[Job]) -> Vec<Value> {
+    crate::platforms::gitlab::lower::lower_gitlab(planned)
+        .jobs
+        .into_values()
+        .filter_map(|job| job.variables)
+        .flat_map(|vars| vars.into_keys().map(Value::from))
+        .collect()
+}
+
 fn merge_gitlab(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping) -> Result<Merged> {
     let job_keys: Vec<String> = string_keys(&doc)
         .into_iter()
@@ -273,18 +284,18 @@ fn merge_gitlab(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
         doc.insert(Value::from("stages"), Value::from(stages));
     }
 
-    // Conform the variables cibox defines; user-only variables stay (they
-    // may feed custom jobs)
-    if let Some(canonical_vars) = canonical.get("variables").and_then(Value::as_mapping) {
-        if !doc.contains_key("variables") {
-            doc.insert(Value::from("variables"), Value::Mapping(Mapping::new()));
+    // cibox used to hoist every job's environment into the top-level
+    // `variables:`, from where it applied to all the other jobs too. Those
+    // keys now live on the job that wants them, so drop the global copies —
+    // left behind they would keep leaking. Variables cibox never sets are the
+    // user's (they may feed custom jobs) and stay.
+    let hoisted = gitlab_job_variable_names(&file.jobs);
+    if let Some(vars) = doc.get_mut("variables").and_then(Value::as_mapping_mut) {
+        for key in hoisted {
+            vars.shift_remove(&key);
         }
-        let vars = doc
-            .get_mut("variables")
-            .and_then(Value::as_mapping_mut)
-            .with_context(|| "`variables:` is not a mapping")?;
-        for (key, value) in canonical_vars {
-            vars.insert(key.clone(), value.clone());
+        if vars.is_empty() {
+            doc.shift_remove("variables");
         }
     }
 
@@ -697,6 +708,51 @@ my-job:
         assert!(doc["rust-release"]["only"].is_null(), "{content}");
         // The user's own job is not cibox's to re-gate
         assert_eq!(doc["my-release"]["only"]["refs"][0].as_str(), Some("tags"));
+    }
+
+    #[test]
+    fn test_gitlab_update_moves_hoisted_variables_onto_their_jobs() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+
+        // A pipeline generated before job environments stayed on their jobs:
+        // the doc job's RUSTDOCFLAGS applied to rust-test's doctests too
+        let existing = "stages: [test, lint]\n\
+                        variables:\n  CARGO_HOME: .cargo\n  \
+                        RUSTDOCFLAGS: --cfg docsrs\n  MINE: '1'\n\
+                        rust-test:\n  stage: test\n  script: [echo stale]\n\
+                        rust-doc:\n  stage: lint\n  script: [echo stale]\n";
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitLab, &file, &resolved, existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+
+        assert!(doc["variables"]["RUSTDOCFLAGS"].is_null(), "{content}");
+        assert!(doc["variables"]["CARGO_HOME"].is_null(), "{content}");
+        // A variable cibox doesn't set is the user's to keep
+        assert_eq!(doc["variables"]["MINE"].as_str(), Some("1"));
+
+        assert_eq!(
+            doc["rust-doc"]["variables"]["RUSTDOCFLAGS"].as_str(),
+            Some("--cfg docsrs")
+        );
+        assert_eq!(doc["rust-test"]["variables"]["CARGO_HOME"].as_str(), Some(".cargo"));
+        assert!(doc["rust-test"]["variables"]["RUSTDOCFLAGS"].is_null(), "{content}");
+    }
+
+    #[test]
+    fn test_gitlab_update_drops_a_variables_block_left_empty() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+
+        let existing = "stages: [test]\nvariables:\n  CARGO_HOME: .cargo\n\
+                        rust-test:\n  stage: test\n  script: [echo stale]\n";
+        let (content, _, _, _) =
+            merged(merge_file(Platform::GitLab, &file, &resolved, existing).unwrap());
+        assert!(!content.contains("variables:\n  CARGO_HOME"), "{content}");
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc.get("variables").is_none(), "{content}");
     }
 
     #[test]
