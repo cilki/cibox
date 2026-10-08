@@ -66,7 +66,8 @@ pub struct DockerRelease {
     /// Target platforms; empty = single-arch build/push on the host runner
     pub platforms: Vec<DockerPlatform>,
     /// Push README.md as the Docker Hub repository description after the
-    /// release; no effect for ghcr.io images or Windows-only releases
+    /// release; no effect for ghcr.io images or Windows-only releases, and
+    /// skipped at runtime when the credentials or the README are missing
     pub sync_readme: bool,
 }
 
@@ -106,12 +107,33 @@ impl DockerRelease {
 
     /// README-sync step, when enabled. None for ghcr.io: there is no
     /// description API to target, so the knob is silently ignored.
+    ///
+    /// The sync reuses the registry credentials, so it is guarded the same way
+    /// the login is — plus a check that there is a README to send, since the
+    /// bind mount would otherwise have docker create an empty `README.md`
+    /// *directory* in the checkout.
+    ///
+    /// The credentials reach the container through the environment rather than
+    /// `-e NAME=VALUE`: the latter writes the registry password into the
+    /// `docker` process's argv, where anything able to read `/proc` on the
+    /// runner — a concurrent job on a shared or self-hosted runner, another
+    /// container sharing the host PID namespace — can read it, and where
+    /// `docker inspect` keeps it for the container's lifetime. The prefix
+    /// assignment puts it in docker's environment instead and `-e NAME`
+    /// forwards it by name, so the value never becomes a command-line
+    /// argument. Only README.md is mounted, read-only, instead of handing the
+    /// whole checkout to a third-party image with write access.
     fn readme_sync_step(&self) -> Option<Step> {
         (self.sync_readme && !self.uses_ghcr()).then(|| {
             Step::run(
                 "Sync README to Docker Hub",
                 format!(
-                    "docker run --rm -v \"$PWD\":/workspace -e DOCKER_USER=\"$DOCKER_USERNAME\" -e DOCKER_PASS=\"$DOCKER_PASSWORD\" chko/docker-pushrm:1 --file /workspace/README.md {}",
+                    "if [ -n \"${{DOCKER_USERNAME:-}}\" ] && [ -f README.md ]; then \
+                     DOCKER_USER=\"$DOCKER_USERNAME\" DOCKER_PASS=\"$DOCKER_PASSWORD\" \
+                     docker run --rm -e DOCKER_USER -e DOCKER_PASS \
+                     -v \"$PWD/README.md\":/workspace/README.md:ro \
+                     chko/docker-pushrm:1 --file /workspace/README.md {}; \
+                     else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi",
                     self.image
                 ),
             )
@@ -552,10 +574,86 @@ mod tests {
         assert!(matches!(job.steps.last(), Some(Step::Run { name, .. }) if name == SYNC_STEP));
         assert_eq!(
             run_command(job, SYNC_STEP),
-            "docker run --rm -v \"$PWD\":/workspace -e DOCKER_USER=\"$DOCKER_USERNAME\" -e DOCKER_PASS=\"$DOCKER_PASSWORD\" chko/docker-pushrm:1 --file /workspace/README.md owner/app"
+            "if [ -n \"${DOCKER_USERNAME:-}\" ] && [ -f README.md ]; then \
+             DOCKER_USER=\"$DOCKER_USERNAME\" DOCKER_PASS=\"$DOCKER_PASSWORD\" \
+             docker run --rm -e DOCKER_USER -e DOCKER_PASS \
+             -v \"$PWD/README.md\":/workspace/README.md:ro \
+             chko/docker-pushrm:1 --file /workspace/README.md owner/app; \
+             else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi"
         );
         // The sync reuses the push secrets, so nothing extra is declared
         assert_eq!(job.secrets, vec!["DOCKER_USERNAME", "DOCKER_PASSWORD"]);
+    }
+
+    #[test]
+    fn test_sync_readme_keeps_the_password_out_of_argv() {
+        // `-e NAME=VALUE` would expand the registry password into the docker
+        // process's command line, readable through /proc on a shared or
+        // self-hosted runner and retained by `docker inspect`. The value has
+        // to travel in docker's own environment, forwarded by name.
+        for platforms in [
+            vec![],
+            vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64],
+            vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxArm64],
+        ] {
+            let rule = DockerRelease {
+                image: "owner/app".to_string(),
+                platforms,
+                sync_readme: true,
+            };
+            for job in rule.jobs(&docker_facts()) {
+                for step in &job.steps {
+                    let Step::Run { command, .. } = step else {
+                        continue;
+                    };
+                    assert!(
+                        !command.contains("-e DOCKER_PASS=")
+                            && !command.contains("-e DOCKER_USER="),
+                        "{}: {command}",
+                        job.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sync_readme_is_skipped_without_credentials() {
+        // The login step right before it already skips when the registry
+        // secrets aren't configured; an unguarded sync would fail the whole
+        // release job instead (GitHub expands a missing secret to "")
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![],
+            sync_readme: true,
+        };
+        let job = &rule.jobs(&docker_facts())[0];
+        let sync = run_command(job, SYNC_STEP);
+        assert!(
+            sync.starts_with("if [ -n \"${DOCKER_USERNAME:-}\" ]"),
+            "{sync}"
+        );
+        // A missing README.md would otherwise have docker create a directory
+        // of that name in the checkout
+        assert!(sync.contains("[ -f README.md ]"), "{sync}");
+    }
+
+    #[test]
+    fn test_sync_readme_mounts_only_the_readme_read_only() {
+        // A third-party image handed the registry password has no business
+        // with a writable mount of the whole checkout
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![],
+            sync_readme: true,
+        };
+        let job = &rule.jobs(&docker_facts())[0];
+        let sync = run_command(job, SYNC_STEP);
+        assert!(
+            sync.contains("-v \"$PWD/README.md\":/workspace/README.md:ro"),
+            "{sync}"
+        );
+        assert!(!sync.contains("-v \"$PWD\":"), "{sync}");
     }
 
     #[test]
