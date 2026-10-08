@@ -73,10 +73,13 @@ pub struct CiboxConfig {
     /// Run the package.json lint script
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub node_lint: RuleToggle,
-    /// Type-check TypeScript with tsc --noEmit
+    /// Type-check TypeScript with tsc --noEmit. Needs `typescript` among the
+    /// project's dependencies: the compiler is run from node_modules/.bin,
+    /// never downloaded.
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub node_typecheck: RuleToggle,
-    /// Check formatting with prettier
+    /// Check formatting with prettier. Needs `prettier` among the project's
+    /// dependencies, as above.
     #[serde(skip_serializing_if = "RuleToggle::is_default")]
     pub node_fmt: RuleToggle,
     /// Run zig build test on every push

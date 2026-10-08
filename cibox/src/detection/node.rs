@@ -32,6 +32,11 @@ pub struct NodeFacts {
     pub has_build_script: bool,
     pub has_tsconfig: bool,
     pub has_prettier_config: bool,
+    /// `typescript` is a declared dependency, so the install step puts `tsc`
+    /// in `node_modules/.bin` at the version the lockfile pins
+    pub has_typescript_dep: bool,
+    /// `prettier` is a declared dependency, as above
+    pub has_prettier_dep: bool,
 }
 
 pub(super) fn gather(path: &Path) -> Option<NodeFacts> {
@@ -57,6 +62,30 @@ pub(super) fn gather(path: &Path) -> Option<NodeFacts> {
         has_build_script: script("build").is_some(),
         has_tsconfig: path.join("tsconfig.json").is_file(),
         has_prettier_config: has_prettier_config(path, &manifest),
+        has_typescript_dep: has_dependency(&manifest, "typescript"),
+        has_prettier_dep: has_dependency(&manifest, "prettier"),
+    })
+}
+
+/// Whether `package.json` declares `name` as a dependency of any kind.
+///
+/// A tool rule can only run a tool the install step actually installs. When
+/// the package isn't declared, `npx`/`bunx` would fall back to downloading
+/// whatever the registry has under that name — so the rules that run a tool
+/// rather than a package.json script gate on this.
+fn has_dependency(manifest: &serde_json::Value, name: &str) -> bool {
+    [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .any(|section| {
+        manifest
+            .get(section)
+            .and_then(|deps| deps.get(name))
+            .is_some()
     })
 }
 
@@ -205,5 +234,46 @@ mod tests {
         )
         .unwrap();
         assert!(gather(dir.path()).unwrap().has_prettier_config);
+    }
+
+    #[test]
+    fn test_tool_dependencies_detected_in_any_section() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let facts = gather(dir.path()).unwrap();
+        assert!(!facts.has_typescript_dep);
+        assert!(!facts.has_prettier_dep);
+
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(
+                dir.path().join("package.json"),
+                format!(r#"{{"{section}": {{"typescript": "^5", "prettier": "^3"}}}}"#),
+            )
+            .unwrap();
+            let facts = gather(dir.path()).unwrap();
+            assert!(facts.has_typescript_dep, "{section}");
+            assert!(facts.has_prettier_dep, "{section}");
+        }
+    }
+
+    #[test]
+    fn test_config_presence_is_not_a_dependency() {
+        // A tsconfig.json or .prettierrc is committed by plenty of projects
+        // that never install the tool itself
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        fs::write(dir.path().join(".prettierrc"), "{}").unwrap();
+        let facts = gather(dir.path()).unwrap();
+        assert!(facts.has_tsconfig);
+        assert!(facts.has_prettier_config);
+        assert!(!facts.has_typescript_dep);
+        assert!(!facts.has_prettier_dep);
     }
 }

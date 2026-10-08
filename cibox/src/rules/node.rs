@@ -56,12 +56,18 @@ fn run_script(n: &NodeFacts, script: &str) -> String {
     }
 }
 
-/// Run a devDependency binary with the detected package manager
-fn exec_cmd(n: &NodeFacts, cmd: &str) -> String {
-    match n.package_manager {
-        NodePackageManager::Bun => format!("bunx {cmd}"),
-        _ => format!("npx {cmd}"),
-    }
+/// Run a tool the install step put in the project's `node_modules/.bin`.
+///
+/// Spelled as a path rather than through `npx`/`bunx` on purpose. Both of
+/// those fall back to *downloading* a package of that name from the registry
+/// and running it when the binary isn't there, which silently puts an
+/// unpinned, unreviewed third party in the pipeline — and resolution is by
+/// binary name, so `npx tsc` fetches the unrelated `tsc` package rather than
+/// `typescript`. Every package manager cibox emits for installs binaries
+/// here, so a missing one means the project didn't declare the tool: the job
+/// should fail saying so, not reach for the network.
+fn local_bin(cmd: &str) -> String {
+    format!("./node_modules/.bin/{cmd}")
 }
 
 /// Base job with the per-manager image and a project-relative dependency
@@ -173,11 +179,18 @@ impl Rule for NodeTypecheck {
     }
 
     fn description(&self) -> &'static str {
-        "Type-check TypeScript with tsc --noEmit"
+        "Type-check TypeScript with tsc --noEmit (requires a typescript dependency)"
     }
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
-        facts.node.as_ref().is_some_and(|n| n.has_tsconfig)
+        // A tsconfig.json on its own doesn't mean the project installs a
+        // compiler — plenty are committed only for an editor, or for a
+        // bundler that carries its own. Running `tsc` anyway would mean
+        // fetching one, so leave the rule to be force-enabled instead.
+        facts
+            .node
+            .as_ref()
+            .is_some_and(|n| n.has_tsconfig && n.has_typescript_dep)
     }
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
@@ -185,7 +198,7 @@ impl Rule for NodeTypecheck {
         vec![
             base_job(self.id(), self.name(), Stage::Lint, 15, &n).with_steps(steps_with_install(
                 &n,
-                Step::run("Type-check", exec_cmd(&n, "tsc --noEmit")),
+                Step::run("Type-check", local_bin("tsc --noEmit")),
             )),
         ]
     }
@@ -204,11 +217,16 @@ impl Rule for NodeFmt {
     }
 
     fn description(&self) -> &'static str {
-        "Check formatting with prettier"
+        "Check formatting with prettier (requires a prettier dependency)"
     }
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
-        facts.node.as_ref().is_some_and(|n| n.has_prettier_config)
+        // A config file alone says which style the project uses, not that it
+        // installs the formatter; see NodeTypecheck's note above
+        facts
+            .node
+            .as_ref()
+            .is_some_and(|n| n.has_prettier_config && n.has_prettier_dep)
     }
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
@@ -216,7 +234,7 @@ impl Rule for NodeFmt {
         vec![
             base_job(self.id(), self.name(), Stage::Lint, 10, &n).with_steps(steps_with_install(
                 &n,
-                Step::run("Check formatting", exec_cmd(&n, "prettier --check .")),
+                Step::run("Check formatting", local_bin("prettier --check .")),
             )),
         ]
     }
@@ -261,12 +279,80 @@ mod tests {
     #[test]
     fn test_typecheck_and_fmt_detection() {
         let facts = facts_with(&[
-            ("package.json", "{}"),
+            (
+                "package.json",
+                r#"{"devDependencies": {"typescript": "^5", "prettier": "^3"}}"#,
+            ),
             ("tsconfig.json", "{}"),
             (".prettierrc", "{}"),
         ]);
         assert!(NodeTypecheck.detect(&facts));
         assert!(NodeFmt.detect(&facts));
+    }
+
+    #[test]
+    fn test_tool_rules_need_the_tool_installed() {
+        // A config file says which style/compiler settings the project uses,
+        // not that it installs the tool. Enabling the rule anyway would make
+        // the job download one at an unpinned version nobody reviewed.
+        let facts = facts_with(&[
+            ("package.json", "{}"),
+            ("tsconfig.json", "{}"),
+            (".prettierrc", "{}"),
+        ]);
+        assert!(!NodeTypecheck.detect(&facts));
+        assert!(!NodeFmt.detect(&facts));
+
+        // One declared tool doesn't enable the other's rule
+        let facts = facts_with(&[
+            ("package.json", r#"{"dependencies": {"typescript": "^5"}}"#),
+            ("tsconfig.json", "{}"),
+            (".prettierrc", "{}"),
+        ]);
+        assert!(NodeTypecheck.detect(&facts));
+        assert!(!NodeFmt.detect(&facts));
+    }
+
+    #[test]
+    fn test_tools_run_from_node_modules_not_the_registry() {
+        // `npx tsc` / `bunx prettier` download and run a package of that name
+        // when the binary is missing — and `tsc` on npm is not the TypeScript
+        // compiler. The install step is the only thing allowed to fetch.
+        for (lockfile, pm) in [("package-lock.json", "npm"), ("bun.lockb", "bun")] {
+            let facts = facts_with(&[
+                (
+                    "package.json",
+                    r#"{"devDependencies": {"typescript": "^5", "prettier": "^3"}}"#,
+                ),
+                ("tsconfig.json", "{}"),
+                (".prettierrc", "{}"),
+                (lockfile, ""),
+            ]);
+            let commands: Vec<String> = [NodeTypecheck.jobs(&facts), NodeFmt.jobs(&facts)]
+                .concat()
+                .iter()
+                .flat_map(|job| job.steps.clone())
+                .filter_map(|step| match step {
+                    Step::Run { command, .. } => Some(command),
+                    _ => None,
+                })
+                .collect();
+
+            assert!(
+                commands.contains(&"./node_modules/.bin/tsc --noEmit".to_string()),
+                "{pm}: {commands:?}"
+            );
+            assert!(
+                commands.contains(&"./node_modules/.bin/prettier --check .".to_string()),
+                "{pm}: {commands:?}"
+            );
+            for command in &commands {
+                assert!(
+                    !command.starts_with("npx ") && !command.starts_with("bunx "),
+                    "{pm}: {command}"
+                );
+            }
+        }
     }
 
     #[test]
