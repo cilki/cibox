@@ -16,6 +16,10 @@ pub struct GitLabJob {
     pub stage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Sidecar containers linked into the job's network, each reachable under
+    /// its image name — `docker:dind` answers on `docker`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub services: Option<Vec<String>>,
     /// The job's environment. GitLab has no job-level `env:`, so `variables:`
     /// is where it goes; set at the top level instead it would apply to every
     /// other job in the pipeline too.

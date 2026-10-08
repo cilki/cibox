@@ -10,6 +10,31 @@ use std::collections::BTreeMap;
 /// pipeline, so branch pushes can't satisfy it.
 const TAG_CONDITION: &str = "$CI_COMMIT_TAG =~ /^v/";
 
+/// Image holding the docker CLI for jobs that build images
+const DOCKER_IMAGE: &str = "docker:latest";
+
+/// GitLab runners give a job no docker daemon of its own: the `docker:latest`
+/// image is only the client, and `/var/run/docker.sock` inside the job's
+/// container belongs to nothing. A daemon has to be linked in as a service,
+/// and the client pointed at it over the network — otherwise every `docker`
+/// command dies with "Cannot connect to the Docker daemon". The service is
+/// reachable as `docker`, and `dind` generates its TLS material into
+/// `DOCKER_TLS_CERTDIR`, shared with the job through the services mount.
+const DIND_SERVICE: &str = "docker:dind";
+const DOCKER_CERT_DIR: &str = "/certs";
+
+fn dind_client_variables() -> BTreeMap<String, String> {
+    [
+        ("DOCKER_HOST", "tcp://docker:2376".to_string()),
+        ("DOCKER_TLS_CERTDIR", DOCKER_CERT_DIR.to_string()),
+        ("DOCKER_TLS_VERIFY", "1".to_string()),
+        ("DOCKER_CERT_PATH", format!("{DOCKER_CERT_DIR}/client")),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
 pub fn lower_gitlab(jobs: &[Job]) -> GitLabCI {
     let mut lowered = BTreeMap::new();
     let mut stages: Vec<Stage> = Vec::new();
@@ -45,6 +70,9 @@ fn lower_job(job: &Job) -> GitLabJob {
         // GitLab clones shallowly by default
         variables.insert("GIT_DEPTH".to_string(), "0".to_string());
     }
+    if job.needs_docker {
+        variables.extend(dind_client_variables());
+    }
 
     let script = job
         .steps
@@ -59,13 +87,14 @@ fn lower_job(job: &Job) -> GitLabJob {
     GitLabJob {
         stage: job.stage.as_str().to_string(),
         image: if job.needs_docker {
-            Some("docker:latest".to_string())
+            Some(DOCKER_IMAGE.to_string())
         } else if job.matrix.is_some() {
             // Expanded per leg from the parallel:matrix variables
             Some("$IMAGE".to_string())
         } else {
             job.image.clone()
         },
+        services: job.needs_docker.then(|| vec![DIND_SERVICE.to_string()]),
         variables: (!variables.is_empty()).then_some(variables),
         script,
         before_script: None,
@@ -161,6 +190,43 @@ mod tests {
             lower_gitlab(&[Job::new("docker-release", "Docker push", Stage::Deploy).with_docker()]);
         let job = &config.jobs["docker-release"];
         assert_eq!(job.image.as_deref(), Some("docker:latest"));
+    }
+
+    #[test]
+    fn test_docker_job_gets_a_daemon_to_talk_to() {
+        let config = lower_gitlab(&[Job::new("docker-build", "Docker build", Stage::Build)
+            .with_docker()
+            .with_steps(vec![
+                Step::checkout(),
+                Step::run("Build image", "docker build -t owner/app ."),
+            ])]);
+        let job = &config.jobs["docker-build"];
+        // The docker image ships the client only, so without a linked daemon
+        // every docker command in the script fails to connect
+        assert_eq!(
+            job.services.as_deref(),
+            Some(["docker:dind".to_string()].as_slice())
+        );
+        let vars = job
+            .variables
+            .as_ref()
+            .expect("docker job needs DOCKER_HOST");
+        assert_eq!(vars["DOCKER_HOST"], "tcp://docker:2376");
+        // dind writes its certificates here and the client reads them back
+        // out of the same shared mount
+        assert_eq!(vars["DOCKER_TLS_CERTDIR"], "/certs");
+        assert_eq!(vars["DOCKER_TLS_VERIFY"], "1");
+        assert_eq!(vars["DOCKER_CERT_PATH"], "/certs/client");
+    }
+
+    #[test]
+    fn test_non_docker_job_gets_no_services() {
+        let config = lower_gitlab(&[Job::new("rust-test", "Cargo test", Stage::Test)
+            .with_image("rust:latest")
+            .with_steps(vec![Step::run("Test", "cargo test")])]);
+        let job = &config.jobs["rust-test"];
+        assert_eq!(job.services, None);
+        assert_eq!(job.variables, None);
     }
 
     #[test]
