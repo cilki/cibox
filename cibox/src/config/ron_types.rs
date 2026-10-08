@@ -179,7 +179,8 @@ pub struct DockerReleaseRule {
     /// Sync README.md to the Docker Hub repository description during the
     /// release job (via chko/docker-pushrm, reusing DOCKER_USERNAME and
     /// DOCKER_PASSWORD). Docker Hub only — ignored for ghcr.io images and
-    /// Windows-only releases. Omit for off.
+    /// Windows-only releases, and skipped at runtime when the credentials
+    /// aren't configured or there is no README.md. Omit for off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_readme: Option<bool>,
 }

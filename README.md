@@ -122,6 +122,11 @@ name has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and
 `DOCKER_PASSWORD` secrets. If the credentials aren't configured in CI, the
 login is skipped, for registries that don't require any.
 
+`sync_readme` additionally pushes `README.md` to the Docker Hub repository
+description once the image is released, reusing the same two secrets. It is
+Docker Hub only — `ghcr.io` has no description API — and like the login it is
+skipped when the credentials aren't configured or there is no `README.md`.
+
 ### Multi-arch docker images
 
 `docker-release` builds a single image for the runner's own architecture by
