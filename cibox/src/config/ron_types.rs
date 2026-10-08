@@ -152,7 +152,10 @@ pub struct DockerRule {
 }
 
 /// Override for the docker-release rule: toggle, image name, and target
-/// platforms
+/// platforms. The push authenticates with GITHUB_TOKEN for ghcr.io images,
+/// or with DOCKER_USERNAME/DOCKER_PASSWORD against the registry host in the
+/// image name (Docker Hub when there is none); login is skipped when the
+/// credentials aren't configured, for registries that don't require any.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockerReleaseRule {

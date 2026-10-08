@@ -116,6 +116,12 @@ literal argument to `docker build -t`: lowercase alphanumerics separated by
 from the git remote (or the directory name) and normalized to fit, so a
 `Fossable/CiBox` remote becomes `fossable/cibox`.
 
+The registry is inferred from the image name. `docker-release` logs in to
+`ghcr.io` with `GITHUB_TOKEN`, and everywhere else — the host prefix if the
+name has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and
+`DOCKER_PASSWORD` secrets. If the credentials aren't configured in CI, the
+login is skipped, for registries that don't require any.
+
 ### Multi-arch docker images
 
 `docker-release` builds a single image for the runner's own architecture by

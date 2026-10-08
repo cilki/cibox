@@ -77,6 +77,16 @@ pub fn coerce_reference(raw: &str) -> String {
     sanitized
 }
 
+/// The registry host of `reference`, when its leading component names one
+/// (`localhost:5000/app` → `localhost:5000`). `None` for Docker Hub-style
+/// names like `owner/app`.
+pub fn registry_host(reference: &str) -> Option<&str> {
+    match reference.split_once('/') {
+        Some((first, _)) if is_host_like(first) => Some(first),
+        _ => None,
+    }
+}
+
 /// Split a trailing `:tag` off a reference. A colon ahead of a `/` belongs to
 /// a registry port, not a tag.
 fn split_tag(reference: &str) -> (&str, Option<&str>) {
@@ -232,6 +242,18 @@ mod tests {
         let long = format!("owner/{}", "a".repeat(MAX_LEN));
         assert!(!is_valid_reference(&long));
         assert_eq!(coerce_reference(&long), FALLBACK_NAME);
+    }
+
+    #[test]
+    fn test_registry_host() {
+        assert_eq!(registry_host("localhost:5000/app"), Some("localhost:5000"));
+        assert_eq!(registry_host("ghcr.io/owner/app"), Some("ghcr.io"));
+        assert_eq!(
+            registry_host("registry.example.com:5000/owner/app"),
+            Some("registry.example.com:5000")
+        );
+        assert_eq!(registry_host("owner/app"), None);
+        assert_eq!(registry_host("app"), None);
     }
 
     #[test]

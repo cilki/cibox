@@ -1,4 +1,5 @@
 use super::Rule;
+use crate::config::image::registry_host;
 use crate::config::DockerPlatform;
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
@@ -49,8 +50,10 @@ impl Rule for DockerBuild {
 
 /// Push the image to a registry when a version tag is pushed.
 /// The registry is inferred from the image name: a `ghcr.io/` prefix logs in
-/// to the GitHub Container Registry with GITHUB_TOKEN, anything else uses
-/// Docker Hub credentials.
+/// to the GitHub Container Registry with GITHUB_TOKEN, any other host prefix
+/// logs in to that registry with Docker Hub-style credentials, and a bare
+/// name uses Docker Hub itself. Login is skipped at runtime when the
+/// credentials aren't configured.
 ///
 /// With `platforms` set, linux targets build in a single buildx+QEMU job.
 /// `WindowsAmd64` cannot be emulated, so it gets its own Windows-runner job
@@ -72,12 +75,24 @@ impl DockerRelease {
         self.image.starts_with("ghcr.io/")
     }
 
+    /// The login step skips at runtime when the credentials aren't
+    /// configured — a registry may not require any (e.g. a local private
+    /// one). GitHub interpolates missing secrets as empty strings while the
+    /// other platforms leave the variables unset, so test with `${VAR:-}`.
     fn login_command(&self) -> String {
         if self.uses_ghcr() {
-            "echo $GITHUB_TOKEN | docker login ghcr.io -u $GITHUB_ACTOR --password-stdin"
+            "if [ -n \"${GITHUB_TOKEN:-}\" ]; then echo \"$GITHUB_TOKEN\" | docker login ghcr.io -u \"$GITHUB_ACTOR\" --password-stdin; else echo \"GITHUB_TOKEN not set; skipping docker login\"; fi"
                 .to_string()
         } else {
-            "echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin".to_string()
+            // Non-default registries need their host on the login command,
+            // or the credentials would go to Docker Hub
+            let host = match registry_host(&self.image) {
+                Some(host) => format!("{host} "),
+                None => String::new(),
+            };
+            format!(
+                "if [ -n \"${{DOCKER_USERNAME:-}}\" ]; then echo \"$DOCKER_PASSWORD\" | docker login {host}-u \"$DOCKER_USERNAME\" --password-stdin; else echo \"DOCKER_USERNAME not set; skipping docker login\"; fi"
+            )
         }
     }
 
@@ -454,14 +469,42 @@ mod tests {
         };
         let job = &rule.jobs(&docker_facts())[0];
         assert_eq!(job.secrets, vec!["GITHUB_TOKEN"]);
-        assert!(job.steps.iter().any(
-            |s| matches!(s, Step::Run { command, .. } if command.contains("docker login ghcr.io"))
-        ));
+        let login = run_command(job, "Login to registry");
+        assert!(login.contains("docker login ghcr.io"));
+        assert!(login.starts_with("if [ -n \"${GITHUB_TOKEN:-}\" ]; then"));
         // The default token can't push packages without this scope
         assert_eq!(
             job.permissions,
             vec![("packages".to_string(), "write".to_string())]
         );
+    }
+
+    #[test]
+    fn test_login_is_skipped_without_credentials() {
+        // A registry may not require credentials at all (e.g. a local
+        // private one), so the login step guards on the variables
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![],
+            sync_readme: false,
+        };
+        let job = &rule.jobs(&docker_facts())[0];
+        assert_eq!(
+            run_command(job, "Login to registry"),
+            "if [ -n \"${DOCKER_USERNAME:-}\" ]; then echo \"$DOCKER_PASSWORD\" | docker login -u \"$DOCKER_USERNAME\" --password-stdin; else echo \"DOCKER_USERNAME not set; skipping docker login\"; fi"
+        );
+    }
+
+    #[test]
+    fn test_private_registry_login_targets_its_host() {
+        let rule = DockerRelease {
+            image: "localhost:5000/app".to_string(),
+            platforms: vec![],
+            sync_readme: false,
+        };
+        let job = &rule.jobs(&docker_facts())[0];
+        assert!(run_command(job, "Login to registry")
+            .contains("docker login localhost:5000 -u \"$DOCKER_USERNAME\""));
     }
 
     #[test]
