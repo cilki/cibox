@@ -21,7 +21,8 @@ fn project() -> tempfile::TempDir {
 
 fn update(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("cibox").unwrap();
-    cmd.current_dir(dir).args(["update", "--platform", "github"]);
+    cmd.current_dir(dir)
+        .args(["update", "--platform", "github"]);
     cmd
 }
 
@@ -55,10 +56,8 @@ fn test_update_lifecycle() {
     // Customize: break a managed job, add a custom job, delete another
     let mut doc = read_yaml(&ci_path);
     let jobs = doc["jobs"].as_mapping_mut().unwrap();
-    jobs["rust-test"] = serde_yaml::from_str(
-        "runs-on: ubuntu-latest\nsteps:\n  - run: echo stale\n",
-    )
-    .unwrap();
+    jobs["rust-test"] =
+        serde_yaml::from_str("runs-on: ubuntu-latest\nsteps:\n  - run: echo stale\n").unwrap();
     jobs.insert(
         "my-job".into(),
         serde_yaml::from_str("runs-on: ubuntu-latest\nsteps:\n  - run: echo mine\n").unwrap(),
@@ -88,7 +87,10 @@ fn test_update_lifecycle() {
     let content = fs::read_to_string(&ci_path).unwrap();
     assert!(content.contains("rust-fmt"), "{content}");
     assert!(!content.contains("my-job"), "{content}");
-    assert!(!content.contains("rust-clippy"), "still disabled: {content}");
+    assert!(
+        !content.contains("rust-clippy"),
+        "still disabled: {content}"
+    );
 }
 
 #[test]
@@ -128,6 +130,101 @@ fn test_version_matrix_lifecycle() {
     let content = fs::read_to_string(&ci_path).unwrap();
     assert!(!content.contains("strategy"), "{content}");
     assert!(content.contains("rust:latest"), "{content}");
+}
+
+/// Turning every rule off is the way to hand a pipeline back to its author, so
+/// `update` has to prune cibox's jobs then rather than refusing to run.
+#[test]
+fn test_disabling_every_rule_prunes_instead_of_erroring() {
+    let dir = project();
+    let ci_path = dir.path().join(".github/workflows/ci.yml");
+
+    update(dir.path()).assert().success();
+
+    // The user keeps a job of their own alongside the generated ones
+    let mut doc = read_yaml(&ci_path);
+    doc["jobs"].as_mapping_mut().unwrap().insert(
+        "my-job".into(),
+        serde_yaml::from_str("runs-on: ubuntu-latest\nsteps:\n  - run: echo mine\n").unwrap(),
+    );
+    write_yaml(&ci_path, &doc);
+
+    fs::write(
+        dir.path().join("cibox.ron"),
+        "(\n  rust_test: (enabled: false),\n  rust_fmt: (enabled: false),\n  \
+         rust_clippy: (enabled: false),\n  rust_audit: (enabled: false),\n  \
+         rust_doc: (enabled: false),\n  rust_minimal_versions: (enabled: false),\n  \
+         rust_release: (enabled: false),\n  docker_build: (enabled: false),\n  \
+         docker_release: (enabled: false),\n)\n",
+    )
+    .unwrap();
+
+    update(dir.path()).assert().success();
+    let doc = read_yaml(&ci_path);
+    let jobs = doc["jobs"].as_mapping().unwrap();
+    assert_eq!(jobs.len(), 1, "only the custom job survives: {jobs:?}");
+    assert!(jobs.contains_key("my-job"), "{jobs:?}");
+}
+
+/// Removing what a rule detected on (here the Dockerfile) must take the rule's
+/// jobs with it, not leave a pipeline that builds an image that is gone.
+#[test]
+fn test_removing_the_last_detected_fact_prunes_its_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let ci_path = dir.path().join(".github/workflows/ci.yml");
+
+    update(dir.path()).assert().success();
+    assert!(fs::read_to_string(&ci_path)
+        .unwrap()
+        .contains("docker-build"));
+
+    // Keep a job of the user's own so the file stays valid once pruned
+    let mut doc = read_yaml(&ci_path);
+    doc["jobs"].as_mapping_mut().unwrap().insert(
+        "my-job".into(),
+        serde_yaml::from_str("runs-on: ubuntu-latest\nsteps:\n  - run: echo mine\n").unwrap(),
+    );
+    write_yaml(&ci_path, &doc);
+
+    fs::remove_file(dir.path().join("Dockerfile")).unwrap();
+    update(dir.path()).assert().success();
+    let content = fs::read_to_string(&ci_path).unwrap();
+    assert!(!content.contains("docker-build"), "{content}");
+    assert!(content.contains("my-job"), "{content}");
+}
+
+/// With nothing enabled *and* nothing on disk to prune there is genuinely
+/// nothing to do, and a silent success would just look like a broken tool.
+#[test]
+fn test_nothing_enabled_and_nothing_to_prune_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+
+    update(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No rules enabled"));
+
+    // --force rewrites files wholesale, so an existing pipeline is no reason
+    // to keep going either
+    let project = project();
+    update(project.path()).assert().success();
+    fs::write(
+        project.path().join("cibox.ron"),
+        "(\n  rust_test: (enabled: false),\n  rust_fmt: (enabled: false),\n  \
+         rust_clippy: (enabled: false),\n  rust_audit: (enabled: false),\n  \
+         rust_doc: (enabled: false),\n  rust_minimal_versions: (enabled: false),\n  \
+         rust_release: (enabled: false),\n  docker_build: (enabled: false),\n  \
+         docker_release: (enabled: false),\n)\n",
+    )
+    .unwrap();
+    update(project.path())
+        .arg("--force")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No rules enabled"));
 }
 
 #[test]

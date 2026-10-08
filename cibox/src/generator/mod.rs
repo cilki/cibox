@@ -17,10 +17,16 @@ use anyhow::bail;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+/// Reported when a resolution leaves no rule enabled, so there is nothing to
+/// write anywhere.
+pub const NOTHING_ENABLED: &str =
+    "No rules enabled — nothing to generate. Run `cibox detect` to see why.";
+
 /// One output file cibox manages: where it goes and the jobs it should hold.
 ///
 /// `jobs` may be empty (e.g. a GitHub `release.yml` when no release rules are
-/// enabled) so the update path can strip stale cibox jobs from such a file.
+/// enabled, or every file when no rule is enabled at all) so the update path
+/// can strip stale cibox jobs from such a file.
 #[derive(Debug, Clone)]
 pub struct PlannedFile {
     pub path: PathBuf,
@@ -33,15 +39,16 @@ pub struct PlannedFile {
 /// GitHub/Gitea get a `ci.yml` for branch/PR jobs and a separate `release.yml`
 /// for tags-only jobs; the other platforms are single-file and gate release
 /// jobs within the document.
+///
+/// Planning succeeds with no enabled rules: the resulting job-less files are
+/// what lets `update` prune cibox's jobs out of an existing pipeline. Callers
+/// that need something to write (see [`generate`]) reject that themselves.
 pub fn plan(
     facts: &ProjectFacts,
     resolved: &[ResolvedRule],
     platform: Platform,
 ) -> Result<Vec<PlannedFile>> {
     let jobs = enabled_jobs(facts, resolved);
-    if jobs.is_empty() {
-        bail!("No rules enabled — nothing to generate. Run `cibox detect` to see why.");
-    }
 
     match platform {
         Platform::GitHub | Platform::Gitea => {
@@ -115,12 +122,19 @@ pub(crate) fn prepend_required_variables(platform: Platform, jobs: &[Job], conte
 }
 
 /// Generate all output files for one platform, skipping empty ones.
+///
+/// Unlike [`plan`], this is for callers that write whole files and so have
+/// nothing to say when no rule is enabled.
 pub fn generate(
     facts: &ProjectFacts,
     resolved: &[ResolvedRule],
     platform: Platform,
 ) -> Result<Vec<(PathBuf, String)>> {
-    plan(facts, resolved, platform)?
+    let planned = plan(facts, resolved, platform)?;
+    if planned.iter().all(|file| file.jobs.is_empty()) {
+        bail!("{NOTHING_ENABLED}");
+    }
+    planned
         .into_iter()
         .filter(|file| !file.jobs.is_empty())
         .map(|file| Ok((file.path.clone(), render_file(platform, &file)?)))
@@ -229,6 +243,36 @@ mod tests {
         let facts = ProjectFacts::default();
         let resolved = resolve(&facts, &CiboxConfig::default());
         assert!(generate(&facts, &resolved, Platform::GitHub).is_err());
+    }
+
+    #[test]
+    fn test_plan_with_nothing_enabled_still_names_the_managed_files() {
+        // `update` prunes through the planned files, so an empty resolution has
+        // to plan them anyway — otherwise disabling every rule (or deleting the
+        // last detected fact) would strand cibox's jobs in the pipeline
+        let empty = ProjectFacts::default();
+        let empty_resolved = resolve(&empty, &CiboxConfig::default());
+        assert!(empty_resolved.iter().all(|r| !r.enabled), "fixture rot");
+
+        let full = full_facts();
+        let full_resolved = resolve(&full, &CiboxConfig::default());
+
+        for platform in Platform::all() {
+            let planned = plan(&empty, &empty_resolved, platform).unwrap();
+            assert!(
+                planned.iter().all(|file| file.jobs.is_empty()),
+                "{platform:?} planned jobs out of nothing"
+            );
+            // ...and they are the same files a populated project would manage
+            let paths: Vec<_> = planned.iter().map(|f| f.path.clone()).collect();
+            let full_paths: Vec<_> = plan(&full, &full_resolved, platform)
+                .unwrap()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect();
+            assert!(!full_paths.is_empty(), "{platform:?} manages no files");
+            assert_eq!(paths, full_paths, "{platform:?}");
+        }
     }
 
     #[test]
