@@ -133,6 +133,13 @@ description once the image is released, reusing the same two secrets. It is
 Docker Hub only — `ghcr.io` has no description API — and like the login it is
 skipped when the credentials aren't configured or there is no `README.md`.
 
+Each backend supplies the docker daemon its own way: GitHub Actions, Gitea
+Actions and CircleCI get one from the runner, and GitLab jobs link
+`docker:dind` in as a service and point the client at it. GitLab's
+docker-in-docker needs a runner started in privileged mode — the shared
+runners on GitLab.com are, a self-hosted one needs `privileged = true` in
+its `config.toml`.
+
 ### Multi-arch docker images
 
 `docker-release` builds a single image for the runner's own architecture by
