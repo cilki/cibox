@@ -157,6 +157,22 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
                     ])
                 }
             }
+            Row::BoolKnob { label, value, .. } => {
+                let checkbox = if *value { "[✓]" } else { "[ ]" };
+                let checkbox_color = if *value { Color::Green } else { Color::DarkGray };
+                let text_color = match (is_selected, value) {
+                    (true, _) => Color::Yellow,
+                    (false, true) => Color::White,
+                    (false, false) => Color::DarkGray,
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!("       {checkbox} "),
+                        Style::default().fg(checkbox_color),
+                    ),
+                    Span::styled(*label, Style::default().fg(text_color)),
+                ])
+            }
             Row::ArchOption { arch, selected } => {
                 let checkbox = if *selected { "[✓]" } else { "[ ]" };
                 let checkbox_color = if *selected {

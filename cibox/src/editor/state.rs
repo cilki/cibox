@@ -56,6 +56,13 @@ pub enum Row {
         /// The value in effect (facts-derived default when not overridden)
         effective: String,
     },
+    /// A boolean knob checkbox (e.g. sync_readme)
+    BoolKnob {
+        rule_id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        value: bool,
+    },
     /// One target-platform checkbox under docker-release
     ArchOption { arch: DockerPlatform, selected: bool },
     /// One configured toolchain version under an expanded test rule
@@ -236,6 +243,14 @@ impl EditorState {
                         effective: self.effective_image(),
                     });
                     if id == "docker-release" {
+                        self.rows.push(Row::BoolKnob {
+                            rule_id: id,
+                            label: "sync_readme",
+                            description: "Sync README.md to the Docker Hub repository description \
+                                          on release; needs DOCKER_USERNAME/DOCKER_PASSWORD. \
+                                          Docker Hub only. Press Enter to toggle.",
+                            value: self.config.docker_release.sync_readme.unwrap_or(false),
+                        });
                         let selected = self
                             .config
                             .docker_release
@@ -289,6 +304,7 @@ impl EditorState {
                     buffer: effective,
                 });
             }
+            Some(Row::BoolKnob { .. }) => self.toggle_sync_readme(),
             Some(Row::ArchOption { arch, .. }) => self.toggle_arch(arch),
             Some(Row::VersionItem {
                 rule_id,
@@ -319,6 +335,15 @@ impl EditorState {
         let override_value = (new_enabled != rule.detected).then_some(new_enabled);
         self.config
             .set_enabled_override(rule.id, override_value);
+        self.refresh();
+        self.auto_save_ron();
+    }
+
+    /// Flip the docker-release sync_readme knob; off matches the default so
+    /// it collapses back to "unset" and cibox.ron stays delta-only
+    pub fn toggle_sync_readme(&mut self) {
+        let new = !self.config.docker_release.sync_readme.unwrap_or(false);
+        self.config.docker_release.sync_readme = new.then_some(true);
         self.refresh();
         self.auto_save_ron();
     }
@@ -511,6 +536,7 @@ impl EditorState {
         self.current_item_description = match self.current_row() {
             Some(Row::Rule(row)) => row.description.to_string(),
             Some(Row::TextKnob { description, .. }) => description.to_string(),
+            Some(Row::BoolKnob { description, .. }) => description.to_string(),
             Some(Row::ArchOption { arch, .. }) => format!(
                 "Include {} in the released multi-arch image",
                 arch.as_str()
@@ -699,14 +725,47 @@ mod tests {
             state.rows[idx + 1],
             Row::TextKnob { label: "image_name", .. }
         ));
-        // image_name + one row per DockerPlatform
-        assert_eq!(state.rows.len(), collapsed_len + 1 + DockerPlatform::ALL.len());
+        assert!(matches!(
+            state.rows[idx + 2],
+            Row::BoolKnob { label: "sync_readme", .. }
+        ));
+        // image_name + sync_readme + one row per DockerPlatform
+        assert_eq!(state.rows.len(), collapsed_len + 2 + DockerPlatform::ALL.len());
 
         // Collapsing from a child row jumps back to the parent
         state.cursor = idx + 2;
         state.collapse_current();
         assert_eq!(state.cursor, rule_index(&state, "docker-release"));
         assert_eq!(state.rows.len(), collapsed_len);
+    }
+
+    #[test]
+    fn test_sync_readme_toggle_is_delta_only() {
+        let dir = docker_dir();
+        let mut state = state_for(dir.path());
+
+        state.cursor = rule_index(&state, "docker-release");
+        state.expand_current();
+        let idx = rule_index(&state, "docker-release");
+        assert!(matches!(
+            state.rows[idx + 2],
+            Row::BoolKnob { label: "sync_readme", value: false, .. }
+        ));
+
+        state.cursor = idx + 2;
+        state.activate_current();
+        assert_eq!(state.config.docker_release.sync_readme, Some(true));
+        assert!(matches!(
+            state.rows[idx + 2],
+            Row::BoolKnob { value: true, .. }
+        ));
+        let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
+        assert!(ron_str.contains("sync_readme"), "{ron_str}");
+        assert!(state.yaml_preview.contains("docker-pushrm"), "{}", state.yaml_preview);
+
+        // Toggling back off matches the default, so the override disappears
+        state.activate_current();
+        assert!(state.config.is_default());
     }
 
     #[test]

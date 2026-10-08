@@ -179,6 +179,7 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
                 .platforms
                 .clone()
                 .unwrap_or_default(),
+            sync_readme: config.docker_release.sync_readme.unwrap_or(false),
         }),
         Box::new(Gitleaks),
     ];
@@ -460,6 +461,26 @@ mod tests {
             s,
             crate::ir::Step::Run { command, .. }
                 if command.contains("--platform linux/amd64,linux/arm64")
+        )));
+    }
+
+    #[test]
+    fn test_docker_sync_readme_knob_flows_into_jobs() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+
+        let mut config = CiboxConfig::default();
+        config.docker_release.sync_readme = Some(true);
+        let resolved = resolve(&facts, &config);
+        let release = resolved
+            .iter()
+            .find(|r| r.rule.id() == "docker-release")
+            .unwrap();
+        let jobs = release.rule.jobs(&facts);
+        assert!(jobs[0].steps.iter().any(|s| matches!(
+            s,
+            crate::ir::Step::Run { command, .. } if command.contains("docker-pushrm")
         )));
     }
 

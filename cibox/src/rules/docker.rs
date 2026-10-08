@@ -62,6 +62,9 @@ pub struct DockerRelease {
     pub image: String,
     /// Target platforms; empty = single-arch build/push on the host runner
     pub platforms: Vec<DockerPlatform>,
+    /// Push README.md as the Docker Hub repository description after the
+    /// release; no effect for ghcr.io images or Windows-only releases
+    pub sync_readme: bool,
 }
 
 impl DockerRelease {
@@ -84,6 +87,20 @@ impl DockerRelease {
         } else {
             vec!["DOCKER_USERNAME".to_string(), "DOCKER_PASSWORD".to_string()]
         }
+    }
+
+    /// README-sync step, when enabled. None for ghcr.io: there is no
+    /// description API to target, so the knob is silently ignored.
+    fn readme_sync_step(&self) -> Option<Step> {
+        (self.sync_readme && !self.uses_ghcr()).then(|| {
+            Step::run(
+                "Sync README to Docker Hub",
+                format!(
+                    "docker run --rm -v \"$PWD\":/workspace -e DOCKER_USER=\"$DOCKER_USERNAME\" -e DOCKER_PASS=\"$DOCKER_PASSWORD\" chko/docker-pushrm:1 --file /workspace/README.md {}",
+                    self.image
+                ),
+            )
+        })
     }
 
     /// Selected platforms deduped and in `DockerPlatform::ALL` order
@@ -193,14 +210,21 @@ impl Rule for DockerRelease {
             (true, windows_empty) => {
                 let job = self.release_job("", self.name()).with_timeout(30);
                 let job = if windows_empty { job } else { job.on_windows() };
-                vec![job.with_steps(self.build_push_steps(facts, &self.image))]
+                let mut steps = self.build_push_steps(facts, &self.image);
+                // The sync tool is a Linux container, so skip it on Windows
+                if windows_empty {
+                    steps.extend(self.readme_sync_step());
+                }
+                vec![job.with_steps(steps)]
             }
             // Linux only: one buildx job pushes the multi-arch manifest
             (false, true) => {
+                let mut steps = self.buildx_steps(facts, &linux, &self.image);
+                steps.extend(self.readme_sync_step());
                 vec![self
                     .release_job("", self.name())
                     .with_timeout(60)
-                    .with_steps(self.buildx_steps(facts, &linux, &self.image))]
+                    .with_steps(steps)]
             }
             // Mixed: stage per-OS images, then merge into one manifest
             (false, false) => {
@@ -220,16 +244,25 @@ impl Rule for DockerRelease {
                             format!("{}-linux", self.id()),
                             format!("{}-windows", self.id()),
                         ])
-                        .with_steps(vec![
-                            Step::run("Login to registry", self.login_command()),
-                            Step::run(
-                                "Merge manifests",
-                                format!(
-                                    "docker buildx imagetools create -t {} {linux_tag} {windows_tag}",
-                                    self.image
+                        .with_steps({
+                            let mut steps = vec![
+                                Step::run("Login to registry", self.login_command()),
+                                Step::run(
+                                    "Merge manifests",
+                                    format!(
+                                        "docker buildx imagetools create -t {} {linux_tag} {windows_tag}",
+                                        self.image
+                                    ),
                                 ),
-                            ),
-                        ]),
+                            ];
+                            // imagetools needs no source checkout, but the
+                            // README sync reads README.md from disk
+                            if let Some(sync) = self.readme_sync_step() {
+                                steps.insert(0, Step::checkout());
+                                steps.push(sync);
+                            }
+                            steps
+                        }),
                 ]
             }
         }
@@ -276,6 +309,7 @@ mod tests {
         let rule = DockerRelease {
             image: "owner/app".to_string(),
             platforms: vec![],
+            sync_readme: false,
         };
         let job = &rule.jobs(&docker_facts())[0];
         assert!(job.tags_only);
@@ -301,6 +335,7 @@ mod tests {
             image: "owner/app".to_string(),
             // Deliberately unsorted; the emitted list is in ALL order
             platforms: vec![DockerPlatform::LinuxArm64, DockerPlatform::LinuxAmd64],
+            sync_readme: false,
         };
         let jobs = rule.jobs(&docker_facts());
         assert_eq!(jobs.len(), 1);
@@ -324,6 +359,7 @@ mod tests {
         let rule = DockerRelease {
             image: "owner/app".to_string(),
             platforms: vec![DockerPlatform::LinuxAmd64],
+            sync_readme: false,
         };
         let job = &rule.jobs(&docker_facts())[0];
         assert!(!job
@@ -341,6 +377,7 @@ mod tests {
         let rule = DockerRelease {
             image: "owner/app".to_string(),
             platforms: vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxArm64],
+            sync_readme: false,
         };
         let jobs = rule.jobs(&docker_facts());
         assert_eq!(jobs.len(), 3);
@@ -398,6 +435,7 @@ mod tests {
         let rule = DockerRelease {
             image: "owner/app".to_string(),
             platforms: vec![DockerPlatform::WindowsAmd64],
+            sync_readme: false,
         };
         let jobs = rule.jobs(&docker_facts());
         assert_eq!(jobs.len(), 1);
@@ -412,6 +450,7 @@ mod tests {
         let rule = DockerRelease {
             image: "ghcr.io/owner/app".to_string(),
             platforms: vec![],
+            sync_readme: false,
         };
         let job = &rule.jobs(&docker_facts())[0];
         assert_eq!(job.secrets, vec!["GITHUB_TOKEN"]);
@@ -430,6 +469,7 @@ mod tests {
         let rule = DockerRelease {
             image: "ghcr.io/owner/app".to_string(),
             platforms: vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxArm64],
+            sync_readme: false,
         };
         for job in rule.jobs(&docker_facts()) {
             assert_eq!(
@@ -446,6 +486,7 @@ mod tests {
         let rule = DockerRelease {
             image: "owner/app".to_string(),
             platforms: vec![],
+            sync_readme: false,
         };
         assert!(rule.jobs(&docker_facts())[0].permissions.is_empty());
         // Neither does a build that never pushes
@@ -453,5 +494,91 @@ mod tests {
             image: "ghcr.io/owner/app".to_string(),
         };
         assert!(build.jobs(&docker_facts())[0].permissions.is_empty());
+    }
+
+    const SYNC_STEP: &str = "Sync README to Docker Hub";
+
+    #[test]
+    fn test_sync_readme_appends_pushrm_step() {
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![],
+            sync_readme: true,
+        };
+        let job = &rule.jobs(&docker_facts())[0];
+        assert!(matches!(job.steps.last(), Some(Step::Run { name, .. }) if name == SYNC_STEP));
+        assert_eq!(
+            run_command(job, SYNC_STEP),
+            "docker run --rm -v \"$PWD\":/workspace -e DOCKER_USER=\"$DOCKER_USERNAME\" -e DOCKER_PASS=\"$DOCKER_PASSWORD\" chko/docker-pushrm:1 --file /workspace/README.md owner/app"
+        );
+        // The sync reuses the push secrets, so nothing extra is declared
+        assert_eq!(job.secrets, vec!["DOCKER_USERNAME", "DOCKER_PASSWORD"]);
+    }
+
+    #[test]
+    fn test_sync_readme_in_buildx_job() {
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64],
+            sync_readme: true,
+        };
+        let jobs = rule.jobs(&docker_facts());
+        assert_eq!(jobs.len(), 1);
+        assert!(matches!(jobs[0].steps.last(), Some(Step::Run { name, .. }) if name == SYNC_STEP));
+    }
+
+    #[test]
+    fn test_sync_readme_merge_job_gets_checkout() {
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxArm64],
+            sync_readme: true,
+        };
+        let jobs = rule.jobs(&docker_facts());
+        // Staging jobs push intermediate tags; only the merge job syncs
+        for staging in &jobs[..2] {
+            assert!(
+                !staging.steps.iter().any(|s| matches!(s, Step::Run { name, .. } if name == SYNC_STEP)),
+                "{}",
+                staging.id
+            );
+        }
+        let merge = &jobs[2];
+        assert!(matches!(merge.steps.first(), Some(Step::Checkout { .. })));
+        assert!(matches!(merge.steps.last(), Some(Step::Run { name, .. }) if name == SYNC_STEP));
+    }
+
+    #[test]
+    fn test_sync_readme_ignored_for_ghcr() {
+        let rule = DockerRelease {
+            image: "ghcr.io/owner/app".to_string(),
+            platforms: vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxArm64],
+            sync_readme: true,
+        };
+        let jobs = rule.jobs(&docker_facts());
+        for job in &jobs {
+            assert!(
+                !job.steps.iter().any(|s| matches!(s, Step::Run { name, .. } if name == SYNC_STEP)),
+                "{}",
+                job.id
+            );
+        }
+        // Without the sync the merge job keeps its no-checkout shape
+        assert!(!jobs[2].steps.iter().any(|s| matches!(s, Step::Checkout { .. })));
+    }
+
+    #[test]
+    fn test_sync_readme_ignored_on_windows_runner() {
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![DockerPlatform::WindowsAmd64],
+            sync_readme: true,
+        };
+        let jobs = rule.jobs(&docker_facts());
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs[0]
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Run { name, .. } if name == SYNC_STEP)));
     }
 }

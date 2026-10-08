@@ -173,6 +173,12 @@ pub struct DockerReleaseRule {
     /// the final tag becomes a merged multi-platform manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<DockerPlatform>>,
+    /// Sync README.md to the Docker Hub repository description during the
+    /// release job (via chko/docker-pushrm, reusing DOCKER_USERNAME and
+    /// DOCKER_PASSWORD). Docker Hub only — ignored for ghcr.io images and
+    /// Windows-only releases. Omit for off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_readme: Option<bool>,
 }
 
 /// A target platform for a multi-arch docker image
@@ -229,7 +235,10 @@ impl DockerRule {
 
 impl DockerReleaseRule {
     pub fn is_default(&self) -> bool {
-        self.enabled.is_none() && self.image_name.is_none() && self.platforms.is_none()
+        self.enabled.is_none()
+            && self.image_name.is_none()
+            && self.platforms.is_none()
+            && self.sync_readme.is_none()
     }
 }
 
@@ -490,6 +499,25 @@ mod tests {
         let ron_str = serialize_config(&config).unwrap();
         assert!(ron_str.contains("platforms"), "{ron_str}");
         assert!(!ron_str.contains("image_name"), "{ron_str}");
+        assert_eq!(parse_config(&ron_str).unwrap(), config);
+    }
+
+    #[test]
+    fn test_parse_sync_readme() {
+        let config = parse_config(r#"(docker_release: (sync_readme: true))"#).unwrap();
+        assert_eq!(config.docker_release.sync_readme, Some(true));
+        assert_eq!(config.docker_release.enabled, None);
+    }
+
+    #[test]
+    fn test_sync_readme_round_trip_is_delta_only() {
+        let mut config = CiboxConfig::default();
+        config.docker_release.sync_readme = Some(true);
+        assert!(!config.is_default());
+        let ron_str = serialize_config(&config).unwrap();
+        assert!(ron_str.contains("sync_readme"), "{ron_str}");
+        assert!(!ron_str.contains("image_name"), "{ron_str}");
+        assert!(!ron_str.contains("platforms"), "{ron_str}");
         assert_eq!(parse_config(&ron_str).unwrap(), config);
     }
 
