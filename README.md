@@ -69,6 +69,12 @@ stay deleted, and jobs you added are kept. Pass `--force` to rewrite the
 files from scratch instead — as the TUI does when it writes, see
 [Interactive editor](#interactive-editor).
 
+Turning every rule off (or deleting whatever the last rule detected on) prunes
+all of cibox's jobs, so `cibox update` is also how you hand a pipeline back to
+yourself. A file that would be left with no jobs at all is reported and left
+untouched, since every platform rejects an empty pipeline — delete it yourself
+if you no longer want it.
+
 ### Token permissions
 
 GitHub and Gitea workflows are generated with `permissions: contents: read`,

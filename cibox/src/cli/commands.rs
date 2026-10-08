@@ -74,6 +74,19 @@ pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: boo
     let planned = crate::generator::plan(&facts, &resolved, platform)
         .with_context(|| format!("Failed to generate CI configuration for {platform}"))?;
 
+    // With nothing enabled there is still work to do as long as a managed file
+    // exists: its cibox jobs are stale and get pruned below. Only when there is
+    // neither anything to write nor anything to prune is the empty resolution a
+    // mistake worth reporting.
+    let prunable = !force
+        && planned.iter().any(|file| {
+            std::fs::read_to_string(working_dir.join(&file.path))
+                .is_ok_and(|text| !text.trim().is_empty())
+        });
+    if planned.iter().all(|file| file.jobs.is_empty()) && !prunable {
+        anyhow::bail!("{}", crate::generator::NOTHING_ENABLED);
+    }
+
     println!();
     for file in planned {
         let output_path = working_dir.join(&file.path);
