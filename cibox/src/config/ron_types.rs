@@ -13,101 +13,101 @@ use crate::error::Result;
 pub struct CiboxConfig {
     /// Run cargo test with all features on every push. Accepts toolchain
     /// versions: "stable", "nightly", or "x.y[.z]".
-    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_test: VersionedRule,
     /// Check code formatting with cargo fmt
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_fmt: RuleToggle,
     /// Run clippy with warnings denied
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_clippy: RuleToggle,
     /// Audit dependencies for known vulnerabilities
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_audit: RuleToggle,
     /// Build documentation on nightly with RUSTDOCFLAGS=--cfg docsrs
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_doc: RuleToggle,
     /// Check the build with the rust-version declared in Cargo.toml
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_msrv: RuleToggle,
     /// Check all feature combinations are additive with cargo-hack
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_feature_combos: RuleToggle,
     /// Test with the minimal dependency versions Cargo.toml permits
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_minimal_versions: RuleToggle,
     /// Publish to crates.io on version tags (requires CARGO_REGISTRY_TOKEN)
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub rust_release: RuleToggle,
     /// Install the package and run pytest on every push. Accepts toolchain
     /// versions as tags of the official python image, e.g. "3.13".
-    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub python_test: VersionedRule,
     /// Lint with ruff
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub python_lint: RuleToggle,
     /// Check code formatting with ruff
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub python_fmt: RuleToggle,
     /// Build and upload to PyPI on version tags (requires TWINE_PASSWORD)
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub python_release: RuleToggle,
     /// Run go test on every push. Accepts toolchain versions as tags of the
     /// official golang image, e.g. "1.24".
-    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub go_test: VersionedRule,
     /// Compile all packages
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub go_build: RuleToggle,
     /// Lint with golangci-lint
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub go_lint: RuleToggle,
     /// Scan for security problems with gosec
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub go_audit: RuleToggle,
     /// Install dependencies and run the package.json test script. Accepts
     /// toolchain versions as tags of the official node image, e.g. "22";
     /// ignored for bun projects.
-    #[serde(skip_serializing_if = "VersionedRule::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub node_test: VersionedRule,
     /// Run the package.json lint script
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub node_lint: RuleToggle,
     /// Type-check TypeScript with tsc --noEmit. Needs `typescript` among the
     /// project's dependencies: the compiler is run from node_modules/.bin,
     /// never downloaded.
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub node_typecheck: RuleToggle,
     /// Check formatting with prettier. Needs `prettier` among the project's
     /// dependencies, as above.
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub node_fmt: RuleToggle,
     /// Run zig build test on every push
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub zig_test: RuleToggle,
     /// Check formatting with zig fmt
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub zig_fmt: RuleToggle,
     /// Compile the project with zig build
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub zig_build: RuleToggle,
     /// Configure, build, and run ctest
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub cmake_test: RuleToggle,
     /// Configure and build with CMake in Release mode
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub cmake_build: RuleToggle,
     /// Check formatting with clang-format (requires .clang-format)
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub cmake_fmt: RuleToggle,
     /// Build the Dockerfile on every push
-    #[serde(skip_serializing_if = "DockerRule::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub docker_build: DockerRule,
     /// Build and push the image to a registry on version tags
-    #[serde(skip_serializing_if = "DockerReleaseRule::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub docker_release: DockerReleaseRule,
     /// Scan the full git history for hardcoded secrets
-    #[serde(skip_serializing_if = "RuleToggle::is_default")]
+    #[serde(skip_serializing_if = "is_default")]
     pub gitleaks: RuleToggle,
 }
 
@@ -131,12 +131,6 @@ pub struct VersionedRule {
     /// job matrix. A single version pins the image; omit for the default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub versions: Option<Vec<String>>,
-}
-
-impl VersionedRule {
-    pub fn is_default(&self) -> bool {
-        self.enabled.is_none() && self.versions.is_none()
-    }
 }
 
 /// Override for the docker-build rule: toggle plus image name
@@ -228,126 +222,100 @@ impl DockerPlatform {
     }
 }
 
-impl RuleToggle {
-    pub fn is_default(&self) -> bool {
-        self.enabled.is_none()
-    }
+/// Whether a value still holds every one of its defaults. A rule entry that
+/// overrides nothing is left out of the serialized document, which is what
+/// keeps cibox.ron delta-only; asking `Default` means a newly added knob is
+/// covered without a second list of fields to keep in step.
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
-impl DockerRule {
-    pub fn is_default(&self) -> bool {
-        self.enabled.is_none() && self.image_name.is_none()
-    }
+/// The `CiboxConfig` field a kebab-case rule id maps to
+fn field_name(rule_id: &str) -> String {
+    rule_id.replace('-', "_")
 }
 
-impl DockerReleaseRule {
-    pub fn is_default(&self) -> bool {
-        self.enabled.is_none()
-            && self.image_name.is_none()
-            && self.platforms.is_none()
-            && self.sync_readme.is_none()
-    }
+/// Define the id-keyed override accessors from one list of [`CiboxConfig`]
+/// fields. A rule's id is its field name in kebab-case, so the ids are
+/// derived instead of written out a second time, and a rule cannot end up
+/// readable through the getter but silently ignored by the setter.
+macro_rules! rule_overrides {
+    (enabled: [$($rule:ident),+ $(,)?], versions: [$($versioned:ident),+ $(,)?] $(,)?) => {
+        impl CiboxConfig {
+            /// The `enabled` override for a rule by its kebab-case id
+            pub fn enabled_override(&self, rule_id: &str) -> Option<bool> {
+                match field_name(rule_id).as_str() {
+                    $(stringify!($rule) => self.$rule.enabled,)+
+                    _ => None,
+                }
+            }
+
+            /// Set the `enabled` override for a rule by its kebab-case id
+            pub fn set_enabled_override(&mut self, rule_id: &str, enabled: Option<bool>) {
+                match field_name(rule_id).as_str() {
+                    $(stringify!($rule) => self.$rule.enabled = enabled,)+
+                    _ => {}
+                }
+            }
+
+            /// The `versions` override for a test rule by its kebab-case id
+            pub fn versions_override(&self, rule_id: &str) -> Option<&Vec<String>> {
+                match field_name(rule_id).as_str() {
+                    $(stringify!($versioned) => self.$versioned.versions.as_ref(),)+
+                    _ => None,
+                }
+            }
+
+            /// Set the `versions` override for a test rule by its kebab-case id
+            pub fn set_versions_override(&mut self, rule_id: &str, versions: Option<Vec<String>>) {
+                match field_name(rule_id).as_str() {
+                    $(stringify!($versioned) => self.$versioned.versions = versions,)+
+                    _ => {}
+                }
+            }
+        }
+    };
+}
+
+rule_overrides! {
+    enabled: [
+        rust_test,
+        rust_fmt,
+        rust_clippy,
+        rust_audit,
+        rust_doc,
+        rust_msrv,
+        rust_feature_combos,
+        rust_minimal_versions,
+        rust_release,
+        python_test,
+        python_lint,
+        python_fmt,
+        python_release,
+        go_test,
+        go_build,
+        go_lint,
+        go_audit,
+        node_test,
+        node_lint,
+        node_typecheck,
+        node_fmt,
+        zig_test,
+        zig_fmt,
+        zig_build,
+        cmake_test,
+        cmake_build,
+        cmake_fmt,
+        docker_build,
+        docker_release,
+        gitleaks,
+    ],
+    versions: [rust_test, python_test, go_test, node_test],
 }
 
 impl CiboxConfig {
     pub fn is_default(&self) -> bool {
-        self == &CiboxConfig::default()
-    }
-
-    /// The `enabled` override for a rule by its kebab-case id
-    pub fn enabled_override(&self, rule_id: &str) -> Option<bool> {
-        match rule_id {
-            "rust-test" => self.rust_test.enabled,
-            "rust-fmt" => self.rust_fmt.enabled,
-            "rust-clippy" => self.rust_clippy.enabled,
-            "rust-audit" => self.rust_audit.enabled,
-            "rust-doc" => self.rust_doc.enabled,
-            "rust-msrv" => self.rust_msrv.enabled,
-            "rust-feature-combos" => self.rust_feature_combos.enabled,
-            "rust-minimal-versions" => self.rust_minimal_versions.enabled,
-            "rust-release" => self.rust_release.enabled,
-            "python-test" => self.python_test.enabled,
-            "python-lint" => self.python_lint.enabled,
-            "python-fmt" => self.python_fmt.enabled,
-            "python-release" => self.python_release.enabled,
-            "go-test" => self.go_test.enabled,
-            "go-build" => self.go_build.enabled,
-            "go-lint" => self.go_lint.enabled,
-            "go-audit" => self.go_audit.enabled,
-            "node-test" => self.node_test.enabled,
-            "node-lint" => self.node_lint.enabled,
-            "node-typecheck" => self.node_typecheck.enabled,
-            "node-fmt" => self.node_fmt.enabled,
-            "zig-test" => self.zig_test.enabled,
-            "zig-fmt" => self.zig_fmt.enabled,
-            "zig-build" => self.zig_build.enabled,
-            "cmake-test" => self.cmake_test.enabled,
-            "cmake-build" => self.cmake_build.enabled,
-            "cmake-fmt" => self.cmake_fmt.enabled,
-            "docker-build" => self.docker_build.enabled,
-            "docker-release" => self.docker_release.enabled,
-            "gitleaks" => self.gitleaks.enabled,
-            _ => None,
-        }
-    }
-
-    /// The `versions` override for a test rule by its kebab-case id
-    pub fn versions_override(&self, rule_id: &str) -> Option<&Vec<String>> {
-        match rule_id {
-            "rust-test" => self.rust_test.versions.as_ref(),
-            "python-test" => self.python_test.versions.as_ref(),
-            "go-test" => self.go_test.versions.as_ref(),
-            "node-test" => self.node_test.versions.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// Set the `versions` override for a test rule by its kebab-case id
-    pub fn set_versions_override(&mut self, rule_id: &str, versions: Option<Vec<String>>) {
-        match rule_id {
-            "rust-test" => self.rust_test.versions = versions,
-            "python-test" => self.python_test.versions = versions,
-            "go-test" => self.go_test.versions = versions,
-            "node-test" => self.node_test.versions = versions,
-            _ => {}
-        }
-    }
-
-    /// Set the `enabled` override for a rule by its kebab-case id
-    pub fn set_enabled_override(&mut self, rule_id: &str, enabled: Option<bool>) {
-        match rule_id {
-            "rust-test" => self.rust_test.enabled = enabled,
-            "rust-fmt" => self.rust_fmt.enabled = enabled,
-            "rust-clippy" => self.rust_clippy.enabled = enabled,
-            "rust-audit" => self.rust_audit.enabled = enabled,
-            "rust-doc" => self.rust_doc.enabled = enabled,
-            "rust-msrv" => self.rust_msrv.enabled = enabled,
-            "rust-feature-combos" => self.rust_feature_combos.enabled = enabled,
-            "rust-minimal-versions" => self.rust_minimal_versions.enabled = enabled,
-            "rust-release" => self.rust_release.enabled = enabled,
-            "python-test" => self.python_test.enabled = enabled,
-            "python-lint" => self.python_lint.enabled = enabled,
-            "python-fmt" => self.python_fmt.enabled = enabled,
-            "python-release" => self.python_release.enabled = enabled,
-            "go-test" => self.go_test.enabled = enabled,
-            "go-build" => self.go_build.enabled = enabled,
-            "go-lint" => self.go_lint.enabled = enabled,
-            "go-audit" => self.go_audit.enabled = enabled,
-            "node-test" => self.node_test.enabled = enabled,
-            "node-lint" => self.node_lint.enabled = enabled,
-            "node-typecheck" => self.node_typecheck.enabled = enabled,
-            "node-fmt" => self.node_fmt.enabled = enabled,
-            "zig-test" => self.zig_test.enabled = enabled,
-            "zig-fmt" => self.zig_fmt.enabled = enabled,
-            "zig-build" => self.zig_build.enabled = enabled,
-            "cmake-test" => self.cmake_test.enabled = enabled,
-            "cmake-build" => self.cmake_build.enabled = enabled,
-            "cmake-fmt" => self.cmake_fmt.enabled = enabled,
-            "docker-build" => self.docker_build.enabled = enabled,
-            "docker-release" => self.docker_release.enabled = enabled,
-            "gitleaks" => self.gitleaks.enabled = enabled,
-            _ => {}
-        }
+        is_default(self)
     }
 }
 

@@ -835,6 +835,22 @@ mod tests {
         assert!(state.config.is_default());
     }
 
+    /// A rule listed here but missing from the `versions` list in
+    /// `rule_overrides!` would render an editable version list whose edits go
+    /// nowhere, so the two have to agree
+    #[test]
+    fn test_every_versioned_rule_has_a_versions_slot() {
+        for (id, _) in VERSIONED_RULES {
+            let mut config = CiboxConfig::default();
+            config.set_versions_override(id, Some(vec!["1".to_string()]));
+            assert_eq!(
+                config.versions_override(id),
+                Some(&vec!["1".to_string()]),
+                "rule {id} is missing from the CiboxConfig versions mapping"
+            );
+        }
+    }
+
     #[test]
     fn test_delete_only_acts_on_version_rows() {
         let dir = rust_dir();

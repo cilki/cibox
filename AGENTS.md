@@ -38,8 +38,10 @@ To add a rule:
    (or a new file), and register it in `resolve()` in `rules/mod.rs`.
 2. Add a snake_case field for it to `CiboxConfig` in
    `cibox/src/config/ron_types.rs` (type `RuleToggle`, or a dedicated struct
-   if the rule has knobs) and extend `enabled_override` /
-   `set_enabled_override`. A unit test checks the id ↔ field mapping.
+   if the rule has knobs) and name the field in the `rule_overrides!` list
+   below it — the id-keyed accessors are generated from that one list, and a
+   rule's kebab-case id is just its field name. A unit test checks that every
+   rule has an entry.
 3. Give it a doc comment on the `CiboxConfig` field — roniker surfaces it in
    the LSP.
 
