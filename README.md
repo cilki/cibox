@@ -93,6 +93,30 @@ yourself. A file that would be left with no jobs at all is reported and left
 untouched, since every platform rejects an empty pipeline — delete it yourself
 if you no longer want it.
 
+### Secrets
+
+Only the release rules need credentials, and each reads them from the
+environment under a fixed name:
+
+| Rule | Secrets |
+|---|---|
+| `rust-release` | `CARGO_REGISTRY_TOKEN` |
+| `python-release` | `TWINE_PASSWORD` (the username is always `__token__`) |
+| `docker-release` | `DOCKER_USERNAME` and `DOCKER_PASSWORD`, or `GITHUB_TOKEN` for a `ghcr.io` image |
+| `aur-release` | `AUR_SSH_PRIVATE_KEY` |
+
+On GitHub and Gitea the generated job wires each one up for you
+(`CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}`), so adding the
+secret to the repository is all that is left to do — and `GITHUB_TOKEN` is
+already there, since the runner hands it to every job. GitLab and CircleCI
+take their variables from the project settings instead, so there is nothing to
+reference in the pipeline — cibox lists what the jobs expect in a comment at
+the top of the generated file:
+
+```yaml
+# Required CI variables: CARGO_REGISTRY_TOKEN, DOCKER_PASSWORD, DOCKER_USERNAME
+```
+
 ### Token permissions
 
 GitHub and Gitea workflows are generated with `permissions: contents: read`, so
@@ -161,10 +185,20 @@ has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and `DOCKER_PASSWOR
 secrets. If the credentials aren't configured in CI, the login is skipped, for
 registries that don't require any.
 
-`sync_readme` additionally pushes `README.md` to the Docker Hub repository
+`docker-release` can also push `README.md` to the Docker Hub repository
 description once the image is released, reusing the same two secrets. It is
-Docker Hub only — `ghcr.io` has no description API — and like the login it is
-skipped when the credentials aren't configured or there is no `README.md`.
+off until you ask for it:
+
+```ron
+(
+    docker_release: (sync_readme: true),
+)
+```
+
+The sync is Docker Hub only — `ghcr.io` has no description API, so the knob is
+ignored for those images, as it is for a Windows-only release (the tool it
+runs is a Linux container) — and like the login it is skipped at run time when
+the credentials aren't configured or there is no `README.md`.
 
 ### Multi-arch docker images
 
@@ -261,11 +295,12 @@ right, with the lines that differ from the file already on disk highlighted.
 | `w`              | write the pipeline files                                          |
 | `q`/`Esc`        | quit                                                              |
 
-Expanding `docker-build`/`docker-release` shows the image name and the target
-platforms, `aur-release` its comma-separated package list, and `android-build`
-its project directory, apt packages, and rust toolchain; expanding a test rule
-shows its `versions` list, where `Enter` on the trailing add row appends a
-toolchain version and `d` removes the one under the cursor.
+Expanding `docker-build`/`docker-release` shows the image name, and
+`docker-release` additionally the `sync_readme` checkbox and the target
+platforms; `aur-release` shows its comma-separated package list, and
+`android-build` its project directory, apt packages, and rust toolchain;
+expanding a test rule shows its `versions` list, where `Enter` on the trailing
+add row appends a toolchain version and `d` removes the one under the cursor.
 
 Toggling a rule or changing a knob saves `cibox.ron` right away — there is no
 separate save key for it, and the file stays delta-only, so flipping a rule back
