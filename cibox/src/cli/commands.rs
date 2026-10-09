@@ -205,7 +205,14 @@ pub fn handle_detect(dir: &str) -> Result<()> {
         );
     }
     if let Some(node) = &facts.node {
-        println!("  {} Node ({})", "✓".green(), node.package_manager.as_str());
+        println!(
+            "  {} Node ({}{})",
+            "✓".green(),
+            node.package_manager.as_str(),
+            // Classic and Modern take different install flags and lay the
+            // project out differently, so which one it is matters
+            if node.yarn_berry { " modern" } else { "" },
+        );
         println!("    typescript: {}", yes_no(node.has_tsconfig));
     }
     if facts.zig.is_some() {

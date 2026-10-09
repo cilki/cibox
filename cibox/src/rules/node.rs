@@ -30,7 +30,15 @@ fn install_steps(n: &NodeFacts) -> Vec<Step> {
         )],
         NodePackageManager::Yarn => vec![
             Step::run("Enable corepack", "corepack enable"),
-            Step::run("Install dependencies", "yarn install --frozen-lockfile"),
+            Step::run(
+                "Install dependencies",
+                if n.yarn_berry {
+                    // Modern renamed the flag and errors out on the old one
+                    "yarn install --immutable"
+                } else {
+                    "yarn install --frozen-lockfile"
+                },
+            ),
         ],
         NodePackageManager::Pnpm => vec![
             Step::run("Enable corepack", "corepack enable"),
@@ -56,34 +64,53 @@ fn run_script(n: &NodeFacts, script: &str) -> String {
     }
 }
 
-/// Run a tool the install step put in the project's `node_modules/.bin`.
+/// Run a tool the install step installed as part of the project.
 ///
-/// Spelled as a path rather than through `npx`/`bunx` on purpose. Both of
-/// those fall back to *downloading* a package of that name from the registry
-/// and running it when the binary isn't there, which silently puts an
-/// unpinned, unreviewed third party in the pipeline — and resolution is by
-/// binary name, so `npx tsc` fetches the unrelated `tsc` package rather than
-/// `typescript`. Every package manager cibox emits for installs binaries
-/// here, so a missing one means the project didn't declare the tool: the job
-/// should fail saying so, not reach for the network.
-fn local_bin(cmd: &str) -> String {
-    format!("./node_modules/.bin/{cmd}")
+/// Spelled out rather than run through `npx`/`bunx` on purpose. Both of those
+/// fall back to *downloading* a package of that name from the registry and
+/// running it when the binary isn't there, which silently puts an unpinned,
+/// unreviewed third party in the pipeline — and resolution is by binary name,
+/// so `npx tsc` fetches the unrelated `tsc` package rather than `typescript`.
+/// A missing binary means the project didn't declare the tool: the job should
+/// fail saying so, not reach for the network.
+///
+/// Yarn Modern defaults to the Plug'n'Play linker, which installs no
+/// `node_modules` directory at all, so there its binaries are reached through
+/// `yarn exec` — which likewise resolves only within the project and never
+/// fetches (that is `yarn dlx`). Everything else lays out `node_modules/.bin`.
+fn tool(n: &NodeFacts, cmd: &str) -> String {
+    if n.yarn_berry {
+        format!("yarn exec {cmd}")
+    } else {
+        format!("./node_modules/.bin/{cmd}")
+    }
 }
 
 /// Base job with the per-manager image and a project-relative dependency
 /// cache (GitLab caches must live inside the project directory)
 fn base_job(id: &str, name: &str, stage: Stage, timeout: u32, n: &NodeFacts) -> Job {
     let (cache_env, cache_path) = match n.package_manager {
-        NodePackageManager::Npm => (Some(("npm_config_cache", ".npm-cache")), ".npm-cache/"),
-        NodePackageManager::Yarn => (Some(("YARN_CACHE_FOLDER", ".yarn-cache")), ".yarn-cache/"),
-        NodePackageManager::Pnpm => (None, ".pnpm-store/"),
-        NodePackageManager::Bun => (Some(("BUN_INSTALL_CACHE_DIR", ".bun-cache")), ".bun-cache/"),
+        NodePackageManager::Npm => (vec![("npm_config_cache", ".npm-cache")], ".npm-cache/"),
+        // Modern ignores cacheFolder entirely while enableGlobalCache is on
+        // (its default), and puts the cache under $HOME instead — where no
+        // backend can cache it. Turning that off makes YARN_CACHE_FOLDER
+        // count again.
+        NodePackageManager::Yarn if n.yarn_berry => (
+            vec![
+                ("YARN_ENABLE_GLOBAL_CACHE", "false"),
+                ("YARN_CACHE_FOLDER", ".yarn-cache"),
+            ],
+            ".yarn-cache/",
+        ),
+        NodePackageManager::Yarn => (vec![("YARN_CACHE_FOLDER", ".yarn-cache")], ".yarn-cache/"),
+        NodePackageManager::Pnpm => (vec![], ".pnpm-store/"),
+        NodePackageManager::Bun => (vec![("BUN_INSTALL_CACHE_DIR", ".bun-cache")], ".bun-cache/"),
     };
     let mut job = Job::new(id, name, stage)
         .with_image(image(n))
         .with_timeout(timeout)
         .with_cache("node-cache", vec![cache_path.to_string()]);
-    if let Some((key, value)) = cache_env {
+    for (key, value) in cache_env {
         job = job.with_env(key, value);
     }
     job
@@ -198,7 +225,7 @@ impl Rule for NodeTypecheck {
         vec![
             base_job(self.id(), self.name(), Stage::Lint, 15, &n).with_steps(steps_with_install(
                 &n,
-                Step::run("Type-check", local_bin("tsc --noEmit")),
+                Step::run("Type-check", tool(&n, "tsc --noEmit")),
             )),
         ]
     }
@@ -234,7 +261,7 @@ impl Rule for NodeFmt {
         vec![
             base_job(self.id(), self.name(), Stage::Lint, 10, &n).with_steps(steps_with_install(
                 &n,
-                Step::run("Check formatting", local_bin("prettier --check .")),
+                Step::run("Check formatting", tool(&n, "prettier --check .")),
             )),
         ]
     }
@@ -424,6 +451,140 @@ mod tests {
         let jobs = rule.jobs(&facts);
         assert_eq!(jobs[0].image.as_deref(), Some("oven/bun:1"));
         assert_eq!(jobs[0].matrix, None);
+    }
+
+    const BERRY_PACKAGE_JSON: &str = r#"{
+        "packageManager": "yarn@4.6.0",
+        "scripts": {"test": "vitest run"},
+        "devDependencies": {"typescript": "^5", "prettier": "^3"}
+    }"#;
+
+    fn berry_facts() -> ProjectFacts {
+        facts_with(&[
+            ("package.json", BERRY_PACKAGE_JSON),
+            ("yarn.lock", "__metadata:\n  version: 8\n"),
+            (".yarnrc.yml", "nodeLinker: pnp\n"),
+            ("tsconfig.json", "{}"),
+            (".prettierrc", "{}"),
+        ])
+    }
+
+    fn classic_facts() -> ProjectFacts {
+        facts_with(&[
+            (
+                "package.json",
+                r#"{"scripts": {"test": "jest"}, "devDependencies": {"typescript": "^5", "prettier": "^3"}}"#,
+            ),
+            ("yarn.lock", "# yarn lockfile v1\n"),
+            ("tsconfig.json", "{}"),
+            (".prettierrc", "{}"),
+        ])
+    }
+
+    fn commands(facts: &ProjectFacts) -> Vec<String> {
+        [
+            NodeTest::default().jobs(facts),
+            NodeTypecheck.jobs(facts),
+            NodeFmt.jobs(facts),
+        ]
+        .concat()
+        .iter()
+        .flat_map(|job| job.steps.clone())
+        .filter_map(|step| match step {
+            Step::Run { command, .. } => Some(command),
+            _ => None,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn test_yarn_modern_installs_with_immutable() {
+        // Modern renamed --frozen-lockfile to --immutable and rejects the old
+        // name outright ("Unsupported option name"), so every job in the
+        // pipeline died on its install step
+        let commands = commands(&berry_facts());
+        assert!(
+            commands.contains(&"yarn install --immutable".to_string()),
+            "{commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("--frozen-lockfile")),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn test_yarn_classic_keeps_frozen_lockfile() {
+        // Classic has no --immutable
+        let commands = commands(&classic_facts());
+        assert!(
+            commands.contains(&"yarn install --frozen-lockfile".to_string()),
+            "{commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("--immutable")),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn test_yarn_modern_runs_tools_through_yarn_exec() {
+        // Modern's default Plug'n'Play linker writes no node_modules at all,
+        // so the ./node_modules/.bin path is simply not there. `yarn exec`
+        // resolves within the project the same way, and still never fetches
+        // (that is `yarn dlx`).
+        let commands = commands(&berry_facts());
+        assert!(
+            commands.contains(&"yarn exec tsc --noEmit".to_string()),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&"yarn exec prettier --check .".to_string()),
+            "{commands:?}"
+        );
+        for command in &commands {
+            assert!(!command.contains("node_modules/.bin"), "{command}");
+            assert!(!command.starts_with("yarn dlx"), "{command}");
+            assert!(!command.starts_with("npx "), "{command}");
+        }
+    }
+
+    #[test]
+    fn test_yarn_classic_runs_tools_from_node_modules() {
+        let commands = commands(&classic_facts());
+        assert!(
+            commands.contains(&"./node_modules/.bin/tsc --noEmit".to_string()),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&"./node_modules/.bin/prettier --check .".to_string()),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn test_yarn_modern_cache_is_not_left_under_home() {
+        // Modern ignores cacheFolder while enableGlobalCache is on (its
+        // default) and caches under $HOME, outside anything the backends
+        // archive — so the cached path would stay empty forever
+        let job = &NodeTest::default().jobs(&berry_facts())[0];
+        assert_eq!(
+            job.cache.as_ref().unwrap().paths,
+            vec![".yarn-cache/".to_string()]
+        );
+        let env = |key: &str| {
+            job.env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env("YARN_ENABLE_GLOBAL_CACHE"), Some("false"));
+        assert_eq!(env("YARN_CACHE_FOLDER"), Some(".yarn-cache"));
+
+        // Classic has no global cache to turn off
+        let job = &NodeTest::default().jobs(&classic_facts())[0];
+        let keys: Vec<&str> = job.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["YARN_CACHE_FOLDER"]);
     }
 
     #[test]
