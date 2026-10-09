@@ -155,6 +155,12 @@ Anything else is rejected by `cibox validate`. The default is derived from the
 git remote (or the directory name) and normalized to fit, so a `Fossable/CiBox`
 remote becomes `fossable/cibox`.
 
+`docker-release` pushes the image under two tags of its own: `latest` and the
+name of the git tag that triggered the release. An `image_name` that already
+carries a `:tag` keeps it as a prefix on both — `example/app:edge` releases as
+`example/app:edge-latest` and `example/app:edge-1.2.3` — since
+`example/app:edge:latest` is not a reference docker would accept.
+
 The registry is inferred from the image name. `docker-release` logs in to
 `ghcr.io` with `GITHUB_TOKEN`, and everywhere else — the host prefix if the name
 has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and `DOCKER_PASSWORD`
@@ -182,13 +188,15 @@ default. Listing `platforms` turns it into a multi-arch build:
 
 The available platforms are `LinuxAmd64`, `LinuxArm64`, `LinuxArmV7`,
 `LinuxRiscv64`, and `WindowsAmd64`. Linux targets build together in one
-`docker buildx` job, with QEMU set up when a foreign architecture is involved.
-`WindowsAmd64` can't be emulated, so it gets its own job on a Windows runner —
-that means GitHub Actions or Gitea Actions only (GitLab and CircleCI refuse to
-generate), and the same Dockerfile has to work from a Windows base image. Mixing
-Linux and Windows targets emits three jobs: the two per-OS builds push staging
-tags and a third merges them into one multi-platform manifest, so `image_name`
-must not already carry a tag.
+`docker buildx` job, with QEMU set up when a foreign architecture is
+involved. `WindowsAmd64` can't be emulated, so it gets its own job on a
+Windows runner — that means GitHub Actions or Gitea Actions only (GitLab and
+CircleCI refuse to generate), and the same Dockerfile has to work from a
+Windows base image. Mixing Linux and Windows targets emits three jobs: the
+two per-OS builds push staging tags (`:linux` and `:windows-amd64`, or
+`:<tag>-linux` and `:<tag>-windows-amd64` when `image_name` carries a tag of
+its own) and a third merges them into one multi-platform manifest under the
+release tags.
 
 ### Publishing to the AUR
 

@@ -1,5 +1,5 @@
 use super::Rule;
-use crate::config::image::registry_host;
+use crate::config::image::{registry_host, with_tag_suffix};
 use crate::config::DockerPlatform;
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
@@ -54,7 +54,8 @@ impl Rule for DockerBuild {
 const READ_VERSION: &str = "version=\"$(git describe --tags --exact-match)\"; ";
 
 /// Push the image to a registry when a version tag is pushed. The image is
-/// pushed under two tags: `latest` and the name of the git tag.
+/// pushed under two tags: `latest` and the name of the git tag — folded into
+/// the tag `image` already carries, if it carries one at all.
 /// The registry is inferred from the image name: a `ghcr.io/` prefix logs in
 /// to the GitHub Container Registry with GITHUB_TOKEN, any other host prefix
 /// logs in to that registry with Docker Hub-style credentials, and a bare
@@ -65,8 +66,8 @@ const READ_VERSION: &str = "version=\"$(git describe --tags --exact-match)\"; ";
 /// `WindowsAmd64` cannot be emulated, so it gets its own Windows-runner job
 /// (the same Dockerfile must support a Windows base image); when linux and
 /// windows are mixed, both jobs push staging tags and a final job merges them
-/// into one multi-platform manifest. Staging tags are appended to `image`, so
-/// the image name must not already carry a tag.
+/// into one multi-platform manifest. The staging tags are derived from
+/// `image`, folding into whatever tag it already carries.
 pub struct DockerRelease {
     pub image: String,
     /// Target platforms; empty = single-arch build/push on the host runner
@@ -88,9 +89,18 @@ impl DockerRelease {
     /// reject rather than becoming shell.
     fn release_tag_flags(&self) -> String {
         format!(
-            "-t {image}:latest -t \"{image}:$version\"",
-            image = self.image
+            "-t {latest} -t \"{versioned}\"",
+            latest = self.release_tag("latest"),
+            versioned = self.release_tag("$version"),
         )
+    }
+
+    /// The final reference for one of the release tags. An `image` that
+    /// already carries a tag of its own folds it into the release tag
+    /// (`owner/app:edge` → `owner/app:edge-latest`), because
+    /// `owner/app:edge:latest` is not a reference docker will accept.
+    fn release_tag(&self, suffix: &str) -> String {
+        with_tag_suffix(&self.image, suffix)
     }
 
     /// The login step skips at runtime when the credentials aren't
@@ -224,16 +234,17 @@ impl DockerRelease {
     /// `tag` (the Windows-runner job — Windows images can't be cross-built
     /// with buildx), or of the final release tags when `tag` is `None`
     fn build_push_steps(&self, facts: &ProjectFacts, tag: Option<&str>) -> Vec<Step> {
+        let latest = self.release_tag("latest");
         let build_tag = match tag {
             Some(tag) => tag.to_string(),
-            None => format!("{}:latest", self.image),
+            None => latest.clone(),
         };
         let push = match tag {
             Some(tag) => format!("docker push {tag}"),
             None => format!(
-                "{READ_VERSION}docker tag {image}:latest \"{image}:$version\"; \
-                 docker push {image}:latest; docker push \"{image}:$version\"",
-                image = self.image
+                "{READ_VERSION}docker tag {latest} \"{versioned}\"; \
+                 docker push {latest}; docker push \"{versioned}\"",
+                versioned = self.release_tag("$version"),
             ),
         };
         vec![
@@ -315,8 +326,8 @@ impl Rule for DockerRelease {
             }
             // Mixed: stage per-OS images, then merge into one manifest
             (false, false) => {
-                let linux_tag = format!("{}:linux", self.image);
-                let windows_tag = format!("{}:windows-amd64", self.image);
+                let linux_tag = with_tag_suffix(&self.image, "linux");
+                let windows_tag = with_tag_suffix(&self.image, "windows-amd64");
                 vec![
                     self.release_job("-linux", "Docker push (linux)")
                         .with_timeout(60)
@@ -523,6 +534,54 @@ mod tests {
             assert_eq!(job.secrets, vec!["DOCKER_PASSWORD"], "{}", job.id);
             assert_eq!(job.variables, vec!["DOCKER_USERNAME"], "{}", job.id);
         }
+    }
+
+    #[test]
+    fn test_mixed_platforms_keep_an_existing_tag() {
+        let rule = DockerRelease {
+            image: "ghcr.io/owner/app:edge".to_string(),
+            platforms: vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxAmd64],
+            sync_readme: false,
+        };
+        let jobs = rule.jobs(&docker_facts());
+        // Both the staging tags and the release tags fold into `edge` rather
+        // than appending a second colon, which every one of these commands
+        // would reject outright
+        assert_eq!(
+            run_command(&jobs[0], "Build and push image"),
+            "docker buildx build --platform linux/amd64 -t ghcr.io/owner/app:edge-linux --push ."
+        );
+        assert_eq!(
+            run_command(&jobs[1], "Build image"),
+            "docker build -t ghcr.io/owner/app:edge-windows-amd64 ."
+        );
+        assert_eq!(
+            run_command(&jobs[2], "Merge manifests"),
+            "version=\"$(git describe --tags --exact-match)\"; \
+             docker buildx imagetools create -t ghcr.io/owner/app:edge-latest \
+             -t \"ghcr.io/owner/app:edge-$version\" \
+             ghcr.io/owner/app:edge-linux ghcr.io/owner/app:edge-windows-amd64"
+        );
+    }
+
+    #[test]
+    fn test_single_arch_release_keeps_an_existing_tag() {
+        let rule = DockerRelease {
+            image: "owner/app:edge".to_string(),
+            platforms: vec![],
+            sync_readme: false,
+        };
+        let job = &rule.jobs(&docker_facts())[0];
+        assert_eq!(
+            run_command(job, "Build image"),
+            "docker build -t owner/app:edge-latest ."
+        );
+        assert_eq!(
+            run_command(job, "Push image"),
+            "version=\"$(git describe --tags --exact-match)\"; \
+             docker tag owner/app:edge-latest \"owner/app:edge-$version\"; \
+             docker push owner/app:edge-latest; docker push \"owner/app:edge-$version\""
+        );
     }
 
     #[test]
