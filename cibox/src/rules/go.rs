@@ -2,10 +2,33 @@ use super::{with_versions, Rule};
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
 
-pub(crate) const IMAGE: &str = "golang:1.23";
+/// Default toolchain image. Kept on a supported Go release: the go command
+/// honours the `go` directive of whatever it is asked to build, and anything
+/// newer than the image makes it fetch a second toolchain mid-job (see the
+/// tool pins below), which is one more unpinned download in the pipeline.
+pub(crate) const IMAGE: &str = "golang:1.27";
 
 /// Workspace-local directory holding both Go caches
 const CACHE_DIR: &str = ".go-cache";
+
+/// The pinned linter, installed by `go-lint`.
+///
+/// `go install <module>@latest` is a mutable pointer: what a user's pipeline
+/// executes changes without any change in their repository and without a diff
+/// for anyone to review, so an upstream release that is broken or compromised
+/// lands in CI on the next run. A version pin is immutable, the module proxy
+/// and checksum database verify it, and an upgrade becomes a reviewable change
+/// to this line.
+///
+/// The pin also repairs the module path. golangci-lint published v2 under
+/// `/v2`, and `@latest` on the old path cannot resolve past the last v1 — so
+/// the unpinned command has been installing v1.64.8 (March 2025) ever since,
+/// and would have kept installing it forever.
+const GOLANGCI_LINT: &str = "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0";
+
+/// The pinned security scanner installed by `go-audit`, pinned for the
+/// reasons on [`GOLANGCI_LINT`]
+const GOSEC: &str = "github.com/securego/gosec/v2/cmd/gosec@v2.29.0";
 
 fn is_go(facts: &ProjectFacts) -> bool {
     facts.go.is_some()
@@ -134,7 +157,7 @@ impl Rule for GoLint {
                 redirect_caches(),
                 Step::run(
                     "Install golangci-lint",
-                    "go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest",
+                    format!("go install {GOLANGCI_LINT}"),
                 ),
                 Step::run("Run golangci-lint", "golangci-lint run"),
             ])]
@@ -168,10 +191,7 @@ impl Rule for GoAudit {
             .with_steps(vec![
                 Step::checkout(),
                 redirect_caches(),
-                Step::run(
-                    "Install gosec",
-                    "go install github.com/securego/gosec/v2/cmd/gosec@latest",
-                ),
+                Step::run("Install gosec", format!("go install {GOSEC}")),
                 Step::run("Run gosec", "gosec ./..."),
             ])]
     }
@@ -199,8 +219,63 @@ mod tests {
     fn test_job_shapes() {
         let jobs = GoTest::default().jobs(&ProjectFacts::default());
         assert_eq!(jobs[0].id, "go-test");
-        assert_eq!(jobs[0].image.as_deref(), Some("golang:1.23"));
+        assert_eq!(jobs[0].image.as_deref(), Some(IMAGE));
         assert_eq!(GoBuild.jobs(&ProjectFacts::default())[0].stage, Stage::Build);
+    }
+
+    /// Every command the go rules emit, flattened
+    fn commands(rule: &dyn Rule) -> Vec<String> {
+        rule.jobs(&ProjectFacts::default())
+            .iter()
+            .flat_map(|job| job.steps.clone())
+            .filter_map(|step| match step {
+                Step::Run { command, .. } => Some(command),
+                Step::Checkout { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_installed_tools_are_pinned_to_a_version() {
+        // `@latest` is a mutable pointer: the pipeline would run whatever
+        // upstream published since, with no change in the user's repository
+        // and no diff for anyone to review
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(GoTest::default()),
+            Box::new(GoBuild),
+            Box::new(GoLint),
+            Box::new(GoAudit),
+        ];
+        for rule in rules {
+            for command in commands(rule.as_ref()) {
+                let Some(module) = command.strip_prefix("go install ") else {
+                    continue;
+                };
+                let (_, version) = module
+                    .rsplit_once('@')
+                    .unwrap_or_else(|| panic!("{}: {command} names no version", rule.id()));
+                assert!(
+                    version.starts_with('v')
+                        && version[1..].starts_with(|c: char| c.is_ascii_digit()),
+                    "{}: {command} is not pinned to a release",
+                    rule.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_golangci_lint_comes_from_the_v2_module_path() {
+        // v2 lives under a new module path, so the old one can only ever
+        // resolve to the final v1 release
+        let install = commands(&GoLint)
+            .into_iter()
+            .find(|c| c.starts_with("go install "))
+            .expect("go-lint installs golangci-lint");
+        assert!(
+            install.contains("/golangci-lint/v2/cmd/golangci-lint@v2."),
+            "{install}"
+        );
     }
 
     #[test]
