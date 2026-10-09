@@ -68,6 +68,11 @@ pub struct ResolvedRule {
     pub detected: bool,
     /// Effective state: the config override, or `detected` when unset
     pub enabled: bool,
+    /// `cibox.ron` turns this rule on explicitly, rather than leaving it to
+    /// detection. That is the user asking for the rule's jobs in so many
+    /// words, so `cibox update` writes them into a file that is missing
+    /// them — see [`crate::generator::merge_file`].
+    pub forced: bool,
 }
 
 /// Normalize a configured versions list: trim, drop empties, dedupe
@@ -188,12 +193,12 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         .into_iter()
         .map(|rule| {
             let detected = rule.detect(facts);
-            let enabled = config
-                .enabled_override(rule.id())
-                .unwrap_or(detected);
+            let override_ = config.enabled_override(rule.id());
+            let enabled = override_.unwrap_or(detected);
             ResolvedRule {
                 detected,
                 enabled,
+                forced: override_ == Some(true),
                 rule,
             }
         })

@@ -132,6 +132,52 @@ fn test_version_matrix_lifecycle() {
     assert!(content.contains("rust:latest"), "{content}");
 }
 
+/// Turning a rule on in `cibox.ron` is how a user adopts a new rule into a
+/// pipeline they have already customized. `--force` would cost them those
+/// customizations, so `update` has to write the job in by itself.
+#[test]
+fn test_enabling_a_rule_adds_its_job_to_an_existing_pipeline() {
+    let dir = project();
+    let ci_path = dir.path().join(".github/workflows/ci.yml");
+
+    update(dir.path()).assert().success();
+
+    // The user customizes: a job of their own, and one of cibox's deleted
+    let mut doc = read_yaml(&ci_path);
+    let jobs = doc["jobs"].as_mapping_mut().unwrap();
+    jobs.insert(
+        "my-job".into(),
+        serde_yaml::from_str("runs-on: ubuntu-latest\nsteps:\n  - run: echo mine\n").unwrap(),
+    );
+    jobs.shift_remove("rust-doc").expect("rust-doc generated");
+    write_yaml(&ci_path, &doc);
+
+    fs::write(dir.path().join("cibox.ron"), "(gitleaks: (enabled: true))").unwrap();
+    update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 added"));
+
+    let doc = read_yaml(&ci_path);
+    let jobs = doc["jobs"].as_mapping().unwrap();
+    assert!(jobs.contains_key("gitleaks"), "{jobs:?}");
+    assert!(jobs.contains_key("my-job"), "custom kept: {jobs:?}");
+    assert!(!jobs.contains_key("rust-doc"), "deletion kept: {jobs:?}");
+
+    // Idempotent now that the job is there
+    let before = fs::read_to_string(&ci_path).unwrap();
+    update(dir.path()).assert().success();
+    assert_eq!(before, fs::read_to_string(&ci_path).unwrap());
+
+    // Dropping the override takes the job back out again
+    fs::write(dir.path().join("cibox.ron"), "()").unwrap();
+    update(dir.path()).assert().success();
+    let doc = read_yaml(&ci_path);
+    let jobs = doc["jobs"].as_mapping().unwrap();
+    assert!(!jobs.contains_key("gitleaks"), "{jobs:?}");
+    assert!(jobs.contains_key("my-job"), "{jobs:?}");
+}
+
 /// Turning every rule off is the way to hand a pipeline back to its author, so
 /// `update` has to prune cibox's jobs then rather than refusing to run.
 #[test]

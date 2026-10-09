@@ -116,9 +116,10 @@ pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: boo
                         conformed,
                         removed,
                         preserved,
+                        added,
                     } => {
                         println!(
-                            "  {} {} ({conformed} updated, {removed} removed, {preserved} custom kept)",
+                            "  {} {} ({conformed} updated, {added} added, {removed} removed, {preserved} custom kept)",
                             "✓".green().bold(),
                             path_label
                         );

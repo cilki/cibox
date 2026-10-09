@@ -1,12 +1,16 @@
 //! Merge canonical cibox output into an existing CI file.
 //!
-//! `cibox update` never adds jobs to a file the user already has: jobs the
-//! user deleted stay deleted. Jobs that are present and cibox-owned (per
+//! Jobs that are present and cibox-owned (per
 //! [`crate::rules::Rule::owns_job_id`]) are conformed to the canonical
 //! output; owned jobs that are no longer generated (rule disabled) are
 //! removed; everything else — custom jobs, extra top-level keys — is
 //! preserved. Editing happens on `serde_yaml::Value` so user documents never
 //! have to fit cibox's typed models.
+//!
+//! A job that detection enables but the file doesn't have is *not* added
+//! back: the user deleted it and said nothing to the contrary. The one
+//! exception is a rule turned on explicitly in `cibox.ron`, which is that
+//! something to the contrary — see [`forced_job_ids`].
 
 use crate::config::Platform;
 use crate::error::Result;
@@ -32,6 +36,8 @@ pub enum MergeOutcome {
         removed: usize,
         /// Jobs cibox doesn't own, left untouched
         preserved: usize,
+        /// Jobs added because `cibox.ron` turns their rule on explicitly
+        added: usize,
     },
 }
 
@@ -66,6 +72,7 @@ pub fn merge_file(
         conformed,
         removed,
         preserved,
+        added,
     } = merged;
 
     if Value::Mapping(doc.clone()) == original {
@@ -89,6 +96,7 @@ pub fn merge_file(
         conformed,
         removed,
         preserved,
+        added,
     })
 }
 
@@ -99,18 +107,40 @@ struct Merged {
     conformed: usize,
     removed: usize,
     preserved: usize,
+    added: usize,
 }
 
 fn is_owned(resolved: &[ResolvedRule], id: &str) -> bool {
     resolved.iter().any(|r| r.rule.owns_job_id(id))
 }
 
-/// Planned jobs whose id appears among the existing keys, with `needs`
-/// pruned to jobs that survive (the user may have deleted a dependency)
-fn kept_jobs(planned: &[Job], existing_keys: &[String]) -> Vec<Job> {
+/// Ids of planned jobs whose rule `cibox.ron` turns on explicitly.
+///
+/// An `enabled: true` override is the user asking for the job in so many
+/// words, and the only signal that tells a job they deleted apart from one
+/// they have yet to see. Rules left to detection stay subject to the
+/// never-re-add rule: the file alone cannot distinguish the two.
+fn forced_job_ids(planned: &[Job], resolved: &[ResolvedRule]) -> Vec<String> {
+    planned
+        .iter()
+        .filter(|job| {
+            resolved
+                .iter()
+                .any(|r| r.forced && r.rule.owns_job_id(&job.id))
+        })
+        .map(|job| job.id.clone())
+        .collect()
+}
+
+/// Planned jobs the merged file should hold: those whose id appears among the
+/// existing keys, plus the force-enabled ones that are still missing. `needs`
+/// is pruned to jobs that survive (the user may have deleted a dependency).
+fn kept_jobs(planned: &[Job], existing_keys: &[String], forced: &[String]) -> Vec<Job> {
     let mut kept: Vec<Job> = planned
         .iter()
-        .filter(|job| existing_keys.iter().any(|k| k == &job.id))
+        .filter(|job| {
+            existing_keys.iter().any(|k| k == &job.id) || forced.iter().any(|f| f == &job.id)
+        })
         .cloned()
         .collect();
     let ids: Vec<String> = kept.iter().map(|j| j.id.clone()).collect();
@@ -156,6 +186,28 @@ fn conform_jobs_map(
     (conformed, removed, preserved)
 }
 
+/// Append the canonical entries for force-enabled jobs the file is missing.
+/// Returns how many were added.
+fn add_forced_jobs(
+    jobs: &mut Mapping,
+    job_keys: &[String],
+    canonical_jobs: &Mapping,
+    forced: &[String],
+) -> usize {
+    let mut added = 0;
+    for id in forced {
+        if job_keys.iter().any(|k| k == id) {
+            continue;
+        }
+        let key = Value::from(id.as_str());
+        if let Some(canonical) = canonical_jobs.get(&key) {
+            jobs.insert(key, canonical.clone());
+            added += 1;
+        }
+    }
+    added
+}
+
 fn merge_github(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping) -> Result<Merged> {
     let Some(jobs) = doc.get_mut("jobs").and_then(Value::as_mapping_mut) else {
         bail!(
@@ -165,7 +217,8 @@ fn merge_github(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
     };
 
     let job_keys = string_keys(jobs);
-    let kept = kept_jobs(&file.jobs, &job_keys);
+    let forced = forced_job_ids(&file.jobs, resolved);
+    let kept = kept_jobs(&file.jobs, &job_keys, &forced);
     let canonical =
         serde_yaml::to_value(crate::platforms::github::lower::lower_github(&kept, file.kind))?;
     let empty = Mapping::new();
@@ -173,6 +226,7 @@ fn merge_github(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
 
     let (conformed, removed, preserved) =
         conform_jobs_map(jobs, &job_keys, canonical_jobs, resolved);
+    let added = add_forced_jobs(jobs, &job_keys, canonical_jobs, &forced);
 
     // Only `jobs` is managed; user-tuned triggers/env/permissions are kept.
     // Scaffold `name`/`on`/`permissions` solely when the workflow lacks them.
@@ -191,6 +245,7 @@ fn merge_github(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
         conformed,
         removed,
         preserved,
+        added,
     })
 }
 
@@ -241,15 +296,16 @@ fn merge_gitlab(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
         .into_iter()
         .filter(|k| !GITLAB_RESERVED.contains(&k.as_str()) && !k.starts_with('.'))
         .collect();
-    let kept = kept_jobs(&file.jobs, &job_keys);
+    let forced = forced_job_ids(&file.jobs, resolved);
+    let kept = kept_jobs(&file.jobs, &job_keys, &forced);
     let canonical = serde_yaml::to_value(crate::platforms::gitlab::lower::lower_gitlab(&kept))?;
+    let canonical_jobs = canonical.as_mapping().expect("GitLabCI serializes to a mapping");
 
-    let (conformed, removed, preserved) = conform_jobs_map(
-        &mut doc,
-        &job_keys,
-        canonical.as_mapping().expect("GitLabCI serializes to a mapping"),
-        resolved,
-    );
+    let (conformed, removed, preserved) =
+        conform_jobs_map(&mut doc, &job_keys, canonical_jobs, resolved);
+    // Added before `stages` is recomputed, so the new job's stage counts as
+    // referenced
+    let added = add_forced_jobs(&mut doc, &job_keys, canonical_jobs, &forced);
 
     // Conform `stages` to what the remaining jobs (cibox or custom) reference
     let referenced: Vec<String> = doc
@@ -305,6 +361,7 @@ fn merge_gitlab(file: &PlannedFile, resolved: &[ResolvedRule], mut doc: Mapping)
         conformed,
         removed,
         preserved,
+        added,
     })
 }
 
@@ -321,7 +378,8 @@ fn merge_circleci(
     };
 
     let job_keys = string_keys(jobs);
-    let kept = kept_jobs(&file.jobs, &job_keys);
+    let forced = forced_job_ids(&file.jobs, resolved);
+    let kept = kept_jobs(&file.jobs, &job_keys, &forced);
     let canonical =
         serde_yaml::to_value(crate::platforms::circleci::lower::lower_circleci(&kept))?;
     let empty = Mapping::new();
@@ -329,6 +387,7 @@ fn merge_circleci(
 
     let (conformed, removed, preserved) =
         conform_jobs_map(jobs, &job_keys, canonical_jobs, resolved);
+    let added = add_forced_jobs(jobs, &job_keys, canonical_jobs, &forced);
 
     // A job also appears as an entry in a workflow's `jobs` list — conform
     // or drop those entries to match, leaving custom entries alone
@@ -391,12 +450,51 @@ fn merge_circleci(
         }
     }
 
+    // A job definition only runs when a workflow invokes it, so an added job
+    // needs its entry too: `main` is where cibox puts its own, falling back
+    // to whatever the user renamed their single workflow to, and scaffolding
+    // the block when the file has none.
+    let forced_entries: Vec<Value> = canonical_entries
+        .iter()
+        .filter(|entry| {
+            entry_id(entry).is_some_and(|id| {
+                forced.iter().any(|f| f == &id) && !job_keys.iter().any(|k| k == &id)
+            })
+        })
+        .map(|entry| (*entry).clone())
+        .collect();
+    if !forced_entries.is_empty() {
+        let workflows = doc
+            .entry(Value::from("workflows"))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if let Some(workflows) = workflows.as_mapping_mut() {
+            let name = Some(Value::from("main"))
+                .filter(|main| workflows.contains_key(main))
+                .or_else(|| workflows.keys().next().cloned())
+                .unwrap_or_else(|| Value::from("main"));
+            let entries = workflows
+                .entry(name)
+                .or_insert_with(|| Value::Mapping(Mapping::new()))
+                .as_mapping_mut()
+                .map(|workflow| {
+                    workflow
+                        .entry(Value::from("jobs"))
+                        .or_insert_with(|| Value::Sequence(Vec::new()))
+                })
+                .and_then(Value::as_sequence_mut);
+            if let Some(entries) = entries {
+                entries.extend(forced_entries);
+            }
+        }
+    }
+
     Ok(Merged {
         doc,
         kept,
         conformed,
         removed,
         preserved,
+        added,
     })
 }
 
@@ -428,17 +526,30 @@ mod tests {
         plan(&facts, resolved, platform).unwrap().swap_remove(index)
     }
 
-    fn merged(outcome: MergeOutcome) -> (String, usize, usize, usize) {
+    fn merged_counts(outcome: MergeOutcome) -> (String, usize, usize, usize, usize) {
         match outcome {
             MergeOutcome::Merged {
                 content,
                 conformed,
                 removed,
                 preserved,
-            } => (content, conformed, removed, preserved),
+                added,
+            } => (content, conformed, removed, preserved, added),
             MergeOutcome::Unchanged => panic!("expected Merged, got Unchanged"),
             MergeOutcome::WouldEmpty => panic!("expected Merged, got WouldEmpty"),
         }
+    }
+
+    fn merged(outcome: MergeOutcome) -> (String, usize, usize, usize) {
+        let (content, conformed, removed, preserved, _) = merged_counts(outcome);
+        (content, conformed, removed, preserved)
+    }
+
+    /// Config that turns a rule on that the fixture's facts don't detect
+    fn force_go_lint() -> CiboxConfig {
+        let mut config = CiboxConfig::default();
+        config.go_lint.enabled = Some(true);
+        config
     }
 
     #[test]
@@ -476,6 +587,168 @@ jobs:
         assert!(content.contains("My CI"), "{content}");
         assert!(content.contains("develop"), "{content}");
         assert_eq!((conformed, removed, preserved), (1, 0, 1));
+    }
+
+    #[test]
+    fn test_github_adds_a_rule_turned_on_in_the_config() {
+        // Enabling a rule in cibox.ron is the only way to ask for a job that
+        // isn't in the file yet; without it `update` would report the rule
+        // enabled and write nothing, so --force (which discards the user's
+        // edits) would be the only way to adopt a new rule.
+        let facts = full_facts();
+        let config = force_go_lint();
+        let resolved = resolve(&facts, &config);
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+
+        // rust-fmt was deleted by the user and a custom job added
+        let existing = r#"
+name: CI
+on: [push]
+permissions:
+  contents: read
+jobs:
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+  my-custom:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo mine
+"#;
+
+        let (content, conformed, removed, preserved, added) =
+            merged_counts(merge_file(Platform::GitHub, &file, &resolved, existing).unwrap());
+
+        assert_eq!((conformed, removed, preserved, added), (1, 0, 1, 1));
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc["jobs"]["go-lint"]["steps"].is_sequence(), "{content}");
+        // Detection-only rules the user deleted are still left out
+        assert!(doc["jobs"]["rust-fmt"].is_null(), "{content}");
+        assert!(doc["jobs"]["my-custom"]["steps"].is_sequence(), "{content}");
+
+        // ...and the job is now present, so a second update is a no-op
+        assert!(matches!(
+            merge_file(Platform::GitHub, &file, &resolved, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn test_gitlab_adds_a_forced_job_with_its_stage() {
+        let facts = full_facts();
+        let config = force_go_lint();
+        let resolved = resolve(&facts, &config);
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+
+        // A pipeline trimmed down to one test job: `lint` isn't a stage yet
+        let existing = "stages: [test]\nrust-test:\n  stage: test\n  script: [echo stale]\n";
+        let (content, _, _, _, added) =
+            merged_counts(merge_file(Platform::GitLab, &file, &resolved, existing).unwrap());
+
+        assert_eq!(added, 1);
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(doc["go-lint"]["stage"].as_str(), Some("lint"));
+        // GitLab rejects a job whose stage isn't declared
+        let stages: Vec<&str> = doc["stages"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(stages.contains(&"lint"), "{content}");
+
+        assert!(matches!(
+            merge_file(Platform::GitLab, &file, &resolved, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn test_circleci_adds_a_forced_job_and_its_workflow_entry() {
+        let facts = full_facts();
+        let config = force_go_lint();
+        let resolved = resolve(&facts, &config);
+        let file = planned_file(Platform::CircleCI, &resolved, 0);
+
+        // The user renamed the workflow, so there is no `main` to extend;
+        // a job with no invocation anywhere would never run
+        let existing = r#"
+version: "2.1"
+jobs:
+  rust-test:
+    docker: [{image: old}]
+    steps: [checkout]
+workflows:
+  everything:
+    jobs:
+      - rust-test
+"#;
+
+        let (content, _, _, _, added) =
+            merged_counts(merge_file(Platform::CircleCI, &file, &resolved, existing).unwrap());
+
+        assert_eq!(added, 1);
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc["jobs"]["go-lint"]["steps"].is_sequence(), "{content}");
+        assert!(doc["workflows"]["main"].is_null(), "{content}");
+        let entries: Vec<&str> = doc["workflows"]["everything"]["jobs"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(entries, vec!["rust-test", "go-lint"], "{content}");
+
+        assert!(matches!(
+            merge_file(Platform::CircleCI, &file, &resolved, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn test_github_adds_back_a_deleted_job_the_config_asks_for() {
+        // `enabled: true` on a rule detection already enables changes nothing
+        // about the resolution, but it is still the user asking for the job —
+        // so a deletion they have since changed their mind about is undone
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_fmt.enabled = Some(true);
+        let resolved = resolve(&facts, &config);
+        assert!(
+            resolved
+                .iter()
+                .any(|r| r.rule.id() == "rust-fmt" && r.detected),
+            "fixture rot"
+        );
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+
+        let existing = "name: CI\non: [push]\njobs:\n  rust-test:\n    \
+                        runs-on: ubuntu-latest\n    steps:\n      - run: echo stale\n";
+        let (content, _, _, _, added) =
+            merged_counts(merge_file(Platform::GitHub, &file, &resolved, existing).unwrap());
+        assert_eq!(added, 1);
+        assert!(content.contains("rust-fmt"), "{content}");
+    }
+
+    #[test]
+    fn test_disabling_a_forced_rule_again_removes_its_job() {
+        // The override is what adds the job, so dropping the override has to
+        // take it back out rather than leave it orphaned forever
+        let facts = full_facts();
+        let resolved = resolve(&facts, &force_go_lint());
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+        let existing = "name: CI\non: [push]\njobs:\n  rust-test:\n    \
+                        runs-on: ubuntu-latest\n    steps:\n      - run: echo stale\n";
+        let (with_job, _, _, _, _) =
+            merged_counts(merge_file(Platform::GitHub, &file, &resolved, existing).unwrap());
+
+        let plain = resolve(&facts, &CiboxConfig::default());
+        let plain_file = planned_file(Platform::GitHub, &plain, 0);
+        let (content, _, removed, _, added) =
+            merged_counts(merge_file(Platform::GitHub, &plain_file, &plain, &with_job).unwrap());
+        assert_eq!((removed, added), (1, 0));
+        assert!(!content.contains("go-lint"), "{content}");
     }
 
     #[test]

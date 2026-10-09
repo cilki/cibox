@@ -69,6 +69,13 @@ stay deleted, and jobs you added are kept. Pass `--force` to rewrite the
 files from scratch instead — as the TUI does when it writes, see
 [Interactive editor](#interactive-editor).
 
+The one job `update` adds to a file you already have is one whose rule you
+turned on yourself with `enabled: true` in `cibox.ron`, since that is you
+asking for it in so many words — dropping the override takes the job out
+again. A job that only detection enables is never re-added, because nothing
+in the file tells a job you deleted apart from one you have yet to see: use
+`enabled: true` or `--force` to adopt those.
+
 Turning every rule off (or deleting whatever the last rule detected on) prunes
 all of cibox's jobs, so `cibox update` is also how you hand a pipeline back to
 yourself. A file that would be left with no jobs at all is reported and left
