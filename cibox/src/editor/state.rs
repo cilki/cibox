@@ -56,26 +56,48 @@ pub enum Row {
         /// The value in effect (facts-derived default when not overridden)
         effective: String,
     },
-    /// A boolean knob checkbox (e.g. sync_readme)
-    BoolKnob {
+    /// A checkbox for one of the boolean knobs
+    Checkbox { knob: Checkbox, value: bool },
+    /// One configured toolchain version under an expanded test rule, or —
+    /// with `index: None` — the trailing "add a version" action row
+    Version {
         rule_id: &'static str,
-        label: &'static str,
-        description: &'static str,
-        value: bool,
-    },
-    /// One target-platform checkbox under docker-release
-    ArchOption { arch: DockerPlatform, selected: bool },
-    /// One configured toolchain version under an expanded test rule
-    VersionItem {
-        rule_id: &'static str,
-        index: usize,
+        index: Option<usize>,
         value: String,
-    },
-    /// Trailing "add a version" action row under an expanded test rule
-    AddVersion {
-        rule_id: &'static str,
+        /// Image used when the rule has no versions configured
         default_image: &'static str,
     },
+}
+
+/// A boolean knob the checklist renders as a checkbox. Flipping one is the
+/// whole of what activating its row does, so the row needs to name which.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Checkbox {
+    /// docker-release's `sync_readme`
+    SyncReadme,
+    /// One entry of docker-release's `platforms`
+    Arch(DockerPlatform),
+}
+
+impl Checkbox {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Checkbox::SyncReadme => "sync_readme",
+            Checkbox::Arch(arch) => arch.as_str(),
+        }
+    }
+
+    pub fn description(&self) -> String {
+        match self {
+            Checkbox::SyncReadme => "Sync README.md to the Docker Hub repository description on \
+                                     release; needs DOCKER_USERNAME/DOCKER_PASSWORD. Docker Hub \
+                                     only. Press Enter to toggle."
+                .to_string(),
+            Checkbox::Arch(arch) => {
+                format!("Include {} in the released multi-arch image", arch.as_str())
+            }
+        }
+    }
 }
 
 /// Which knob a text input edits
@@ -219,14 +241,17 @@ impl EditorState {
                         .cloned()
                         .unwrap_or_default();
                     for (index, value) in versions.iter().enumerate() {
-                        self.rows.push(Row::VersionItem {
+                        self.rows.push(Row::Version {
                             rule_id: id,
-                            index,
+                            index: Some(index),
                             value: value.clone(),
+                            default_image,
                         });
                     }
-                    self.rows.push(Row::AddVersion {
+                    self.rows.push(Row::Version {
                         rule_id: id,
+                        index: None,
+                        value: String::new(),
                         default_image,
                     });
                 } else {
@@ -243,12 +268,8 @@ impl EditorState {
                         effective: self.effective_image(),
                     });
                     if id == "docker-release" {
-                        self.rows.push(Row::BoolKnob {
-                            rule_id: id,
-                            label: "sync_readme",
-                            description: "Sync README.md to the Docker Hub repository description \
-                                          on release; needs DOCKER_USERNAME/DOCKER_PASSWORD. \
-                                          Docker Hub only. Press Enter to toggle.",
+                        self.rows.push(Row::Checkbox {
+                            knob: Checkbox::SyncReadme,
                             value: self.config.docker_release.sync_readme.unwrap_or(false),
                         });
                         let selected = self
@@ -258,9 +279,9 @@ impl EditorState {
                             .clone()
                             .unwrap_or_default();
                         for arch in DockerPlatform::ALL {
-                            self.rows.push(Row::ArchOption {
-                                arch,
-                                selected: selected.contains(&arch),
+                            self.rows.push(Row::Checkbox {
+                                knob: Checkbox::Arch(arch),
+                                value: selected.contains(&arch),
                             });
                         }
                     }
@@ -290,7 +311,21 @@ impl EditorState {
         self.rows.get(self.cursor)
     }
 
-    /// Activate the row under the cursor: toggle a rule or arch checkbox, or
+    /// The text edit in progress on `row`, if that is the row being edited.
+    /// A row and a [`KnobInput`] name the same knob the same way, which is
+    /// all it takes to match them up.
+    pub fn editing(&self, row: &Row) -> Option<&KnobInput> {
+        let (rule_id, target) = match row {
+            Row::TextKnob { rule_id, .. } => (*rule_id, KnobTarget::ImageName),
+            Row::Version { rule_id, index, .. } => (*rule_id, KnobTarget::Version(*index)),
+            _ => return None,
+        };
+        self.input
+            .as_ref()
+            .filter(|input| input.rule_id == rule_id && input.target == target)
+    }
+
+    /// Activate the row under the cursor: toggle a rule or a checkbox, or
     /// start editing a text knob
     pub fn activate_current(&mut self) {
         match self.rows.get(self.cursor).cloned() {
@@ -304,24 +339,17 @@ impl EditorState {
                     buffer: effective,
                 });
             }
-            Some(Row::BoolKnob { .. }) => self.toggle_sync_readme(),
-            Some(Row::ArchOption { arch, .. }) => self.toggle_arch(arch),
-            Some(Row::VersionItem {
+            Some(Row::Checkbox { knob, .. }) => self.toggle_checkbox(knob),
+            Some(Row::Version {
                 rule_id,
                 index,
                 value,
+                ..
             }) => {
                 self.input = Some(KnobInput {
                     rule_id,
-                    target: KnobTarget::Version(Some(index)),
+                    target: KnobTarget::Version(index),
                     buffer: value,
-                });
-            }
-            Some(Row::AddVersion { rule_id, .. }) => {
-                self.input = Some(KnobInput {
-                    rule_id,
-                    target: KnobTarget::Version(None),
-                    buffer: String::new(),
                 });
             }
             None => {}
@@ -339,35 +367,36 @@ impl EditorState {
         self.auto_save_ron();
     }
 
-    /// Flip the docker-release sync_readme knob; off matches the default so
-    /// it collapses back to "unset" and cibox.ron stays delta-only
-    pub fn toggle_sync_readme(&mut self) {
-        let new = !self.config.docker_release.sync_readme.unwrap_or(false);
-        self.config.docker_release.sync_readme = new.then_some(true);
-        self.refresh();
-        self.auto_save_ron();
-    }
-
-    /// Flip one docker-release target platform; an empty selection collapses
-    /// back to "unset" so cibox.ron stays delta-only
-    pub fn toggle_arch(&mut self, arch: DockerPlatform) {
-        let mut selected = self
-            .config
-            .docker_release
-            .platforms
-            .clone()
-            .unwrap_or_default();
-        if let Some(pos) = selected.iter().position(|p| *p == arch) {
-            selected.remove(pos);
-        } else {
-            selected.push(arch);
+    /// Flip one boolean knob. The off state matches the default in both
+    /// cases — `sync_readme` unset, `platforms` empty — so it collapses back
+    /// to "unset" and cibox.ron stays delta-only.
+    pub fn toggle_checkbox(&mut self, knob: Checkbox) {
+        match knob {
+            Checkbox::SyncReadme => {
+                let new = !self.config.docker_release.sync_readme.unwrap_or(false);
+                self.config.docker_release.sync_readme = new.then_some(true);
+            }
+            Checkbox::Arch(arch) => {
+                let mut selected = self
+                    .config
+                    .docker_release
+                    .platforms
+                    .clone()
+                    .unwrap_or_default();
+                if let Some(pos) = selected.iter().position(|p| *p == arch) {
+                    selected.remove(pos);
+                } else {
+                    selected.push(arch);
+                }
+                // Stored in ALL order, so the file doesn't record click order
+                let selected: Vec<DockerPlatform> = DockerPlatform::ALL
+                    .iter()
+                    .copied()
+                    .filter(|p| selected.contains(p))
+                    .collect();
+                self.config.docker_release.platforms = (!selected.is_empty()).then_some(selected);
+            }
         }
-        let selected: Vec<DockerPlatform> = DockerPlatform::ALL
-            .iter()
-            .copied()
-            .filter(|p| selected.contains(p))
-            .collect();
-        self.config.docker_release.platforms = (!selected.is_empty()).then_some(selected);
         self.refresh();
         self.auto_save_ron();
     }
@@ -429,7 +458,11 @@ impl EditorState {
     /// Remove the toolchain version under the cursor; an empty list collapses
     /// back to "unset" so cibox.ron stays delta-only
     pub fn delete_current_version(&mut self) {
-        let Some(Row::VersionItem { rule_id, index, .. }) = self.rows.get(self.cursor).cloned()
+        let Some(Row::Version {
+            rule_id,
+            index: Some(index),
+            ..
+        }) = self.rows.get(self.cursor).cloned()
         else {
             return;
         };
@@ -536,15 +569,15 @@ impl EditorState {
         self.current_item_description = match self.current_row() {
             Some(Row::Rule(row)) => row.description.to_string(),
             Some(Row::TextKnob { description, .. }) => description.to_string(),
-            Some(Row::BoolKnob { description, .. }) => description.to_string(),
-            Some(Row::ArchOption { arch, .. }) => format!(
-                "Include {} in the released multi-arch image",
-                arch.as_str()
-            ),
-            Some(Row::VersionItem { .. }) => {
+            Some(Row::Checkbox { knob, .. }) => knob.description(),
+            Some(Row::Version { index: Some(_), .. }) => {
                 "Toolchain version run as one matrix leg; Enter to edit, d to remove".to_string()
             }
-            Some(Row::AddVersion { default_image, .. }) => format!(
+            Some(Row::Version {
+                index: None,
+                default_image,
+                ..
+            }) => format!(
                 "Add a toolchain version to test against; unset = default image {default_image}"
             ),
             None => String::new(),
@@ -727,7 +760,10 @@ mod tests {
         ));
         assert!(matches!(
             state.rows[idx + 2],
-            Row::BoolKnob { label: "sync_readme", .. }
+            Row::Checkbox {
+                knob: Checkbox::SyncReadme,
+                ..
+            }
         ));
         // image_name + sync_readme + one row per DockerPlatform
         assert_eq!(state.rows.len(), collapsed_len + 2 + DockerPlatform::ALL.len());
@@ -749,7 +785,10 @@ mod tests {
         let idx = rule_index(&state, "docker-release");
         assert!(matches!(
             state.rows[idx + 2],
-            Row::BoolKnob { label: "sync_readme", value: false, .. }
+            Row::Checkbox {
+                knob: Checkbox::SyncReadme,
+                value: false
+            }
         ));
 
         state.cursor = idx + 2;
@@ -757,7 +796,10 @@ mod tests {
         assert_eq!(state.config.docker_release.sync_readme, Some(true));
         assert!(matches!(
             state.rows[idx + 2],
-            Row::BoolKnob { value: true, .. }
+            Row::Checkbox {
+                knob: Checkbox::SyncReadme,
+                value: true
+            }
         ));
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         assert!(ron_str.contains("sync_readme"), "{ron_str}");
@@ -777,7 +819,7 @@ mod tests {
         state.cursor = rule_index(&state, "rust-test");
         state.expand_current();
         let idx = rule_index(&state, "rust-test");
-        assert!(matches!(state.rows[idx + 1], Row::AddVersion { .. }));
+        assert!(matches!(state.rows[idx + 1], Row::Version { index: None, .. }));
 
         // Adding a version through the add row
         state.cursor = idx + 1;
@@ -796,7 +838,7 @@ mod tests {
         );
         assert!(matches!(
             &state.rows[idx + 1],
-            Row::VersionItem { value, .. } if value == "1.85"
+            Row::Version { index: Some(0), value, .. } if value == "1.85"
         ));
 
         // A second version turns the preview into a matrix
@@ -860,6 +902,15 @@ mod tests {
         assert!(state.config.is_default());
     }
 
+    /// Index of the row holding a given checkbox
+    fn checkbox_index(state: &EditorState, knob: Checkbox) -> usize {
+        state
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Checkbox { knob: k, .. } if *k == knob))
+            .unwrap()
+    }
+
     #[test]
     fn test_arch_toggle_is_delta_only() {
         let dir = docker_dir();
@@ -868,8 +919,14 @@ mod tests {
         state.cursor = rule_index(&state, "docker-release");
         state.expand_current();
 
-        state.toggle_arch(DockerPlatform::LinuxArm64);
-        state.toggle_arch(DockerPlatform::LinuxAmd64);
+        // Activating an arch row flips that arch and nothing else
+        let toggle = |state: &mut EditorState, arch| {
+            state.cursor = checkbox_index(state, Checkbox::Arch(arch));
+            state.activate_current();
+        };
+        toggle(&mut state, DockerPlatform::LinuxArm64);
+        toggle(&mut state, DockerPlatform::LinuxAmd64);
+        assert_eq!(state.config.docker_release.sync_readme, None);
         // Stored in ALL order regardless of toggle order
         assert_eq!(
             state.config.docker_release.platforms,
@@ -880,8 +937,8 @@ mod tests {
         assert!(state.yaml_preview.contains("buildx"), "{}", state.yaml_preview);
 
         // Unselecting everything removes the key entirely
-        state.toggle_arch(DockerPlatform::LinuxArm64);
-        state.toggle_arch(DockerPlatform::LinuxAmd64);
+        toggle(&mut state, DockerPlatform::LinuxArm64);
+        toggle(&mut state, DockerPlatform::LinuxAmd64);
         assert!(state.config.is_default());
     }
 

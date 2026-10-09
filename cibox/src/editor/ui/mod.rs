@@ -1,4 +1,4 @@
-use crate::editor::state::{EditorState, KnobTarget, Platform, Row, RuleRow};
+use crate::editor::state::{EditorState, Platform, Row, RuleRow};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -114,143 +114,56 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
     for (i, row) in state.rows.iter().enumerate() {
         let is_selected = i == state.cursor;
 
-        let line = match row {
-            Row::Rule(rule) => rule_line(rule, is_selected),
-            Row::TextKnob {
-                rule_id,
-                label,
-                override_value,
-                effective,
-                ..
-            } => {
-                let editing = state.input.as_ref().filter(|input| {
-                    input.rule_id == *rule_id && input.target == KnobTarget::ImageName
-                });
-                if let Some(input) = editing {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("       {label}: "),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("{}▏", input.buffer),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ])
-                } else {
-                    let overridden = override_value.is_some();
-                    let value_color = match (is_selected, overridden) {
-                        (true, _) => Color::Yellow,
-                        (false, true) => Color::White,
-                        (false, false) => Color::DarkGray,
-                    };
-                    let marker = if overridden { " *" } else { "" };
-                    Line::from(vec![
-                        Span::styled(
-                            format!("       {label}: "),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("{effective}{marker}"),
-                            Style::default().fg(value_color),
-                        ),
-                    ])
-                }
-            }
-            Row::BoolKnob { label, value, .. } => {
-                let checkbox = if *value { "[✓]" } else { "[ ]" };
-                let checkbox_color = if *value { Color::Green } else { Color::DarkGray };
-                let text_color = match (is_selected, value) {
-                    (true, _) => Color::Yellow,
-                    (false, true) => Color::White,
-                    (false, false) => Color::DarkGray,
-                };
+        let line = match (row, state.editing(row)) {
+            // The knob under edit: its own prefix, then the buffer and caret
+            (_, Some(input)) => Line::from(vec![
+                dim(knob_prefix(row)),
+                Span::styled(
+                    format!("{}▏", input.buffer),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            (Row::Rule(rule), _) => rule_line(rule, is_selected),
+            (
+                Row::TextKnob {
+                    override_value,
+                    effective,
+                    ..
+                },
+                _,
+            ) => {
+                let overridden = override_value.is_some();
+                let marker = if overridden { " *" } else { "" };
                 Line::from(vec![
+                    dim(knob_prefix(row)),
                     Span::styled(
-                        format!("       {checkbox} "),
-                        Style::default().fg(checkbox_color),
+                        format!("{effective}{marker}"),
+                        Style::default().fg(knob_value_color(is_selected, overridden)),
                     ),
-                    Span::styled(*label, Style::default().fg(text_color)),
                 ])
             }
-            Row::ArchOption { arch, selected } => {
-                let checkbox = if *selected { "[✓]" } else { "[ ]" };
-                let checkbox_color = if *selected {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                };
-                let text_color = match (is_selected, selected) {
-                    (true, _) => Color::Yellow,
-                    (false, true) => Color::White,
-                    (false, false) => Color::DarkGray,
-                };
-                Line::from(vec![
-                    Span::styled(
-                        format!("     {checkbox} "),
-                        Style::default().fg(checkbox_color),
-                    ),
-                    Span::styled(arch.as_str(), Style::default().fg(text_color)),
-                ])
-            }
-            Row::VersionItem {
-                rule_id,
-                index,
-                value,
-            } => {
-                let editing = state.input.as_ref().filter(|input| {
-                    input.rule_id == *rule_id
-                        && input.target == KnobTarget::Version(Some(*index))
-                });
-                let prefix =
-                    Span::styled("       - ".to_string(), Style::default().fg(Color::DarkGray));
-                if let Some(input) = editing {
-                    Line::from(vec![
-                        prefix,
-                        Span::styled(
-                            format!("{}▏", input.buffer),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ])
-                } else {
-                    let color = if is_selected {
-                        Color::Yellow
-                    } else {
-                        Color::White
-                    };
-                    Line::from(vec![
-                        prefix,
-                        Span::styled(value.clone(), Style::default().fg(color)),
-                    ])
-                }
-            }
-            Row::AddVersion { rule_id, .. } => {
-                let editing = state.input.as_ref().filter(|input| {
-                    input.rule_id == *rule_id && input.target == KnobTarget::Version(None)
-                });
-                if let Some(input) = editing {
-                    Line::from(vec![
-                        Span::styled(
-                            "       + ".to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("{}▏", input.buffer),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ])
-                } else {
-                    let color = if is_selected {
-                        Color::Yellow
-                    } else {
-                        Color::DarkGray
-                    };
-                    Line::from(Span::styled(
-                        "       [+] add version…".to_string(),
-                        Style::default().fg(color),
-                    ))
-                }
-            }
+            (Row::Checkbox { knob, value }, _) => Line::from(vec![
+                Span::styled(
+                    format!("       {} ", if *value { "[✓]" } else { "[ ]" }),
+                    Style::default().fg(if *value { Color::Green } else { Color::DarkGray }),
+                ),
+                Span::styled(
+                    knob.label(),
+                    Style::default().fg(knob_value_color(is_selected, *value)),
+                ),
+            ]),
+            (Row::Version { index: Some(_), value, .. }, _) => Line::from(vec![
+                dim(knob_prefix(row)),
+                Span::styled(
+                    value.clone(),
+                    Style::default().fg(knob_value_color(is_selected, true)),
+                ),
+            ]),
+            // The add row holds no value of its own, so it stays dimmed
+            (Row::Version { index: None, .. }, _) => Line::from(Span::styled(
+                "       [+] add version…",
+                Style::default().fg(knob_value_color(is_selected, false)),
+            )),
         };
 
         let item_style = if is_selected {
@@ -270,6 +183,32 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
     );
 
     f.render_widget(list, area);
+}
+
+/// The dim label a knob row draws before its value, which doubles as the
+/// prefix shown while that knob is being edited. Empty for the rows that
+/// hold no editable value and so never ask for one.
+fn knob_prefix(row: &Row) -> String {
+    match row {
+        Row::TextKnob { label, .. } => format!("       {label}: "),
+        Row::Version { index: Some(_), .. } => "       - ".to_string(),
+        Row::Version { index: None, .. } => "       + ".to_string(),
+        Row::Rule(_) | Row::Checkbox { .. } => String::new(),
+    }
+}
+
+fn dim(text: String) -> Span<'static> {
+    Span::styled(text, Style::default().fg(Color::DarkGray))
+}
+
+/// Color of a knob's value: highlighted under the cursor, dimmed while it
+/// holds its default
+fn knob_value_color(is_selected: bool, set: bool) -> Color {
+    match (is_selected, set) {
+        (true, _) => Color::Yellow,
+        (false, true) => Color::White,
+        (false, false) => Color::DarkGray,
+    }
 }
 
 fn rule_line(row: &RuleRow, is_selected: bool) -> Line<'static> {
@@ -522,6 +461,70 @@ fn render_footer(f: &mut Frame, area: Rect, state: &EditorState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Editor state for a Rust project with a Dockerfile, with every
+    /// expandable rule open — the only state in which knob rows get drawn
+    fn expanded_state() -> (tempfile::TempDir, EditorState) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM rust:latest\n").unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+        let mut state = EditorState::new(facts, None, dir.path().to_path_buf()).unwrap();
+        for id in ["rust-test", "docker-release"] {
+            state.cursor = state
+                .rows
+                .iter()
+                .position(|row| matches!(row, Row::Rule(rule) if rule.id == id))
+                .unwrap();
+            state.expand_current();
+        }
+        (dir, state)
+    }
+
+    /// The rules panel drawn tall enough to hold every row, one String per
+    /// terminal line
+    fn rendered_panel(state: &EditorState) -> Vec<String> {
+        let (width, height) = (64u16, state.rows.len() as u16 + 2);
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_rules_panel(f, Rect::new(0, 0, width, height), state))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// Every config option of an expanded rule is one row of the same shape,
+    /// whichever knob it holds
+    #[test]
+    fn test_knob_rows_render_at_a_common_indent() {
+        let (_dir, state) = expanded_state();
+        let lines = rendered_panel(&state);
+        let row = |needle: &str| {
+            let line = lines
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}:\n{}", lines.join("\n")));
+            // Drop the panel's left border
+            line.trim_start_matches('│').to_string()
+        };
+
+        for knob in ["image_name:", "sync_readme", "linux/amd64", "add version…"] {
+            let row = row(knob);
+            assert!(row.starts_with("       "), "{knob}: {row:?}");
+            assert!(!row.starts_with("        "), "{knob}: {row:?}");
+        }
+        // The two boolean knobs are checkboxes, the rest are not
+        assert!(row("sync_readme").contains("[ ]"));
+        assert!(row("linux/amd64").contains("[ ]"));
+        assert!(!row("image_name:").contains("[ ]"));
+    }
 
     /// (text, foreground, background) of every span on a line
     fn spans(line: &Line<'static>) -> Vec<(String, Option<Color>, Option<Color>)> {
