@@ -154,8 +154,10 @@ involved. `WindowsAmd64` can't be emulated, so it gets its own job on a
 Windows runner — that means GitHub Actions or Gitea Actions only (GitLab and
 CircleCI refuse to generate), and the same Dockerfile has to work from a
 Windows base image. Mixing Linux and Windows targets emits three jobs: the
-two per-OS builds push staging tags and a third merges them into one
-multi-platform manifest, so `image_name` must not already carry a tag.
+two per-OS builds push staging tags (`:linux` and `:windows-amd64`, or
+`:<tag>-linux` and `:<tag>-windows-amd64` when `image_name` carries a tag of
+its own) and a third merges them into one multi-platform manifest under
+`image_name` itself.
 
 You can use our TUI interface to edit this file or any editor with LSP support.
 Configure your editor to use `cibox lsp` as an LSP and you'll get inline

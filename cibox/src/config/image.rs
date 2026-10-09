@@ -77,6 +77,31 @@ pub fn coerce_reference(raw: &str) -> String {
     sanitized
 }
 
+/// A reference to the same repository as `reference`, tagged for a staging
+/// image: `owner/app` + `linux` → `owner/app:linux`.
+///
+/// A reference that already carries a tag folds it into the new one
+/// (`owner/app:edge` + `linux` → `owner/app:edge-linux`) rather than growing
+/// a second colon — `owner/app:edge:linux` is not a reference at all, and
+/// docker rejects it. The base tag is truncated if the combination would
+/// overflow the tag length limit, so the result is always valid.
+pub fn with_tag_suffix(reference: &str, suffix: &str) -> String {
+    let (name, tag) = split_tag(reference);
+    let Some(tag) = tag else {
+        return format!("{name}:{suffix}");
+    };
+    // Leave room for the suffix and the `-` joining it
+    let room = MAX_TAG_LEN.saturating_sub(suffix.len() + 1);
+    // `get` yields None past the end (keep the whole tag, it fits) and on a
+    // non-char boundary (only reachable for a non-ASCII tag, which is not a
+    // valid reference to begin with) — either way, never a panic
+    let base = tag.get(..room).unwrap_or(tag);
+    if base.is_empty() {
+        return format!("{name}:{suffix}");
+    }
+    format!("{name}:{base}-{suffix}")
+}
+
 /// The registry host of `reference`, when its leading component names one
 /// (`localhost:5000/app` → `localhost:5000`). `None` for Docker Hub-style
 /// names like `owner/app`.
@@ -254,6 +279,46 @@ mod tests {
         );
         assert_eq!(registry_host("owner/app"), None);
         assert_eq!(registry_host("app"), None);
+    }
+
+    #[test]
+    fn test_tag_suffix_never_produces_a_second_colon() {
+        // An untagged name just gains the staging tag
+        assert_eq!(with_tag_suffix("owner/app", "linux"), "owner/app:linux");
+        assert_eq!(
+            with_tag_suffix("localhost:5000/app", "windows-amd64"),
+            "localhost:5000/app:windows-amd64"
+        );
+        // A name that already carries one folds it in, instead of the
+        // `owner/app:edge:linux` docker refuses to parse
+        assert_eq!(
+            with_tag_suffix("owner/app:edge", "linux"),
+            "owner/app:edge-linux"
+        );
+        assert_eq!(
+            with_tag_suffix("registry.example.com:5000/owner/app:1.2.3", "linux"),
+            "registry.example.com:5000/owner/app:1.2.3-linux"
+        );
+    }
+
+    #[test]
+    fn test_tag_suffix_output_is_always_a_valid_reference() {
+        // Including when the existing tag leaves no room for the suffix
+        for reference in [
+            "app",
+            "owner/app",
+            "owner/app:edge",
+            "localhost:5000/app:edge",
+            &format!("owner/app:{}", "v".repeat(MAX_TAG_LEN)),
+        ] {
+            for suffix in ["linux", "windows-amd64"] {
+                let tagged = with_tag_suffix(reference, suffix);
+                assert!(
+                    is_valid_reference(&tagged),
+                    "{reference:?} + {suffix:?} gave {tagged:?}"
+                );
+            }
+        }
     }
 
     #[test]

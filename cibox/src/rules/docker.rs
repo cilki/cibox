@@ -1,5 +1,5 @@
 use super::Rule;
-use crate::config::image::registry_host;
+use crate::config::image::{registry_host, with_tag_suffix};
 use crate::config::DockerPlatform;
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
@@ -59,8 +59,8 @@ impl Rule for DockerBuild {
 /// `WindowsAmd64` cannot be emulated, so it gets its own Windows-runner job
 /// (the same Dockerfile must support a Windows base image); when linux and
 /// windows are mixed, both jobs push staging tags and a final job merges them
-/// into one multi-platform manifest. Staging tags are appended to `image`, so
-/// the image name must not already carry a tag.
+/// into one multi-platform manifest. The staging tags are derived from
+/// `image`, folding into whatever tag it already carries.
 pub struct DockerRelease {
     pub image: String,
     /// Target platforms; empty = single-arch build/push on the host runner
@@ -265,8 +265,8 @@ impl Rule for DockerRelease {
             }
             // Mixed: stage per-OS images, then merge into one manifest
             (false, false) => {
-                let linux_tag = format!("{}:linux", self.image);
-                let windows_tag = format!("{}:windows-amd64", self.image);
+                let linux_tag = with_tag_suffix(&self.image, "linux");
+                let windows_tag = with_tag_suffix(&self.image, "windows-amd64");
                 vec![
                     self.release_job("-linux", "Docker push (linux)")
                         .with_timeout(60)
@@ -465,6 +465,31 @@ mod tests {
                 job.id
             );
         }
+    }
+
+    #[test]
+    fn test_mixed_platforms_keep_an_existing_tag() {
+        let rule = DockerRelease {
+            image: "ghcr.io/owner/app:edge".to_string(),
+            platforms: vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxAmd64],
+            sync_readme: false,
+        };
+        let jobs = rule.jobs(&docker_facts());
+        // The staging tags fold into `edge` rather than appending a second
+        // colon, which every one of these commands would reject outright
+        assert_eq!(
+            run_command(&jobs[0], "Build and push image"),
+            "docker buildx build --platform linux/amd64 -t ghcr.io/owner/app:edge-linux --push ."
+        );
+        assert_eq!(
+            run_command(&jobs[1], "Build image"),
+            "docker build -t ghcr.io/owner/app:edge-windows-amd64 ."
+        );
+        assert_eq!(
+            run_command(&jobs[2], "Merge manifests"),
+            "docker buildx imagetools create -t ghcr.io/owner/app:edge \
+             ghcr.io/owner/app:edge-linux ghcr.io/owner/app:edge-windows-amd64"
+        );
     }
 
     #[test]
