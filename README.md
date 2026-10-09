@@ -114,9 +114,21 @@ credential is dropped.
 
 ### Where credentials come from
 
+Only the release rules need credentials, and each one reads them from the
+environment under a fixed name:
+
+| Rule             | Secrets                                                                          |
+| ---------------- | -------------------------------------------------------------------------------- |
+| `rust-release`   | `CARGO_REGISTRY_TOKEN`                                                           |
+| `python-release` | `TWINE_PASSWORD` (the username is always `__token__`)                            |
+| `docker-release` | `DOCKER_USERNAME` and `DOCKER_PASSWORD`, or `GITHUB_TOKEN` for a `ghcr.io` image |
+| `aur-release`    | `AUR_SSH_PRIVATE_KEY`                                                            |
+
 On GitHub and Gitea, a credential is read from repository Secrets and only from
 there: `DOCKER_PASSWORD`, `CARGO_REGISTRY_TOKEN`, `TWINE_PASSWORD` and
-`AUR_SSH_PRIVATE_KEY` lower to `NAME: ${{ secrets.NAME }}`. A Variable is not a
+`AUR_SSH_PRIVATE_KEY` lower to `NAME: ${{ secrets.NAME }}`, so putting the
+secret in the repository is all that is left to do — and `GITHUB_TOKEN` is
+already there, since the runner hands it to every job. A Variable is not a
 quieter Secret — its value is displayed in the settings UI, handed back in
 plaintext by the variables API and never masked in a log — so cibox offers no
 `|| vars.NAME` fallback for a credential, which would amount to saying that
@@ -125,7 +137,11 @@ choice: `DOCKER_USERNAME` lowers to
 `${{ secrets.DOCKER_USERNAME || vars.DOCKER_USERNAME }}` and can live in either
 store. GitLab and CircleCI read both kinds from project CI variables, which the
 `# Required CI variables:` header at the top of the generated file lists for
-you.
+you:
+
+```yaml
+# Required CI variables: CARGO_REGISTRY_TOKEN, DOCKER_PASSWORD, DOCKER_USERNAME
+```
 
 ## `cibox.ron`
 
@@ -164,10 +180,20 @@ has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and `DOCKER_PASSWOR
 secrets. If the credentials aren't configured in CI, the login is skipped, for
 registries that don't require any.
 
-`sync_readme` additionally pushes `README.md` to the Docker Hub repository
+`docker-release` can also push `README.md` to the Docker Hub repository
 description once the image is released, reusing the same two secrets. It is
-Docker Hub only — `ghcr.io` has no description API — and like the login it is
-skipped when the credentials aren't configured or there is no `README.md`.
+off until you ask for it:
+
+```ron
+(
+    docker_release: (sync_readme: true),
+)
+```
+
+The sync is Docker Hub only — `ghcr.io` has no description API, so the knob is
+ignored for those images, as it is for a Windows-only release (the tool it
+runs is a Linux container) — and like the login it is skipped at run time when
+the credentials aren't configured or there is no `README.md`.
 
 ### Multi-arch docker images
 
