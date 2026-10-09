@@ -91,6 +91,26 @@ where every later step can read it — including build scripts and test suites
 running third-party code. Nothing cibox generates uses git after the clone,
 so the credential is dropped.
 
+### Triggers
+
+Release jobs run on `v*` tags everywhere. What runs the rest of the pipeline
+differs per platform, and only GitHub and Gitea pin it to a branch list:
+
+| Platform | Branch/PR jobs | Tag jobs |
+|---|---|---|
+| GitHub / Gitea Actions | `ci.yml`, on `push` and `pull_request` against `main` or `master` | `release.yml`, on `push` of a `v*` tag |
+| GitLab CI | no `rules:` of their own, so they run in every pipeline GitLab starts — a tag push included | `rules: - if: $CI_COMMIT_TAG =~ /^v/` |
+| CircleCI | no `filters:`, so branch pushes only — CircleCI runs no unfiltered job on a tag | `filters: tags: only: /^v.*/` with `branches: ignore: /.*/` |
+
+So a tag push runs the release jobs alone on GitHub, Gitea and CircleCI,
+while GitLab also runs the whole test pipeline against the tag.
+
+The `main`/`master` list is not a knob. If your default branch is called
+something else, a generated GitHub or Gitea `ci.yml` never fires at all —
+edit its `on:` block and `cibox update` keeps your version, just as it does a
+widened `permissions:`. `--force` and the TUI's `w` rewrite the whole file,
+so they put the default list back.
+
 ## `cibox.ron`
 
 `cibox.ron` holds only your *overrides* from the detected defaults — no file
