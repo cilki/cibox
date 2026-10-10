@@ -1,3 +1,4 @@
+use super::display;
 use crate::config::{infer_platform, parse_config, CiboxConfig, Platform};
 use crate::detection::{gather_facts, ProjectFacts};
 use crate::error::Result;
@@ -209,13 +210,15 @@ pub fn handle_detect(dir: &str) -> Result<()> {
 
     println!("{}", "Project facts:".cyan().bold());
     let yes_no = |b: bool| if b { "yes".green() } else { "no".dimmed() };
+    // Names read out of the project's own files are printed through
+    // `display::untrusted`: see that module for why
     if let Some(rust) = &facts.rust {
         println!(
             "  {} Rust{}{}",
             "✓".green(),
             rust.package_name
                 .as_deref()
-                .map(|n| format!(" ({n})"))
+                .map(|n| format!(" ({})", display::untrusted(n)))
                 .unwrap_or_default(),
             if rust.is_workspace { " [workspace]" } else { "" },
         );
@@ -231,7 +234,7 @@ pub fn handle_detect(dir: &str) -> Result<()> {
             "✓".green(),
             go.module_path
                 .as_deref()
-                .map(|m| format!(" ({m})"))
+                .map(|m| format!(" ({})", display::untrusted(m)))
                 .unwrap_or_default()
         );
     }
@@ -254,11 +257,15 @@ pub fn handle_detect(dir: &str) -> Result<()> {
         println!("    tests: {}", yes_no(cmake.has_tests));
     }
     if let Some(docker) = &facts.docker {
-        println!("  {} Docker ({})", "✓".green(), docker.dockerfile);
+        println!(
+            "  {} Docker ({})",
+            "✓".green(),
+            display::untrusted(&docker.dockerfile)
+        );
     }
     println!("    git repository: {}", yes_no(facts.is_git_repo));
     if let Some(slug) = &facts.repo_slug {
-        println!("    remote: {}", slug);
+        println!("    remote: {}", display::untrusted(slug));
     }
     if !facts.existing_ci.is_empty() {
         let names: Vec<&str> = facts.existing_ci.iter().map(|p| p.name()).collect();
