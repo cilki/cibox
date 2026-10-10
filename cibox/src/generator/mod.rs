@@ -1,5 +1,6 @@
 //! Turn resolved rules into output files for a platform.
 
+mod disabled;
 mod merge;
 
 pub use merge::{merge_file, MergeOutcome};
@@ -16,6 +17,49 @@ use crate::rules::{enabled_jobs, ResolvedRule};
 use anyhow::bail;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+/// Which jobs `update` may touch: ownership (per [`crate::rules::Rule::owns_job_id`])
+/// narrowed by an optional `--rule` selection.
+pub struct JobFilter<'a> {
+    pub resolved: &'a [ResolvedRule],
+    /// Rule ids named with `--rule`; `None` means every rule is selected
+    pub selection: Option<&'a BTreeSet<String>>,
+}
+
+impl JobFilter<'_> {
+    /// Some cibox rule emits this job id (whether or not it is selected)
+    pub(crate) fn owned(&self, id: &str) -> bool {
+        self.resolved.iter().any(|r| r.rule.owns_job_id(id))
+    }
+
+    /// cibox may touch this job: owned, and its rule is selected
+    pub(crate) fn managed(&self, id: &str) -> bool {
+        match self.selection {
+            None => self.owned(id),
+            Some(sel) => self
+                .resolved
+                .iter()
+                .any(|r| sel.contains(r.rule.id()) && r.rule.owns_job_id(id)),
+        }
+    }
+}
+
+/// The planned jobs the filter lets `update` touch, with `needs` pruned to
+/// jobs that are themselves included (a `--rule` selection may exclude a
+/// dependency).
+pub fn managed_jobs(file: &PlannedFile, filter: &JobFilter) -> Vec<Job> {
+    let mut jobs: Vec<Job> = file
+        .jobs
+        .iter()
+        .filter(|j| filter.managed(&j.id))
+        .cloned()
+        .collect();
+    let ids: Vec<String> = jobs.iter().map(|j| j.id.clone()).collect();
+    for job in &mut jobs {
+        job.needs.retain(|n| ids.contains(n));
+    }
+    jobs
+}
 
 /// Reported when a resolution leaves no rule enabled, so there is nothing to
 /// write anywhere.
@@ -103,21 +147,51 @@ pub fn render_file(platform: Platform, file: &PlannedFile) -> Result<String> {
     Ok(content)
 }
 
-/// GitLab and CircleCI read secrets from ambient CI variables rather than
-/// naming them in the pipeline, so list what the jobs expect at the top of
-/// the file to make setup discoverable. A no-op on the other platforms,
-/// whose lowered jobs reference their secrets inline.
-pub(crate) fn prepend_required_variables(platform: Platform, jobs: &[Job], content: &mut String) {
+/// Prefix of the secrets header comment on ambient-variable platforms
+pub(crate) const REQUIRED_VARIABLES_PREFIX: &str = "# Required CI variables: ";
+
+/// The secrets header line the given jobs call for, newline included, or
+/// `None` when the platform names secrets inline or no job wants any.
+pub(crate) fn required_variables_line(platform: Platform, jobs: &[Job]) -> Option<String> {
     if !matches!(platform, Platform::GitLab | Platform::CircleCI) {
-        return;
+        return None;
     }
     let secrets: BTreeSet<&str> = jobs
         .iter()
         .flat_map(|job| job.secrets.iter().map(String::as_str))
         .collect();
-    if !secrets.is_empty() {
-        let names = secrets.into_iter().collect::<Vec<_>>().join(", ");
-        content.insert_str(0, &format!("# Required CI variables: {names}\n"));
+    if secrets.is_empty() {
+        return None;
+    }
+    let names = secrets.into_iter().collect::<Vec<_>>().join(", ");
+    Some(format!("{REQUIRED_VARIABLES_PREFIX}{names}\n"))
+}
+
+/// GitLab and CircleCI read secrets from ambient CI variables rather than
+/// naming them in the pipeline, so list what the jobs expect at the top of
+/// the file to make setup discoverable. A no-op on the other platforms,
+/// whose lowered jobs reference their secrets inline.
+pub(crate) fn prepend_required_variables(platform: Platform, jobs: &[Job], content: &mut String) {
+    if let Some(line) = required_variables_line(platform, jobs) {
+        content.insert_str(0, &line);
+    }
+}
+
+/// Bring the leading secrets header in line with what the jobs require:
+/// replace a stale one, drop an obsolete one, add a missing one. Merged
+/// documents keep their existing text, so unlike [`prepend_required_variables`]
+/// this has to reconcile rather than blindly prepend.
+pub(crate) fn reconcile_required_variables(platform: Platform, jobs: &[Job], content: &mut String) {
+    let desired = required_variables_line(platform, jobs);
+    if content.starts_with(REQUIRED_VARIABLES_PREFIX) {
+        let end = content.find('\n').map_or(content.len(), |i| i + 1);
+        if content[..end] == *desired.as_deref().unwrap_or("") {
+            return;
+        }
+        content.replace_range(..end, "");
+    }
+    if let Some(line) = desired {
+        content.insert_str(0, &line);
     }
 }
 

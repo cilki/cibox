@@ -152,7 +152,17 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
 
     let mut env: BTreeMap<String, String> = job.env.iter().cloned().collect();
     for secret in &job.secrets {
-        env.insert(secret.clone(), format!("${{{{ secrets.{secret} }}}}"));
+        // Not everything a rule needs is sensitive (e.g. a registry
+        // username), so users reasonably store some of these under the
+        // repository's Variables instead of Secrets; `||` takes whichever
+        // context has the value. GITHUB_TOKEN is runner-provided and exists
+        // only in the secrets context.
+        let value = if secret == "GITHUB_TOKEN" {
+            format!("${{{{ secrets.{secret} }}}}")
+        } else {
+            format!("${{{{ secrets.{secret} || vars.{secret} }}}}")
+        };
+        env.insert(secret.clone(), value);
     }
 
     // A job-level block replaces the workflow-level one rather than adding to
@@ -282,14 +292,23 @@ mod tests {
     #[test]
     fn test_secrets_become_job_env() {
         let workflow = lower_github(
-            &[Job::new("docker-release", "Docker push", Stage::Deploy)
-                .with_secrets(vec!["DOCKER_PASSWORD".to_string()])],
+            &[Job::new("docker-release", "Docker push", Stage::Deploy).with_secrets(vec![
+                "DOCKER_USERNAME".to_string(),
+                "DOCKER_PASSWORD".to_string(),
+                "GITHUB_TOKEN".to_string(),
+            ])],
             WorkflowKind::Release,
         );
+        let env = workflow.jobs["docker-release"].env.as_ref().unwrap();
         assert_eq!(
-            workflow.jobs["docker-release"].env.as_ref().unwrap()["DOCKER_PASSWORD"],
-            "${{ secrets.DOCKER_PASSWORD }}"
+            env["DOCKER_USERNAME"],
+            "${{ secrets.DOCKER_USERNAME || vars.DOCKER_USERNAME }}"
         );
+        assert_eq!(
+            env["DOCKER_PASSWORD"],
+            "${{ secrets.DOCKER_PASSWORD || vars.DOCKER_PASSWORD }}"
+        );
+        assert_eq!(env["GITHUB_TOKEN"], "${{ secrets.GITHUB_TOKEN }}");
     }
 
     #[test]

@@ -34,6 +34,34 @@ fn write_yaml(path: &Path, doc: &Value) {
     fs::write(path, serde_yaml::to_string(doc).unwrap()).unwrap();
 }
 
+/// Comment one job's block out in place, the way a user would
+fn comment_out_job(path: &Path, id: &str) {
+    let content = fs::read_to_string(path).unwrap();
+    let mut out = String::new();
+    let mut in_block = false;
+    let mut indent = 0;
+    for line in content.split_inclusive('\n') {
+        let this_indent = line.len() - line.trim_start().len();
+        let is_key = line.trim_end() == format!("{}{id}:", " ".repeat(this_indent));
+        if is_key {
+            in_block = true;
+            indent = this_indent;
+            out.push_str(&format!("{}# {}", " ".repeat(indent), &line[indent..]));
+            continue;
+        }
+        if in_block {
+            if line.trim().is_empty() || this_indent > indent {
+                out.push_str(&format!("{}# {}", " ".repeat(indent), &line[indent..]));
+                continue;
+            }
+            in_block = false;
+        }
+        out.push_str(line);
+    }
+    assert!(out.contains(&format!("# {id}:")), "job {id} not found");
+    fs::write(path, out).unwrap();
+}
+
 #[test]
 fn test_update_lifecycle() {
     let dir = project();
@@ -65,32 +93,157 @@ fn test_update_lifecycle() {
     jobs.shift_remove("rust-fmt").expect("rust-fmt generated");
     write_yaml(&ci_path, &doc);
 
-    update(dir.path()).assert().success();
+    update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added"));
     let content = fs::read_to_string(&ci_path).unwrap();
     assert!(content.contains("cargo test"), "conformed: {content}");
     assert!(!content.contains("echo stale"), "{content}");
     assert!(content.contains("my-job"), "custom kept: {content}");
-    assert!(!content.contains("rust-fmt"), "not re-added: {content}");
+    assert!(content.contains("rust-fmt"), "deleted job re-added: {content}");
 
-    // Disabling a rule removes its job from the existing file
+    // Commenting a job out keeps it disabled: a current block is left alone
+    comment_out_job(&ci_path, "rust-fmt");
+    update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+    let content = fs::read_to_string(&ci_path).unwrap();
+    assert!(content.contains("# rust-fmt:"), "{content}");
+
+    // ...while a stale one is regenerated, still commented
+    let stale = content.replace("cargo fmt", "cargo fmt --old-flag");
+    fs::write(&ci_path, stale).unwrap();
+    update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 disabled"));
+    let content = fs::read_to_string(&ci_path).unwrap();
+    assert!(content.contains("# rust-fmt:"), "{content}");
+    assert!(!content.contains("--old-flag"), "{content}");
+    let doc = read_yaml(&ci_path);
+    assert!(
+        doc["jobs"]["rust-fmt"].is_null(),
+        "stays inactive: {content}"
+    );
+
+    // Disabling a rule removes its job from the existing file — active
+    // (rust-clippy) and commented-out (rust-fmt) alike
     fs::write(
         dir.path().join("cibox.ron"),
-        "(rust_clippy: (enabled: false))",
+        "(rust_clippy: (enabled: false), rust_fmt: (enabled: false))",
     )
     .unwrap();
     update(dir.path()).assert().success();
     let content = fs::read_to_string(&ci_path).unwrap();
     assert!(!content.contains("rust-clippy"), "{content}");
+    assert!(!content.contains("rust-fmt"), "{content}");
 
     // --force restores the canonical pipeline
     update(dir.path()).arg("--force").assert().success();
     let content = fs::read_to_string(&ci_path).unwrap();
-    assert!(content.contains("rust-fmt"), "{content}");
+    assert!(content.contains("rust-test"), "{content}");
     assert!(!content.contains("my-job"), "{content}");
     assert!(
         !content.contains("rust-clippy"),
         "still disabled: {content}"
     );
+}
+
+#[test]
+fn test_commented_job_tracks_config_changes() {
+    let dir = project();
+    let ci_path = dir.path().join(".github/workflows/ci.yml");
+
+    update(dir.path()).assert().success();
+    comment_out_job(&ci_path, "rust-test");
+    update(dir.path()).assert().success();
+
+    // The commented block keeps tracking configuration: a version matrix
+    // shows up inside it, still commented
+    fs::write(
+        dir.path().join("cibox.ron"),
+        r#"(rust_test: (versions: ["1.85", "nightly"]))"#,
+    )
+    .unwrap();
+    update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 disabled"));
+    let content = fs::read_to_string(&ci_path).unwrap();
+    assert!(content.contains("# rust-test:"), "{content}");
+    assert!(content.contains("#   strategy:"), "{content}");
+    assert!(
+        read_yaml(&ci_path)["jobs"]["rust-test"].is_null(),
+        "{content}"
+    );
+}
+
+#[test]
+fn test_rule_flag_limits_update_to_selected_rules() {
+    let dir = project();
+    let ci_path = dir.path().join(".github/workflows/ci.yml");
+
+    update(dir.path()).assert().success();
+
+    // Make two managed jobs stale, then update only one of them
+    let mut doc = read_yaml(&ci_path);
+    let jobs = doc["jobs"].as_mapping_mut().unwrap();
+    jobs["rust-test"] =
+        serde_yaml::from_str("runs-on: ubuntu-latest\nsteps:\n  - run: echo stale\n").unwrap();
+    jobs["rust-fmt"] =
+        serde_yaml::from_str("runs-on: ubuntu-latest\nsteps:\n  - run: echo stale too\n").unwrap();
+    write_yaml(&ci_path, &doc);
+
+    update(dir.path())
+        .args(["--rule", "rust-test"])
+        .assert()
+        .success();
+    let content = fs::read_to_string(&ci_path).unwrap();
+    assert!(content.contains("cargo test"), "{content}");
+    assert!(!content.contains("echo stale\n"), "{content}");
+    assert!(content.contains("echo stale too"), "unselected kept: {content}");
+}
+
+#[test]
+fn test_rule_flag_rejects_unknown_rules_and_force() {
+    let dir = project();
+    update(dir.path())
+        .args(["--rule", "bogus"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("unknown rule 'bogus'")
+                .and(predicate::str::contains("rust-test")),
+        );
+    update(dir.path())
+        .args(["--rule", "rust-test", "--force"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rule_flag_creates_missing_file_with_selected_jobs_only() {
+    let dir = project();
+    let ci_path = dir.path().join(".github/workflows/ci.yml");
+    let release_path = dir.path().join(".github/workflows/release.yml");
+
+    update(dir.path())
+        .args(["--rule", "rust-test"])
+        .assert()
+        .success();
+    let doc = read_yaml(&ci_path);
+    let jobs = doc["jobs"].as_mapping().unwrap();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert!(jobs.contains_key("rust-test"), "{jobs:?}");
+    assert!(!release_path.exists(), "no selected release jobs");
+
+    // A later plain update brings the rest back in
+    update(dir.path()).assert().success();
+    let doc = read_yaml(&ci_path);
+    assert!(doc["jobs"].as_mapping().unwrap().len() > 1);
+    assert!(release_path.is_file());
 }
 
 #[test]

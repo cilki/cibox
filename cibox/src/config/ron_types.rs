@@ -152,7 +152,9 @@ pub struct DockerRule {
 /// platforms. The push authenticates with GITHUB_TOKEN for ghcr.io images,
 /// or with DOCKER_USERNAME/DOCKER_PASSWORD against the registry host in the
 /// image name (Docker Hub when there is none); login is skipped when the
-/// credentials aren't configured, for registries that don't require any.
+/// credentials aren't configured, for registries that don't require any. On
+/// GitHub/Gitea the credentials are read from repository Secrets, falling
+/// back to Variables for values that needn't be secret (e.g. the username).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockerReleaseRule {

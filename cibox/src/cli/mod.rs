@@ -13,8 +13,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Update CI config in place: conform and prune cibox-managed jobs,
-    /// keeping jobs you added and respecting jobs you removed
+    /// Update CI config in place: conform, re-add, and prune cibox-managed
+    /// jobs, keeping jobs you added; comment a job out to keep it disabled
+    /// but maintained
     Update {
         /// Path to cibox.ron override file (optional)
         #[arg(default_value = "cibox.ron")]
@@ -25,9 +26,14 @@ pub enum Commands {
         #[arg(short, long)]
         platform: Option<String>,
 
-        /// Rewrite files completely: re-add dropped jobs and discard customizations
+        /// Rewrite files completely, discarding customizations
         #[arg(short, long)]
         force: bool,
+
+        /// Touch only this rule's jobs (repeatable); everything else,
+        /// including other cibox-managed jobs, is left as-is
+        #[arg(long = "rule", value_name = "RULE", conflicts_with = "force")]
+        rules: Vec<String>,
     },
 
     /// Validate cibox.ron and show the resulting rule resolution

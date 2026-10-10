@@ -56,12 +56,29 @@ fn print_rule_table(resolved: &[ResolvedRule]) {
 }
 
 /// Handle the update command
-pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: bool) -> Result<()> {
+pub fn handle_update(
+    config_path: &str,
+    platform_arg: Option<String>,
+    force: bool,
+    rules: &[String],
+) -> Result<()> {
     let working_dir = PathBuf::from(".");
     let facts = gather_facts(&working_dir);
     let config = load_config(config_path, config_path != "cibox.ron")?;
     let platform = effective_platform(platform_arg, &facts)?;
     let resolved = resolve(&facts, &config);
+
+    // `--rule` must be validated by hand: nothing else rejects an unknown id
+    let valid: Vec<&str> = resolved.iter().map(|r| r.rule.id()).collect();
+    if let Some(bad) = rules.iter().find(|r| !valid.contains(&r.as_str())) {
+        anyhow::bail!("unknown rule '{bad}'; valid rules: {}", valid.join(", "));
+    }
+    let selection: Option<std::collections::BTreeSet<String>> =
+        (!rules.is_empty()).then(|| rules.iter().cloned().collect());
+    let filter = crate::generator::JobFilter {
+        resolved: &resolved,
+        selection: selection.as_ref(),
+    };
 
     println!(
         "{} {} for {}",
@@ -83,7 +100,11 @@ pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: boo
             std::fs::read_to_string(working_dir.join(&file.path))
                 .is_ok_and(|text| !text.trim().is_empty())
         });
-    if planned.iter().all(|file| file.jobs.is_empty()) && !prunable {
+    if planned
+        .iter()
+        .all(|file| crate::generator::managed_jobs(file, &filter).is_empty())
+        && !prunable
+    {
         anyhow::bail!("{}", crate::generator::NOTHING_ENABLED);
     }
 
@@ -94,11 +115,12 @@ pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: boo
         let existing = std::fs::read_to_string(&output_path).ok();
 
         // A missing or empty file gets the full canonical content (as does
-        // --force); a file with content is merged: cibox-owned jobs are
-        // conformed or pruned, everything the user did to it is kept
+        // --force), narrowed to the selected rules under --rule; a file with
+        // content is merged: cibox-managed jobs are conformed, re-added, or
+        // pruned, and everything the user did to it is kept
         let content = match existing {
             Some(text) if !force && !text.trim().is_empty() => {
-                match crate::generator::merge_file(platform, &file, &resolved, &text)? {
+                match crate::generator::merge_file(platform, &file, &filter, &text)? {
                     crate::generator::MergeOutcome::Unchanged => {
                         println!("  {} {} unchanged", "○".dimmed(), path_label);
                         continue;
@@ -114,24 +136,40 @@ pub fn handle_update(config_path: &str, platform_arg: Option<String>, force: boo
                     crate::generator::MergeOutcome::Merged {
                         content,
                         conformed,
+                        added,
                         removed,
+                        disabled,
                         preserved,
                     } => {
+                        let mut parts = vec![format!("{conformed} updated")];
+                        if added > 0 {
+                            parts.push(format!("{added} added"));
+                        }
+                        parts.push(format!("{removed} removed"));
+                        if disabled > 0 {
+                            parts.push(format!("{disabled} disabled"));
+                        }
+                        parts.push(format!("{preserved} kept"));
                         println!(
-                            "  {} {} ({conformed} updated, {removed} removed, {preserved} custom kept)",
+                            "  {} {} ({})",
                             "✓".green().bold(),
-                            path_label
+                            path_label,
+                            parts.join(", ")
                         );
                         content
                     }
                 }
             }
             _ => {
-                if file.jobs.is_empty() {
+                let fresh = crate::generator::PlannedFile {
+                    jobs: crate::generator::managed_jobs(&file, &filter),
+                    ..file.clone()
+                };
+                if fresh.jobs.is_empty() {
                     continue;
                 }
                 println!("  {} {}", "✓".green().bold(), path_label);
-                crate::generator::render_file(platform, &file)?
+                crate::generator::render_file(platform, &fresh)?
             }
         };
 

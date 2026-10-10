@@ -62,12 +62,26 @@ The files cibox manages, per platform:
 | GitLab CI | `.gitlab-ci.yml` |
 | CircleCI | `.circleci/config.yml` |
 
-`cibox update` is safe to re-run after you customize the generated files. It
-conforms the jobs cibox manages to its current output, removes managed jobs
-whose rule you disabled, and leaves everything else alone: jobs you deleted
-stay deleted, and jobs you added are kept. Pass `--force` to rewrite the
-files from scratch instead — as the TUI does when it writes, see
-[Interactive editor](#interactive-editor).
+`cibox update` is safe to re-run after you customize the generated files.
+Merging happens on a lossless YAML tree, so your comments, formatting, and
+key order survive. It conforms the jobs cibox manages to its current output,
+re-adds managed jobs that are missing, removes managed jobs whose rule you
+disabled, and leaves everything else alone: jobs you added are kept
+untouched. Pass `--force` to rewrite the files from scratch instead — as the
+TUI does when it writes, see [Interactive editor](#interactive-editor).
+
+To keep a managed job out of the pipeline without losing it, comment its
+block out. `update` leaves the block commented but keeps regenerating its
+content (reported as "disabled"), so uncommenting it later gives you a
+current job, not a stale one. To drop a job permanently, disable its rule in
+`cibox.ron` — that removes it, commented or not.
+
+Pass `--rule <RULE>` (repeatable) to touch only the named rules' jobs; every
+other job, cibox-managed or not, is left exactly as it is:
+
+```
+$ cibox update --rule rust-test --rule rust-fmt
+```
 
 Turning every rule off (or deleting whatever the last rule detected on) prunes
 all of cibox's jobs, so `cibox update` is also how you hand a pipeline back to
@@ -205,6 +219,6 @@ pick applies to the preview and to `w` for this session only; it is never
 recorded in `cibox.ron`, which holds nothing but rule overrides.
 
 `w` writes each file from scratch, the way `cibox update --force` does: jobs
-you added to a generated file by hand are dropped and jobs you deleted come
-back. Quit and run `cibox update` instead to keep those edits.
+you added to a generated file by hand are dropped, along with your comments
+and formatting. Quit and run `cibox update` instead to keep those edits.
 

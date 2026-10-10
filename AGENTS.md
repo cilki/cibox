@@ -25,12 +25,17 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
   hand-written literals — `build.rs` feeds this file to roniker for the RON
   LSP (`cibox lsp`).
 - `cibox update` merges into existing files instead of overwriting:
-  `generator::plan` lists the managed files and their jobs,
-  `generator::merge_file` conforms/prunes cibox-owned jobs (ownership via
-  `Rule::owns_job_id`) at the `serde_yaml::Value` level and preserves
-  everything the user added or removed. Missing/empty files and `--force`
-  get the full `generator::render_file` output. The editor TUI still
-  overwrites (it previews a diff).
+  `generator::plan` lists the managed files and their jobs, and
+  `generator::merge_file` edits a lossless `yaml-edit` syntax tree, so user
+  comments and formatting survive. Managed jobs (ownership via
+  `Rule::owns_job_id`, narrowed by `--rule` through `generator::JobFilter`)
+  are conformed, re-added when missing, or pruned when their rule is off;
+  everything the user added is preserved. A commented-out managed job stays
+  commented but gets its content regenerated ("disabled") —
+  `generator::disabled` finds those blocks by uncommenting candidate comment
+  runs and parsing them. Missing/empty files and `--force` get the full
+  `generator::render_file` output. The editor TUI still overwrites (it
+  previews a diff).
 
 To add a rule:
 
