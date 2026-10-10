@@ -31,41 +31,22 @@ pub enum MergeOutcome {
     /// Merging would strip every active job from the file, which the
     /// platform rejects as invalid; leave the file untouched
     WouldEmpty,
-    Merged {
-        content: String,
-        /// Owned jobs replaced with canonical content
-        conformed: usize,
-        /// Owned jobs re-added because they were missing
-        added: usize,
-        /// Owned jobs removed because their rule no longer generates them
-        removed: usize,
-        /// Commented-out jobs kept commented, with regenerated content
-        disabled: usize,
-        /// Jobs cibox doesn't manage, left untouched
-        preserved: usize,
-    },
+    Merged { content: String, counts: Counts },
 }
 
-#[derive(Default)]
-struct Counts {
-    conformed: usize,
-    added: usize,
-    removed: usize,
-    disabled: usize,
-    preserved: usize,
-}
-
-impl Counts {
-    fn outcome(self, content: String) -> MergeOutcome {
-        MergeOutcome::Merged {
-            content,
-            conformed: self.conformed,
-            added: self.added,
-            removed: self.removed,
-            disabled: self.disabled,
-            preserved: self.preserved,
-        }
-    }
+/// How many jobs the merge did each thing to, for the command's summary line
+#[derive(Debug, Default)]
+pub struct Counts {
+    /// Owned jobs replaced with canonical content
+    pub conformed: usize,
+    /// Owned jobs re-added because they were missing
+    pub added: usize,
+    /// Owned jobs removed because their rule no longer generates them
+    pub removed: usize,
+    /// Commented-out jobs kept commented, with regenerated content
+    pub disabled: usize,
+    /// Jobs cibox doesn't manage, left untouched
+    pub preserved: usize,
 }
 
 /// Merge one planned file into the existing on-disk content.
@@ -103,9 +84,15 @@ fn parse_lossless(text: &str, path: &Path) -> Result<YamlFile> {
     })
 }
 
-/// The planned jobs split into what runs and what stays commented out, with
-/// `needs` edges pruned to jobs that exist on the other side of the merge.
-struct Partition {
+/// The plan measured against the file: which managed jobs stay active, which
+/// the user commented out (and the comment blocks holding them), and which
+/// are missing and have to be re-added. `needs` edges are pruned to jobs that
+/// exist on the same side of the merge.
+struct Split {
+    /// Comment blocks that really do define disabled managed jobs
+    blocks: Vec<DisabledBlock>,
+    /// The ids `blocks` define, i.e. the jobs the user disabled
+    disabled_ids: Vec<String>,
     /// Managed jobs that will be active in the file, in plan order
     active: Vec<Job>,
     /// Managed jobs the user commented out
@@ -114,19 +101,36 @@ struct Partition {
     adds: Vec<String>,
 }
 
-fn partition(
+impl Split {
+    /// Every managed job that survives the merge, active or commented out —
+    /// what the canonical output has to cover
+    fn kept(&self) -> Vec<Job> {
+        self.active.iter().chain(&self.disabled).cloned().collect()
+    }
+
+    fn active_ids(&self) -> Vec<String> {
+        self.active.iter().map(|j| j.id.clone()).collect()
+    }
+}
+
+fn split_plan(
     planned: &[Job],
     existing_keys: &[String],
-    disabled_ids: &[String],
+    blocks: Vec<DisabledBlock>,
     filter: &JobFilter,
-) -> Partition {
-    let managed: Vec<Job> = planned
+) -> Split {
+    // An active key shadows a commented block of the same id: the block is
+    // then an ordinary comment, not a disabled job.
+    let blocks: Vec<DisabledBlock> = blocks
+        .into_iter()
+        .filter(|b| !b.ids.iter().any(|id| existing_keys.contains(id)))
+        .collect();
+    let disabled_ids: Vec<String> = blocks.iter().flat_map(|b| b.ids.clone()).collect();
+
+    let (mut disabled, mut active): (Vec<Job>, Vec<Job>) = planned
         .iter()
         .filter(|j| filter.managed(&j.id))
         .cloned()
-        .collect();
-    let (mut disabled, mut active): (Vec<Job>, Vec<Job>) = managed
-        .into_iter()
         .partition(|j| disabled_ids.contains(&j.id));
     let adds: Vec<String> = active
         .iter()
@@ -154,24 +158,60 @@ fn partition(
         job.needs
             .retain(|n| final_active.contains(n) || inert.contains(n));
     }
-    Partition {
+    Split {
+        blocks,
+        disabled_ids,
         active,
         disabled,
         adds,
     }
 }
 
-/// An active key shadows a commented block of the same id: the block is then
-/// an ordinary comment, not a disabled job.
-fn unshadowed_blocks(blocks: Vec<DisabledBlock>, active_keys: &[String]) -> Vec<DisabledBlock> {
-    blocks
-        .into_iter()
-        .filter(|b| !b.ids.iter().any(|id| active_keys.contains(id)))
+fn get<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
+    map.get(Value::from(key))
+}
+
+/// The mapping's keys, in order, skipping any that aren't plain strings
+fn string_keys(map: &serde_yaml::Mapping) -> Vec<String> {
+    map.keys()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
         .collect()
 }
 
-fn get<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
-    map.get(Value::from(key))
+/// The existing top-level `jobs:` mapping on the platforms that nest their
+/// jobs under one. Holding nothing is legitimate — that is what every job
+/// being commented out or deleted looks like — but a file without the key at
+/// all is not a pipeline cibox can merge into.
+fn existing_job_mapping(
+    original: &serde_yaml::Mapping,
+    path: &Path,
+) -> Result<serde_yaml::Mapping> {
+    match get(original, "jobs") {
+        Some(Value::Mapping(m)) => Ok(m.clone()),
+        Some(Value::Null) => Ok(serde_yaml::Mapping::new()),
+        _ => bail!(
+            "{} has no `jobs:` mapping; use --force to overwrite it",
+            path.display()
+        ),
+    }
+}
+
+/// The `jobs:` mapping of freshly lowered canonical output, empty when the
+/// resolution left no job for this file
+fn canonical_job_mapping(canonical: &Value) -> serde_yaml::Mapping {
+    canonical
+        .get("jobs")
+        .and_then(Value::as_mapping)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn root_mapping(parsed: &YamlFile) -> Result<Mapping> {
+    parsed
+        .document()
+        .and_then(|doc| doc.as_mapping())
+        .context("document is a mapping")
 }
 
 /// Render `{key: value}` canonically and return the parsed value node, ready
@@ -260,6 +300,54 @@ fn conform_jobs(
         }
     }
     Ok(())
+}
+
+/// Where a platform keeps its jobs in the document.
+enum JobsAt {
+    /// Under a top-level `jobs:` mapping (GitHub/Gitea, CircleCI)
+    JobsKey,
+    /// At the document root, mixed with configuration keys (GitLab)
+    Root,
+}
+
+/// The tree phase every merge ends with: reparse the text-edited document and
+/// conform the managed jobs on the lossless syntax tree. Returns the parse —
+/// whose tree the caller may keep editing before rendering it — alongside a
+/// plain-value view of the same text.
+fn conform_document(
+    text: &str,
+    at: JobsAt,
+    file: &PlannedFile,
+    filter: &JobFilter,
+    canonical_jobs: &serde_yaml::Mapping,
+    adds: &[String],
+    counts: &mut Counts,
+) -> Result<(YamlFile, Value)> {
+    let parsed = parse_lossless(text, &file.path)?;
+    let current: Value = serde_yaml::from_str(text).context("regenerated comment blocks reparse")?;
+    let plan = JobsPlan {
+        canonical: canonical_jobs,
+        adds,
+        filter,
+        path: &file.path,
+    };
+    let current_map = current.as_mapping().context("document is a mapping")?;
+    let root = root_mapping(&parsed)?;
+    match at {
+        JobsAt::Root => {
+            conform_jobs(&root, &gitlab_job_keys(current_map), current_map, &plan, counts)?;
+        }
+        JobsAt::JobsKey => {
+            let jobs = get(current_map, "jobs")
+                .and_then(Value::as_mapping)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(node) = root.get_mapping("jobs") {
+                conform_jobs(&node, &string_keys(&jobs), &jobs, &plan, counts)?;
+            }
+        }
+    }
+    Ok((parsed, current))
 }
 
 /// Text replacements for the disabled blocks: regenerate blocks whose
@@ -394,72 +482,35 @@ fn merge_github(
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
 
-    // `jobs:` holding nothing happens when every job is commented out or
-    // deleted; a file without the key at all is not a workflow
-    let existing_jobs: serde_yaml::Mapping = match get(original, "jobs") {
-        Some(Value::Mapping(m)) => m.clone(),
-        Some(Value::Null) => serde_yaml::Mapping::new(),
-        _ => bail!(
-            "{} has no `jobs:` mapping; use --force to overwrite it",
-            file.path.display()
-        ),
-    };
-    let existing_keys: Vec<String> = existing_jobs
-        .keys()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
+    let existing_jobs = existing_job_mapping(original, &file.path)?;
+    let existing_keys = string_keys(&existing_jobs);
+    let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
 
-    let blocks = unshadowed_blocks(scan.blocks, &existing_keys);
-    let disabled_ids: Vec<String> = blocks.iter().flat_map(|b| b.ids.clone()).collect();
-    let parts = partition(&file.jobs, &existing_keys, &disabled_ids, filter);
-
-    let kept_all: Vec<Job> = parts.active.iter().chain(&parts.disabled).cloned().collect();
-    let canonical =
-        serde_yaml::to_value(crate::platforms::github::lower::lower_github(&kept_all, file.kind))?;
-    let empty = serde_yaml::Mapping::new();
-    let canonical_jobs = canonical
-        .get("jobs")
-        .and_then(Value::as_mapping)
-        .unwrap_or(&empty);
+    let canonical = serde_yaml::to_value(crate::platforms::github::lower::lower_github(
+        &split.kept(),
+        file.kind,
+    ))?;
+    let canonical_jobs = &canonical_job_mapping(&canonical);
 
     // Text phase: the commented blocks live outside the YAML value tree
-    let mut edits = block_edits(&blocks, canonical_jobs, &mut counts)?;
+    let mut edits = block_edits(&split.blocks, canonical_jobs, &mut counts)?;
     if existing_jobs.is_empty() {
-        add_jobs_textually(existing, &parts.adds, canonical_jobs, &mut counts, &mut edits)?;
+        add_jobs_textually(existing, &split.adds, canonical_jobs, &mut counts, &mut edits)?;
     }
     let text = apply_edits(existing, edits);
 
     // Tree phase: conform the live jobs on the lossless syntax tree
-    let parsed = parse_lossless(&text, &file.path)?;
-    let current: Value =
-        serde_yaml::from_str(&text).context("regenerated comment blocks reparse")?;
+    let (parsed, current) = conform_document(
+        &text,
+        JobsAt::JobsKey,
+        file,
+        filter,
+        canonical_jobs,
+        &split.adds,
+        &mut counts,
+    )?;
     let current_map = current.as_mapping().context("document is a mapping")?;
-    let current_jobs = get(current_map, "jobs")
-        .and_then(Value::as_mapping)
-        .cloned()
-        .unwrap_or_default();
-    let current_keys: Vec<String> = current_jobs
-        .keys()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    let doc = parsed.document().context("document is a mapping")?;
-    let root = doc.as_mapping().context("document is a mapping")?;
-    if let Some(jobs) = root.get_mapping("jobs") {
-        conform_jobs(
-            &jobs,
-            &current_keys,
-            &current_jobs,
-            &JobsPlan {
-                canonical: canonical_jobs,
-                adds: &parts.adds,
-                filter,
-                path: &file.path,
-            },
-            &mut counts,
-        )?;
-    }
+    let root = root_mapping(&parsed)?;
 
     // Only `jobs` is managed; user-tuned triggers/env/permissions are kept.
     // Scaffold `name`/`on`/`permissions` solely when the workflow lacks them.
@@ -481,11 +532,11 @@ fn merge_github(
         .iter()
         .filter(|k| !filter.managed(k) || get(canonical_jobs, k).is_some())
         .count()
-        + parts.adds.len();
+        + split.adds.len();
     if live_jobs == 0 && counts.disabled == 0 {
         return Ok(MergeOutcome::WouldEmpty);
     }
-    Ok(counts.outcome(content))
+    Ok(MergeOutcome::Merged { content, counts })
 }
 
 /// Top-level `.gitlab-ci.yml` keys that are configuration, not jobs.
@@ -531,39 +582,28 @@ fn merge_gitlab(
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
     let existing_keys = gitlab_job_keys(original);
+    let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
 
-    let blocks = unshadowed_blocks(scan.blocks, &existing_keys);
-    let disabled_ids: Vec<String> = blocks.iter().flat_map(|b| b.ids.clone()).collect();
-    let parts = partition(&file.jobs, &existing_keys, &disabled_ids, filter);
-
-    let kept_all: Vec<Job> = parts.active.iter().chain(&parts.disabled).cloned().collect();
-    let canonical = serde_yaml::to_value(crate::platforms::gitlab::lower::lower_gitlab(&kept_all))?;
+    let canonical =
+        serde_yaml::to_value(crate::platforms::gitlab::lower::lower_gitlab(&split.kept()))?;
     let canonical_map = canonical
         .as_mapping()
         .expect("GitLabCI serializes to a mapping");
 
-    let edits = block_edits(&blocks, canonical_map, &mut counts)?;
+    let edits = block_edits(&split.blocks, canonical_map, &mut counts)?;
     let text = apply_edits(existing, edits);
 
-    let parsed = parse_lossless(&text, &file.path)?;
-    let current: Value =
-        serde_yaml::from_str(&text).context("regenerated comment blocks reparse")?;
-    let current_map = current.as_mapping().context("document is a mapping")?;
-    let doc = parsed.document().context("document is a mapping")?;
-    let root = doc.as_mapping().context("document is a mapping")?;
-
-    conform_jobs(
-        &root,
-        &existing_keys,
-        current_map,
-        &JobsPlan {
-            canonical: canonical_map,
-            adds: &parts.adds,
-            filter,
-            path: &file.path,
-        },
+    let (parsed, current) = conform_document(
+        &text,
+        JobsAt::Root,
+        file,
+        filter,
+        canonical_map,
+        &split.adds,
         &mut counts,
     )?;
+    let current_map = current.as_mapping().context("document is a mapping")?;
+    let root = root_mapping(&parsed)?;
 
     // Conform `stages` to what the final jobs reference. Canonical stages
     // cover the disabled jobs too, so a commented job's stage stays and
@@ -578,7 +618,7 @@ fn merge_gitlab(
             final_jobs.push(value);
         }
     }
-    for id in &parts.adds {
+    for id in &split.adds {
         if let Some(canonical) = get(canonical_map, id) {
             final_jobs.push(canonical);
         }
@@ -639,13 +679,13 @@ fn merge_gitlab(
     }
 
     let mut content = parsed.to_string();
-    let header = header_jobs(&file.jobs, filter, &disabled_ids, &existing_keys);
+    let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &existing_keys);
     crate::generator::reconcile_required_variables(Platform::GitLab, &header, &mut content);
 
     if content == existing {
         return Ok(MergeOutcome::Unchanged);
     }
-    Ok(counts.outcome(content))
+    Ok(MergeOutcome::Merged { content, counts })
 }
 
 /// A CircleCI workflow invocation entry names its job either as a bare
@@ -680,6 +720,17 @@ enum EntryOp {
     Replace(Vec<Value>),
 }
 
+/// The canonical invocation entries of one job. A matrix job is invoked once
+/// per leg, so an id can map to several entries; a job that is no longer
+/// generated maps to none.
+fn legs_of(canonical_entries: &[Value], id: &str) -> Vec<Value> {
+    canonical_entries
+        .iter()
+        .filter(|c| entry_id(c).as_deref() == Some(id))
+        .cloned()
+        .collect()
+}
+
 /// Decide the fate of each invocation entry in one workflow and the list it
 /// adds up to. A matrix job is invoked once per leg, so one id can map to
 /// several canonical entries: the first existing entry expands to all of
@@ -691,13 +742,6 @@ fn conform_entries(
     disabled_ids: &[String],
     filter: &JobFilter,
 ) -> (Vec<Value>, Vec<EntryOp>, Vec<String>) {
-    let legs_of = |id: &str| -> Vec<Value> {
-        canonical_entries
-            .iter()
-            .filter(|c| entry_id(c).as_deref() == Some(id))
-            .cloned()
-            .collect()
-    };
     let mut seen: Vec<String> = Vec::new();
     let mut desired: Vec<Value> = Vec::new();
     let mut ops: Vec<EntryOp> = Vec::new();
@@ -708,7 +752,7 @@ fn conform_entries(
                     ops.push(EntryOp::Remove);
                     continue;
                 }
-                let legs = legs_of(&id);
+                let legs = legs_of(canonical_entries, &id);
                 if legs.is_empty() {
                     ops.push(EntryOp::Remove);
                     continue;
@@ -807,32 +851,14 @@ fn merge_circleci(
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
 
-    let existing_jobs: serde_yaml::Mapping = match get(original, "jobs") {
-        Some(Value::Mapping(m)) => m.clone(),
-        Some(Value::Null) => serde_yaml::Mapping::new(),
-        _ => bail!(
-            "{} has no `jobs:` mapping; use --force to overwrite it",
-            file.path.display()
-        ),
-    };
-    let existing_keys: Vec<String> = existing_jobs
-        .keys()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
+    let existing_jobs = existing_job_mapping(original, &file.path)?;
+    let existing_keys = string_keys(&existing_jobs);
+    let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
 
-    let blocks = unshadowed_blocks(scan.blocks, &existing_keys);
-    let disabled_ids: Vec<String> = blocks.iter().flat_map(|b| b.ids.clone()).collect();
-    let parts = partition(&file.jobs, &existing_keys, &disabled_ids, filter);
-
-    let kept_all: Vec<Job> = parts.active.iter().chain(&parts.disabled).cloned().collect();
-    let canonical =
-        serde_yaml::to_value(crate::platforms::circleci::lower::lower_circleci(&kept_all))?;
-    let empty = serde_yaml::Mapping::new();
-    let canonical_jobs = canonical
-        .get("jobs")
-        .and_then(Value::as_mapping)
-        .unwrap_or(&empty);
+    let canonical = serde_yaml::to_value(crate::platforms::circleci::lower::lower_circleci(
+        &split.kept(),
+    ))?;
+    let canonical_jobs = &canonical_job_mapping(&canonical);
     let canonical_entries: Vec<Value> = canonical
         .get("workflows")
         .and_then(|w| w.get("main"))
@@ -840,24 +866,21 @@ fn merge_circleci(
         .and_then(Value::as_sequence)
         .cloned()
         .unwrap_or_default();
-    let legs_of = |id: &str| -> Vec<Value> {
-        canonical_entries
-            .iter()
-            .filter(|c| entry_id(c).as_deref() == Some(id))
-            .cloned()
-            .collect()
-    };
 
     // Text phase: commented job blocks, plus commented workflow entries —
     // kept in sync with the job's canonical invocations while it stays
     // disabled, dropped when the job is no longer generated at all
-    let mut edits = block_edits(&blocks, canonical_jobs, &mut counts)?;
+    let mut edits = block_edits(&split.blocks, canonical_jobs, &mut counts)?;
     for run in &scan.entries {
         // An id that isn't a disabled job makes this an ordinary comment
-        if run.ids.iter().any(|id| !disabled_ids.contains(id)) {
+        if run.ids.iter().any(|id| !split.disabled_ids.contains(id)) {
             continue;
         }
-        let expected: Vec<Value> = run.ids.iter().flat_map(|id| legs_of(id)).collect();
+        let expected: Vec<Value> = run
+            .ids
+            .iter()
+            .flat_map(|id| legs_of(&canonical_entries, id))
+            .collect();
         if expected == run.entries {
             continue;
         }
@@ -869,7 +892,7 @@ fn merge_circleci(
         edits.push((run.span.clone(), disabled::comment_out(&rendered, run.indent)));
     }
     if existing_jobs.is_empty() {
-        add_jobs_textually(existing, &parts.adds, canonical_jobs, &mut counts, &mut edits)?;
+        add_jobs_textually(existing, &split.adds, canonical_jobs, &mut counts, &mut edits)?;
     }
 
     // A job also appears as an entry in a workflow's `jobs` list — conform
@@ -877,7 +900,7 @@ fn merge_circleci(
     // lists are edited textually, item by item (spans from the syntax
     // tree), so comments between entries survive; flow-style lists are
     // replaced wholesale on the tree instead.
-    let active_ids: Vec<String> = parts.active.iter().map(|j| j.id.clone()).collect();
+    let active_ids = split.active_ids();
     let mut invoked: Vec<String> = Vec::new();
     let mut drop_workflows: Vec<String> = Vec::new();
     let mut wholesale: Vec<(String, Vec<Value>)> = Vec::new();
@@ -895,7 +918,7 @@ fn merge_circleci(
                 continue;
             };
             let (desired, ops, seen) =
-                conform_entries(entries, &canonical_entries, &disabled_ids, filter);
+                conform_entries(entries, &canonical_entries, &split.disabled_ids, filter);
             invoked.extend(seen);
             let spans = workflow_spans(existing, original_parse, name);
             if name == "main" {
@@ -942,7 +965,7 @@ fn merge_circleci(
     let missing_entries: Vec<Value> = active_ids
         .iter()
         .filter(|id| !invoked.contains(id))
-        .flat_map(|id| legs_of(id))
+        .flat_map(|id| legs_of(&canonical_entries, id))
         .collect();
     let mut build_main = false;
     if !missing_entries.is_empty() {
@@ -958,35 +981,16 @@ fn merge_circleci(
 
     let text = apply_edits(existing, edits);
 
-    let parsed = parse_lossless(&text, &file.path)?;
-    let current: Value =
-        serde_yaml::from_str(&text).context("regenerated comment blocks reparse")?;
-    let current_map = current.as_mapping().context("document is a mapping")?;
-    let current_jobs = get(current_map, "jobs")
-        .and_then(Value::as_mapping)
-        .cloned()
-        .unwrap_or_default();
-    let current_keys: Vec<String> = current_jobs
-        .keys()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    let doc = parsed.document().context("document is a mapping")?;
-    let root = doc.as_mapping().context("document is a mapping")?;
-    if let Some(jobs) = root.get_mapping("jobs") {
-        conform_jobs(
-            &jobs,
-            &current_keys,
-            &current_jobs,
-            &JobsPlan {
-                canonical: canonical_jobs,
-                adds: &parts.adds,
-                filter,
-                path: &file.path,
-            },
-            &mut counts,
-        )?;
-    }
+    let (parsed, _) = conform_document(
+        &text,
+        JobsAt::JobsKey,
+        file,
+        filter,
+        canonical_jobs,
+        &split.adds,
+        &mut counts,
+    )?;
+    let root = root_mapping(&parsed)?;
 
     if let Some(workflows_node) = root.get_mapping("workflows") {
         for name in &drop_workflows {
@@ -1017,13 +1021,13 @@ fn merge_circleci(
     }
 
     let mut content = parsed.to_string();
-    let header = header_jobs(&file.jobs, filter, &disabled_ids, &existing_keys);
+    let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &existing_keys);
     crate::generator::reconcile_required_variables(Platform::CircleCI, &header, &mut content);
 
     if content == existing {
         return Ok(MergeOutcome::Unchanged);
     }
-    Ok(counts.outcome(content))
+    Ok(MergeOutcome::Merged { content, counts })
 }
 
 #[cfg(test)]
@@ -1072,34 +1076,12 @@ mod tests {
         }
     }
 
-    struct MergedParts {
-        content: String,
-        conformed: usize,
-        added: usize,
-        removed: usize,
-        disabled: usize,
-        preserved: usize,
-    }
-
-    fn merged(outcome: MergeOutcome) -> MergedParts {
+    /// The content and counts of a merge that is expected to have changed
+    /// something
+    fn merged(outcome: MergeOutcome) -> (String, Counts) {
         match outcome {
-            MergeOutcome::Merged {
-                content,
-                conformed,
-                added,
-                removed,
-                disabled,
-                preserved,
-            } => MergedParts {
-                content,
-                conformed,
-                added,
-                removed,
-                disabled,
-                preserved,
-            },
-            MergeOutcome::Unchanged => panic!("expected Merged, got Unchanged"),
-            MergeOutcome::WouldEmpty => panic!("expected Merged, got WouldEmpty"),
+            MergeOutcome::Merged { content, counts } => (content, counts),
+            other => panic!("expected Merged, got {other:?}"),
         }
     }
 
@@ -1156,18 +1138,18 @@ jobs:
 "#;
 
         let filter = no_selection(&resolved);
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
 
-        assert!(!m.content.contains("echo stale"), "{}", m.content);
-        assert!(m.content.contains("cargo test"), "{}", m.content);
-        assert!(m.content.contains("echo mine"), "{}", m.content);
+        assert!(!content.contains("echo stale"), "{}", content);
+        assert!(content.contains("cargo test"), "{}", content);
+        assert!(content.contains("echo mine"), "{}", content);
         // Deleted jobs come back
-        assert!(m.content.contains("rust-fmt"), "{}", m.content);
-        assert!(m.content.contains("My CI"), "{}", m.content);
-        assert!(m.content.contains("develop"), "{}", m.content);
-        assert_eq!(m.conformed, 1);
-        assert_eq!(m.added, file.jobs.len() - 1);
-        assert_eq!((m.removed, m.disabled, m.preserved), (0, 0, 1));
+        assert!(content.contains("rust-fmt"), "{}", content);
+        assert!(content.contains("My CI"), "{}", content);
+        assert!(content.contains("develop"), "{}", content);
+        assert_eq!(counts.conformed, 1);
+        assert_eq!(counts.added, file.jobs.len() - 1);
+        assert_eq!((counts.removed, counts.disabled, counts.preserved), (0, 0, 1));
     }
 
     #[test]
@@ -1192,9 +1174,9 @@ jobs:
 "#;
 
         let filter = no_selection(&resolved);
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
-        assert!(!m.content.contains("rust-fmt"), "{}", m.content);
-        assert_eq!(m.removed, 1);
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert!(!content.contains("rust-fmt"), "{}", content);
+        assert_eq!(counts.removed, 1);
     }
 
     #[test]
@@ -1227,18 +1209,18 @@ jobs:
 "#;
 
         let filter = no_selection(&resolved);
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
         // The deleted leg is re-added, so the manifest keeps depending on it
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
-        assert!(doc["jobs"]["docker-release-linux"].is_mapping(), "{}", m.content);
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc["jobs"]["docker-release-linux"].is_mapping(), "{}", content);
         let needs: Vec<&str> = doc["jobs"]["docker-release"]["needs"]
             .as_sequence()
             .unwrap()
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert!(needs.contains(&"docker-release-linux"), "{}", m.content);
-        assert!(needs.contains(&"docker-release-windows"), "{}", m.content);
+        assert!(needs.contains(&"docker-release-linux"), "{}", content);
+        assert!(needs.contains(&"docker-release-windows"), "{}", content);
     }
 
     #[test]
@@ -1256,11 +1238,11 @@ jobs:
         let canonical = render_file(Platform::GitHub, &file).unwrap();
         let existing = comment_out_job(&canonical, "docker-release-linux");
 
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
-        assert_eq!(m.disabled, 1, "{}", m.content);
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
+        assert_eq!(counts.disabled, 1, "{}", content);
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
         // Not an active job anymore...
-        assert!(doc["jobs"]["docker-release-linux"].is_null(), "{}", m.content);
+        assert!(doc["jobs"]["docker-release-linux"].is_null(), "{}", content);
         // ...so the live manifest job must not depend on it
         let needs: Vec<&str> = doc["jobs"]["docker-release"]["needs"]
             .as_sequence()
@@ -1268,10 +1250,10 @@ jobs:
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert!(!needs.contains(&"docker-release-linux"), "{}", m.content);
-        assert!(needs.contains(&"docker-release-windows"), "{}", m.content);
+        assert!(!needs.contains(&"docker-release-linux"), "{}", content);
+        assert!(needs.contains(&"docker-release-windows"), "{}", content);
         // The commented block itself survives
-        assert!(m.content.contains("# docker-release-linux:"), "{}", m.content);
+        assert!(content.contains("# docker-release-linux:"), "{}", content);
     }
 
     #[test]
@@ -1315,14 +1297,14 @@ jobs:
     steps:
       - run: echo stale
 "#;
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, without).unwrap());
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, without).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
         assert_eq!(doc["permissions"]["contents"].as_str(), Some("read"));
         // Scaffolded keys land in the preamble, not after the job list
         assert!(
-            m.content.find("permissions:").unwrap() < m.content.find("jobs:").unwrap(),
+            content.find("permissions:").unwrap() < content.find("jobs:").unwrap(),
             "{}",
-            m.content
+            content
         );
 
         // A user who widened the token on purpose keeps their choice
@@ -1337,8 +1319,8 @@ jobs:
     steps:
       - run: echo stale
 "#;
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, with).unwrap());
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, with).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
         assert_eq!(doc["permissions"]["contents"].as_str(), Some("write"));
         assert_eq!(doc["permissions"]["id-token"].as_str(), Some("write"));
     }
@@ -1402,11 +1384,11 @@ jobs:
       # keep this hack until the flake is fixed
       - run: echo mine
 "#;
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
-        assert!(m.content.contains("# named with care"), "{}", m.content);
-        assert!(m.content.contains("# trigger notes live here"), "{}", m.content);
-        assert!(m.content.contains("# keep this hack"), "{}", m.content);
-        assert!(!m.content.contains("echo stale"), "{}", m.content);
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert!(content.contains("# named with care"), "{}", content);
+        assert!(content.contains("# trigger notes live here"), "{}", content);
+        assert!(content.contains("# keep this hack"), "{}", content);
+        assert!(!content.contains("echo stale"), "{}", content);
     }
 
     #[test]
@@ -1421,18 +1403,18 @@ jobs:
         // Make the commented content stale
         existing = existing.replace("cargo test", "cargo test --old-flag");
 
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
-        assert_eq!(m.disabled, 1, "{}", m.content);
-        assert_eq!(m.conformed, 0, "{}", m.content);
-        assert!(m.content.contains("# rust-test:"), "{}", m.content);
-        assert!(m.content.contains("cargo test"), "{}", m.content);
-        assert!(!m.content.contains("--old-flag"), "{}", m.content);
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
-        assert!(doc["jobs"]["rust-test"].is_null(), "{}", m.content);
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
+        assert_eq!(counts.disabled, 1, "{}", content);
+        assert_eq!(counts.conformed, 0, "{}", content);
+        assert!(content.contains("# rust-test:"), "{}", content);
+        assert!(content.contains("cargo test"), "{}", content);
+        assert!(!content.contains("--old-flag"), "{}", content);
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc["jobs"]["rust-test"].is_null(), "{}", content);
 
         // Merging the output again is a no-op
         assert!(matches!(
-            merge_file(Platform::GitHub, &file, &filter, &m.content).unwrap(),
+            merge_file(Platform::GitHub, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
         ));
     }
@@ -1474,10 +1456,10 @@ jobs:
         let file = planned_file(Platform::GitHub, &resolved, 0);
         let filter = no_selection(&resolved);
 
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
-        assert_eq!(m.removed, 1, "{}", m.content);
-        assert_eq!(m.disabled, 0, "{}", m.content);
-        assert!(!m.content.contains("rust-fmt"), "{}", m.content);
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
+        assert_eq!(counts.removed, 1, "{}", content);
+        assert_eq!(counts.disabled, 0, "{}", content);
+        assert!(!content.contains("rust-fmt"), "{}", content);
     }
 
     #[test]
@@ -1493,11 +1475,11 @@ jobs:
         }
         let existing = existing.replace("cargo test", "cargo test --old-flag");
 
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
-        assert_eq!(m.disabled, file.jobs.len(), "{}", m.content);
-        assert!(!m.content.contains("--old-flag"), "{}", m.content);
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
-        assert!(doc["jobs"].is_null(), "{}", m.content);
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
+        assert_eq!(counts.disabled, file.jobs.len(), "{}", content);
+        assert!(!content.contains("--old-flag"), "{}", content);
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc["jobs"].is_null(), "{}", content);
     }
 
     #[test]
@@ -1529,14 +1511,14 @@ jobs:
       - run: echo mine
 "#;
 
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
-        assert_eq!(m.conformed, 1, "{}", m.content);
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert_eq!(counts.conformed, 1, "{}", content);
         // Unselected cibox jobs are left exactly as found, and missing ones
         // are not added
-        assert!(m.content.contains("echo stale too"), "{}", m.content);
-        assert_eq!(m.added, 0, "{}", m.content);
-        assert_eq!(m.preserved, 2, "{}", m.content);
-        assert!(!m.content.contains("rust-clippy"), "{}", m.content);
+        assert!(content.contains("echo stale too"), "{}", content);
+        assert_eq!(counts.added, 0, "{}", content);
+        assert_eq!(counts.preserved, 2, "{}", content);
+        assert!(!content.contains("rust-clippy"), "{}", content);
     }
 
     #[test]
@@ -1566,10 +1548,10 @@ jobs:
       - run: cargo fmt --check
 "#;
 
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
         // rust-fmt's rule is disabled, but it isn't selected, so it stays
-        assert!(m.content.contains("rust-fmt"), "{}", m.content);
-        assert_eq!(m.removed, 0, "{}", m.content);
+        assert!(content.contains("rust-fmt"), "{}", content);
+        assert_eq!(counts.removed, 0, "{}", content);
     }
 
     #[test]
@@ -1594,19 +1576,19 @@ my-job:
   script: [echo mine]
 "#;
 
-        let m = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        let (content, counts) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
 
-        assert!(m.content.contains("extra.yml"), "{}", m.content);
-        assert!(m.content.contains(".hidden-template"), "{}", m.content);
-        assert!(m.content.contains("MINE"), "{}", m.content);
-        assert!(m.content.contains("my-job"), "{}", m.content);
-        assert!(m.content.contains("cargo test"), "{}", m.content);
-        assert!(!m.content.contains("echo stale"), "{}", m.content);
+        assert!(content.contains("extra.yml"), "{}", content);
+        assert!(content.contains(".hidden-template"), "{}", content);
+        assert!(content.contains("MINE"), "{}", content);
+        assert!(content.contains("my-job"), "{}", content);
+        assert!(content.contains("cargo test"), "{}", content);
+        assert!(!content.contains("echo stale"), "{}", content);
         // The custom stage survives because my-job references it
-        assert!(m.content.contains("custom"), "{}", m.content);
-        assert_eq!(m.conformed, 1);
-        assert_eq!(m.added, file.jobs.len() - 1);
-        assert_eq!((m.removed, m.preserved), (0, 1));
+        assert!(content.contains("custom"), "{}", content);
+        assert_eq!(counts.conformed, 1);
+        assert_eq!(counts.added, file.jobs.len() - 1);
+        assert_eq!((counts.removed, counts.preserved), (0, 1));
     }
 
     #[test]
@@ -1622,14 +1604,14 @@ my-job:
                         only:\n    refs: [tags]\n\
                         my-release:\n  stage: deploy\n  script: [echo mine]\n  \
                         only:\n    refs: [tags]\n";
-        let m = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
 
         assert_eq!(
             doc["rust-release"]["rules"][0]["if"].as_str(),
             Some("$CI_COMMIT_TAG =~ /^v/")
         );
-        assert!(doc["rust-release"]["only"].is_null(), "{}", m.content);
+        assert!(doc["rust-release"]["only"].is_null(), "{}", content);
         // The user's own job is not cibox's to re-gate
         assert_eq!(doc["my-release"]["only"]["refs"][0].as_str(), Some("tags"));
     }
@@ -1648,11 +1630,11 @@ my-job:
                         RUSTDOCFLAGS: --cfg docsrs\n  MINE: '1'\n\
                         rust-test:\n  stage: test\n  script: [echo stale]\n\
                         rust-doc:\n  stage: lint\n  script: [echo stale]\n";
-        let m = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
 
-        assert!(doc["variables"]["RUSTDOCFLAGS"].is_null(), "{}", m.content);
-        assert!(doc["variables"]["CARGO_HOME"].is_null(), "{}", m.content);
+        assert!(doc["variables"]["RUSTDOCFLAGS"].is_null(), "{}", content);
+        assert!(doc["variables"]["CARGO_HOME"].is_null(), "{}", content);
         // A variable cibox doesn't set is the user's to keep
         assert_eq!(doc["variables"]["MINE"].as_str(), Some("1"));
 
@@ -1661,7 +1643,7 @@ my-job:
             Some("--cfg docsrs")
         );
         assert_eq!(doc["rust-test"]["variables"]["CARGO_HOME"].as_str(), Some(".cargo"));
-        assert!(doc["rust-test"]["variables"]["RUSTDOCFLAGS"].is_null(), "{}", m.content);
+        assert!(doc["rust-test"]["variables"]["RUSTDOCFLAGS"].is_null(), "{}", content);
     }
 
     #[test]
@@ -1673,10 +1655,10 @@ my-job:
 
         let existing = "stages: [test]\nvariables:\n  CARGO_HOME: .cargo\n\
                         rust-test:\n  stage: test\n  script: [echo stale]\n";
-        let m = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
-        assert!(!m.content.contains("variables:\n  CARGO_HOME"), "{}", m.content);
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
-        assert!(doc.get("variables").is_none(), "{}", m.content);
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        assert!(!content.contains("variables:\n  CARGO_HOME"), "{}", content);
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc.get("variables").is_none(), "{}", content);
     }
 
     #[test]
@@ -1689,25 +1671,24 @@ my-job:
 
         // The secret-bearing job gets re-added, so the header appears
         let existing = "stages: [test]\nrust-test:\n  stage: test\n  script: [echo stale]\n";
-        let m = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
         assert!(
-            m.content
-                .starts_with("# Required CI variables: CARGO_REGISTRY_TOKEN\n"),
+            content.starts_with("# Required CI variables: CARGO_REGISTRY_TOKEN\n"),
             "{}",
-            m.content
+            content
         );
         // ...exactly once, even though the next merge starts from a file
         // that already carries it
-        let twice = merged(
+        let (twice, _) = merged(
             merge_file(
                 Platform::GitLab,
                 &file,
                 &filter,
-                &m.content.replace("cargo publish", "echo stale"),
+                &content.replace("cargo publish", "echo stale"),
             )
             .unwrap(),
         );
-        assert_eq!(twice.content.matches("Required CI variables").count(), 1);
+        assert_eq!(twice.matches("Required CI variables").count(), 1);
 
         // No secret-bearing job left: the header goes away
         let mut config = CiboxConfig::default();
@@ -1715,8 +1696,8 @@ my-job:
         let resolved = resolve(&facts, &config);
         let file = plan(&facts, &resolved, Platform::GitLab).unwrap().swap_remove(0);
         let filter = no_selection(&resolved);
-        let m = merged(merge_file(Platform::GitLab, &file, &filter, &m.content).unwrap());
-        assert!(!m.content.contains("Required CI variables"), "{}", m.content);
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, &content).unwrap());
+        assert!(!content.contains("Required CI variables"), "{}", content);
 
         // GitHub workflows name their secrets inline, so no header there
         let facts = full_facts();
@@ -1726,8 +1707,8 @@ my-job:
         let existing = "name: Release\non:\n  push:\n    tags: [v*]\njobs:\n  \
                         rust-release:\n    runs-on: ubuntu-latest\n    steps:\n      \
                         - run: echo stale\n";
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
-        assert!(!m.content.contains("Required CI variables"), "{}", m.content);
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert!(!content.contains("Required CI variables"), "{}", content);
     }
 
     #[test]
@@ -1740,23 +1721,23 @@ my-job:
         let canonical = render_file(Platform::GitLab, &file).unwrap();
         let existing = comment_out_job(&canonical, "rust-release");
 
-        let m = merged(merge_file(Platform::GitLab, &file, &filter, &existing).unwrap());
-        assert_eq!(m.disabled, 1, "{}", m.content);
+        let (content, counts) = merged(merge_file(Platform::GitLab, &file, &filter, &existing).unwrap());
+        assert_eq!(counts.disabled, 1, "{}", content);
         // A commented job doesn't run, so its secret isn't required...
-        assert!(!m.content.contains("Required CI variables"), "{}", m.content);
-        assert!(m.content.contains("# rust-release:"), "{}", m.content);
+        assert!(!content.contains("Required CI variables"), "{}", content);
+        assert!(content.contains("# rust-release:"), "{}", content);
         // ...but its stage stays declared, so uncommenting just works
-        let doc: Value = serde_yaml::from_str(&m.content).unwrap();
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
         let stages: Vec<&str> = doc["stages"]
             .as_sequence()
             .unwrap()
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert!(stages.contains(&"deploy"), "{}", m.content);
+        assert!(stages.contains(&"deploy"), "{}", content);
 
         assert!(matches!(
-            merge_file(Platform::GitLab, &file, &filter, &m.content).unwrap(),
+            merge_file(Platform::GitLab, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
         ));
     }
@@ -1794,11 +1775,11 @@ my-job:
 
         let existing = "name: CI\non: [push]\njobs:\n  rust-test:\n    \
                         runs-on: ubuntu-latest\n    steps:\n      - run: echo stale\n";
-        let m = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
-        assert!(m.content.contains("strategy:"), "{}", m.content);
-        assert!(m.content.contains("fail-fast: false"), "{}", m.content);
-        assert!(m.content.contains("rustlang/rust:nightly"), "{}", m.content);
-        assert!(!m.content.contains("echo stale"), "{}", m.content);
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert!(content.contains("strategy:"), "{}", content);
+        assert!(content.contains("fail-fast: false"), "{}", content);
+        assert!(content.contains("rustlang/rust:nightly"), "{}", content);
+        assert!(!content.contains("echo stale"), "{}", content);
     }
 
     #[test]
@@ -1825,15 +1806,15 @@ workflows:
       - my-job
 "#;
 
-        let m = merged(merge_file(Platform::CircleCI, &file, &filter, existing).unwrap());
-        assert!(m.content.contains("rust-test-1.85"), "{}", m.content);
-        assert!(m.content.contains("rust-test-nightly"), "{}", m.content);
-        assert!(m.content.contains("my-job"), "{}", m.content);
-        assert!(m.content.contains("<< parameters.image >>"), "{}", m.content);
+        let (content, _) = merged(merge_file(Platform::CircleCI, &file, &filter, existing).unwrap());
+        assert!(content.contains("rust-test-1.85"), "{}", content);
+        assert!(content.contains("rust-test-nightly"), "{}", content);
+        assert!(content.contains("my-job"), "{}", content);
+        assert!(content.contains("<< parameters.image >>"), "{}", content);
         // Merging the merged output again is a no-op: the expanded
         // invocations map back onto the same canonical entries
         assert!(matches!(
-            merge_file(Platform::CircleCI, &file, &filter, &m.content).unwrap(),
+            merge_file(Platform::CircleCI, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
         ));
     }
@@ -1869,12 +1850,12 @@ workflows:
           image: rustlang/rust:nightly
 "#;
 
-        let m = merged(merge_file(Platform::CircleCI, &file, &filter, existing).unwrap());
-        assert!(!m.content.contains("rust-test-nightly"), "{}", m.content);
-        assert!(!m.content.contains("parameters"), "{}", m.content);
-        assert!(m.content.contains("rust:1.85"), "{}", m.content);
+        let (content, _) = merged(merge_file(Platform::CircleCI, &file, &filter, existing).unwrap());
+        assert!(!content.contains("rust-test-nightly"), "{}", content);
+        assert!(!content.contains("parameters"), "{}", content);
+        assert!(content.contains("rust:1.85"), "{}", content);
         // Exactly one rust-test invocation remains
-        assert_eq!(m.content.matches("- rust-test").count(), 1, "{}", m.content);
+        assert_eq!(content.matches("- rust-test").count(), 1, "{}", content);
     }
 
     #[test]
@@ -1912,16 +1893,16 @@ workflows:
       - rust-fmt
 "#;
 
-        let m = merged(merge_file(Platform::CircleCI, &file, &filter, existing).unwrap());
+        let (content, counts) = merged(merge_file(Platform::CircleCI, &file, &filter, existing).unwrap());
 
-        assert!(!m.content.contains("rust-fmt"), "{}", m.content);
-        assert!(m.content.contains("my-job"), "{}", m.content);
-        assert!(m.content.contains("nightly"), "{}", m.content);
+        assert!(!content.contains("rust-fmt"), "{}", content);
+        assert!(content.contains("my-job"), "{}", content);
+        assert!(content.contains("nightly"), "{}", content);
         // A workflow left with no jobs is dropped entirely
-        assert!(!m.content.contains("stale-only"), "{}", m.content);
-        assert!(m.content.contains("cargo test"), "{}", m.content);
-        assert!(!m.content.contains("echo stale"), "{}", m.content);
-        assert_eq!((m.conformed, m.removed, m.preserved), (1, 1, 1));
+        assert!(!content.contains("stale-only"), "{}", content);
+        assert!(content.contains("cargo test"), "{}", content);
+        assert!(!content.contains("echo stale"), "{}", content);
+        assert_eq!((counts.conformed, counts.removed, counts.preserved), (1, 1, 1));
     }
 
     #[test]
@@ -1945,13 +1926,13 @@ workflows:
 
         // Stale commented content gets regenerated, still commented
         let stale = existing.replace("cargo test", "cargo test --old-flag");
-        let m = merged(merge_file(Platform::CircleCI, &file, &filter, &stale).unwrap());
-        assert_eq!(m.disabled, 1, "{}", m.content);
-        assert!(!m.content.contains("--old-flag"), "{}", m.content);
-        assert!(m.content.contains("# rust-test:"), "{}", m.content);
-        assert!(m.content.contains("# - rust-test"), "{}", m.content);
+        let (content, counts) = merged(merge_file(Platform::CircleCI, &file, &filter, &stale).unwrap());
+        assert_eq!(counts.disabled, 1, "{}", content);
+        assert!(!content.contains("--old-flag"), "{}", content);
+        assert!(content.contains("# rust-test:"), "{}", content);
+        assert!(content.contains("# - rust-test"), "{}", content);
         assert!(matches!(
-            merge_file(Platform::CircleCI, &file, &filter, &m.content).unwrap(),
+            merge_file(Platform::CircleCI, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
         ));
     }

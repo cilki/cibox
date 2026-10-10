@@ -133,23 +133,16 @@ pub fn handle_update(
                         );
                         continue;
                     }
-                    crate::generator::MergeOutcome::Merged {
-                        content,
-                        conformed,
-                        added,
-                        removed,
-                        disabled,
-                        preserved,
-                    } => {
-                        let mut parts = vec![format!("{conformed} updated")];
-                        if added > 0 {
-                            parts.push(format!("{added} added"));
+                    crate::generator::MergeOutcome::Merged { content, counts } => {
+                        let mut parts = vec![format!("{} updated", counts.conformed)];
+                        if counts.added > 0 {
+                            parts.push(format!("{} added", counts.added));
                         }
-                        parts.push(format!("{removed} removed"));
-                        if disabled > 0 {
-                            parts.push(format!("{disabled} disabled"));
+                        parts.push(format!("{} removed", counts.removed));
+                        if counts.disabled > 0 {
+                            parts.push(format!("{} disabled", counts.disabled));
                         }
-                        parts.push(format!("{preserved} kept"));
+                        parts.push(format!("{} kept", counts.preserved));
                         println!(
                             "  {} {} ({})",
                             "✓".green().bold(),

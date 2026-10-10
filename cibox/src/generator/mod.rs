@@ -3,7 +3,7 @@
 mod disabled;
 mod merge;
 
-pub use merge::{merge_file, MergeOutcome};
+pub use merge::{merge_file, Counts, MergeOutcome};
 
 use crate::config::Platform;
 use crate::detection::ProjectFacts;
