@@ -15,13 +15,6 @@ const VERSIONED_RULES: [(&str, &str); 4] = [
     ("node-test", crate::rules::node::IMAGE),
 ];
 
-/// Rules whose config options can be expanded inline: the versioned test
-/// rules plus the two docker rules, which share an image-name knob
-fn expandable(rule_id: &str) -> bool {
-    matches!(rule_id, "docker-build" | "docker-release")
-        || VERSIONED_RULES.iter().any(|(id, _)| *id == rule_id)
-}
-
 /// A rule line in the checklist
 #[derive(Debug, Clone)]
 pub struct RuleRow {
@@ -100,22 +93,6 @@ impl Checkbox {
     }
 }
 
-/// Which knob a text input edits
-#[derive(Debug, Clone, PartialEq)]
-pub enum KnobTarget {
-    ImageName,
-    /// Some(i) edits versions[i]; None appends a new version
-    Version(Option<usize>),
-}
-
-/// In-progress edit of a text knob
-#[derive(Debug, Clone)]
-pub struct KnobInput {
-    pub rule_id: &'static str,
-    pub target: KnobTarget,
-    pub buffer: String,
-}
-
 pub struct EditorState {
     // Project context
     pub facts: ProjectFacts,
@@ -135,8 +112,15 @@ pub struct EditorState {
     pub cursor: usize,
     /// Ids of rules whose config options are shown
     pub expanded: HashSet<&'static str>,
-    /// Text knob currently being edited, if any
-    pub input: Option<KnobInput>,
+    /// Text being typed into a knob row, if an edit is in progress.
+    ///
+    /// Which knob that is doesn't need recording: an edit starts on the row
+    /// under the cursor, and while one is in progress the key handler feeds
+    /// every keystroke to the buffer — so nothing can move the cursor or
+    /// rebuild the rows until it is committed or cancelled. The row the
+    /// buffer belongs to is therefore always `rows[cursor]`, and that row
+    /// already says which knob it edits.
+    pub input: Option<String>,
 
     // UI state
     pub platform_menu_open: bool,
@@ -214,78 +198,89 @@ impl EditorState {
         crate::rules::docker_image(&self.facts, &self.config)
     }
 
+    /// The config-option rows of one rule, in display order: the toolchain
+    /// versions of a test rule, or the image name (plus docker-release's
+    /// booleans) of a docker rule. Empty for every other rule, which is also
+    /// what makes it unexpandable — one list of knobs per rule, rather than a
+    /// second classification to keep in step with this one.
+    fn knob_rows(&self, rule_id: &'static str) -> Vec<Row> {
+        if let Some(&(_, default_image)) = VERSIONED_RULES.iter().find(|(id, _)| *id == rule_id) {
+            let versions = self
+                .config
+                .versions_override(rule_id)
+                .cloned()
+                .unwrap_or_default();
+            return versions
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| Row::Version {
+                    rule_id,
+                    index: Some(index),
+                    value,
+                    default_image,
+                })
+                // The trailing "add a version" action row
+                .chain([Row::Version {
+                    rule_id,
+                    index: None,
+                    value: String::new(),
+                    default_image,
+                }])
+                .collect();
+        }
+
+        if !matches!(rule_id, "docker-build" | "docker-release") {
+            return Vec::new();
+        }
+        let mut rows = vec![Row::TextKnob {
+            rule_id,
+            label: "image_name",
+            description: "Image name, e.g. \"fossable/cibox\"; applies to both docker \
+                          rules. Press Enter to edit.",
+            override_value: match rule_id {
+                "docker-build" => self.config.docker_build.image_name.clone(),
+                _ => self.config.docker_release.image_name.clone(),
+            },
+            effective: self.effective_image(),
+        }];
+        if rule_id == "docker-release" {
+            rows.push(Row::Checkbox {
+                knob: Checkbox::SyncReadme,
+                value: self.config.docker_release.sync_readme.unwrap_or(false),
+            });
+            let selected = self
+                .config
+                .docker_release
+                .platforms
+                .clone()
+                .unwrap_or_default();
+            rows.extend(DockerPlatform::ALL.map(|arch| Row::Checkbox {
+                knob: Checkbox::Arch(arch),
+                value: selected.contains(&arch),
+            }));
+        }
+        rows
+    }
+
     /// Re-resolve rules against the current config and regenerate the preview
     pub fn refresh(&mut self) {
         let resolved = resolve(&self.facts, &self.config);
         self.rows = Vec::new();
         for r in &resolved {
             let id = r.rule.id();
-            let expandable = expandable(id);
-            let expanded = expandable && self.expanded.contains(id);
+            let knobs = self.knob_rows(id);
+            let expanded = !knobs.is_empty() && self.expanded.contains(id);
             self.rows.push(Row::Rule(RuleRow {
                 id,
                 name: r.rule.name(),
                 description: r.rule.description(),
                 detected: r.detected,
                 enabled: r.enabled,
-                expandable,
+                expandable: !knobs.is_empty(),
                 expanded,
             }));
             if expanded {
-                if let Some((_, default_image)) =
-                    VERSIONED_RULES.iter().find(|(vid, _)| *vid == id)
-                {
-                    let versions = self
-                        .config
-                        .versions_override(id)
-                        .cloned()
-                        .unwrap_or_default();
-                    for (index, value) in versions.iter().enumerate() {
-                        self.rows.push(Row::Version {
-                            rule_id: id,
-                            index: Some(index),
-                            value: value.clone(),
-                            default_image,
-                        });
-                    }
-                    self.rows.push(Row::Version {
-                        rule_id: id,
-                        index: None,
-                        value: String::new(),
-                        default_image,
-                    });
-                } else {
-                    let override_value = match id {
-                        "docker-build" => self.config.docker_build.image_name.clone(),
-                        _ => self.config.docker_release.image_name.clone(),
-                    };
-                    self.rows.push(Row::TextKnob {
-                        rule_id: id,
-                        label: "image_name",
-                        description: "Image name, e.g. \"fossable/cibox\"; applies to both docker \
-                                      rules. Press Enter to edit.",
-                        override_value,
-                        effective: self.effective_image(),
-                    });
-                    if id == "docker-release" {
-                        self.rows.push(Row::Checkbox {
-                            knob: Checkbox::SyncReadme,
-                            value: self.config.docker_release.sync_readme.unwrap_or(false),
-                        });
-                        let selected = self
-                            .config
-                            .docker_release
-                            .platforms
-                            .clone()
-                            .unwrap_or_default();
-                        for arch in DockerPlatform::ALL {
-                            self.rows.push(Row::Checkbox {
-                                knob: Checkbox::Arch(arch),
-                                value: selected.contains(&arch),
-                            });
-                        }
-                    }
-                }
+                self.rows.extend(knobs);
             }
         }
         if self.cursor >= self.rows.len() {
@@ -311,47 +306,22 @@ impl EditorState {
         self.rows.get(self.cursor)
     }
 
-    /// The text edit in progress on `row`, if that is the row being edited.
-    /// A row and a [`KnobInput`] name the same knob the same way, which is
-    /// all it takes to match them up.
-    pub fn editing(&self, row: &Row) -> Option<&KnobInput> {
-        let (rule_id, target) = match row {
-            Row::TextKnob { rule_id, .. } => (*rule_id, KnobTarget::ImageName),
-            Row::Version { rule_id, index, .. } => (*rule_id, KnobTarget::Version(*index)),
-            _ => return None,
-        };
-        self.input
-            .as_ref()
-            .filter(|input| input.rule_id == rule_id && input.target == target)
+    /// The text being typed into the row at `index`, if that is the row the
+    /// edit in progress belongs to — which is the one under the cursor.
+    pub fn editing(&self, index: usize) -> Option<&str> {
+        (index == self.cursor)
+            .then_some(self.input.as_deref())
+            .flatten()
     }
 
     /// Activate the row under the cursor: toggle a rule or a checkbox, or
-    /// start editing a text knob
+    /// start editing a text knob from its current value
     pub fn activate_current(&mut self) {
         match self.rows.get(self.cursor).cloned() {
             Some(Row::Rule(rule)) => self.toggle_rule(&rule),
-            Some(Row::TextKnob {
-                rule_id, effective, ..
-            }) => {
-                self.input = Some(KnobInput {
-                    rule_id,
-                    target: KnobTarget::ImageName,
-                    buffer: effective,
-                });
-            }
             Some(Row::Checkbox { knob, .. }) => self.toggle_checkbox(knob),
-            Some(Row::Version {
-                rule_id,
-                index,
-                value,
-                ..
-            }) => {
-                self.input = Some(KnobInput {
-                    rule_id,
-                    target: KnobTarget::Version(index),
-                    buffer: value,
-                });
-            }
+            Some(Row::TextKnob { effective, .. }) => self.input = Some(effective),
+            Some(Row::Version { value, .. }) => self.input = Some(value),
             None => {}
         }
     }
@@ -401,34 +371,35 @@ impl EditorState {
         self.auto_save_ron();
     }
 
-    /// Commit the text knob being edited. A value matching the facts-derived
-    /// default (or an empty one) removes the override.
+    /// Commit the text being typed into the knob row under the cursor. A
+    /// value matching the facts-derived default (or an empty one) removes the
+    /// override.
     pub fn commit_input(&mut self) {
-        let Some(input) = self.input.take() else {
+        let Some(buffer) = self.input.take() else {
             return;
         };
-        let value = input.buffer.trim().to_string();
-        match input.target {
-            KnobTarget::ImageName => {
+        let value = buffer.trim().to_string();
+        match self.rows.get(self.cursor).cloned() {
+            Some(Row::TextKnob { rule_id, .. }) => {
                 // The typed name is written to cibox.ron and from there into
                 // a shell command, so coerce it into a valid reference rather
                 // than saving something the config parser would reject
                 let override_value = (!value.is_empty())
                     .then(|| crate::config::image::coerce_reference(&value))
                     .filter(|value| *value != self.default_image());
-                match input.rule_id {
+                match rule_id {
                     "docker-build" => self.config.docker_build.image_name = override_value,
                     "docker-release" => self.config.docker_release.image_name = override_value,
                     _ => {}
                 }
             }
-            KnobTarget::Version(slot) => {
+            Some(Row::Version { rule_id, index, .. }) => {
                 let mut versions = self
                     .config
-                    .versions_override(input.rule_id)
+                    .versions_override(rule_id)
                     .cloned()
                     .unwrap_or_default();
-                match slot {
+                match index {
                     // Committing an empty value removes the entry
                     Some(i) if value.is_empty() => {
                         if i < versions.len() {
@@ -447,8 +418,9 @@ impl EditorState {
                 // preview shows is what the file means
                 let versions = clean_versions(Some(&versions));
                 self.config
-                    .set_versions_override(input.rule_id, (!versions.is_empty()).then_some(versions));
+                    .set_versions_override(rule_id, (!versions.is_empty()).then_some(versions));
             }
+            _ => return,
         }
         self.refresh();
         self.update_current_item_description();
@@ -486,14 +458,14 @@ impl EditorState {
     }
 
     pub fn input_push(&mut self, c: char) {
-        if let Some(input) = &mut self.input {
-            input.buffer.push(c);
+        if let Some(buffer) = &mut self.input {
+            buffer.push(c);
         }
     }
 
     pub fn input_backspace(&mut self) {
-        if let Some(input) = &mut self.input {
-            input.buffer.pop();
+        if let Some(buffer) = &mut self.input {
+            buffer.pop();
         }
     }
 
@@ -648,6 +620,13 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    /// Backspace over the whole prefilled buffer of the edit in progress
+    fn clear_input(state: &mut EditorState) {
+        for _ in 0..state.input.as_deref().unwrap_or_default().len() {
+            state.input_backspace();
+        }
     }
 
     fn rule_index(state: &EditorState, id: &str) -> usize {
@@ -824,10 +803,8 @@ mod tests {
         // Adding a version through the add row
         state.cursor = idx + 1;
         state.activate_current();
-        assert_eq!(
-            state.input.as_ref().unwrap().target,
-            KnobTarget::Version(None)
-        );
+        // The add row holds no value, so the edit starts from an empty buffer
+        assert_eq!(state.editing(state.cursor), Some(""));
         for c in "1.85".chars() {
             state.input_push(c);
         }
@@ -858,10 +835,9 @@ mod tests {
         // Editing in place replaces the entry; duplicates collapse
         state.cursor = idx + 1;
         state.activate_current();
-        let buffer_len = state.input.as_ref().unwrap().buffer.len();
-        for _ in 0..buffer_len {
-            state.input_backspace();
-        }
+        // ...prefilled with the entry under the cursor
+        assert_eq!(state.editing(state.cursor), Some("1.85"));
+        clear_input(&mut state);
         for c in "nightly".chars() {
             state.input_push(c);
         }
@@ -954,7 +930,9 @@ mod tests {
 
         // Enter starts editing prefilled with the effective value
         state.activate_current();
-        assert_eq!(state.input.as_ref().unwrap().buffer, default);
+        assert_eq!(state.editing(state.cursor), Some(default.as_str()));
+        // ...and only on that row
+        assert_eq!(state.editing(state.cursor + 1), None);
 
         // Esc cancels without touching the config
         state.cancel_input();
@@ -962,9 +940,7 @@ mod tests {
 
         // Typing a custom name stores the override
         state.activate_current();
-        for _ in 0..state.input.as_ref().unwrap().buffer.len() {
-            state.input_backspace();
-        }
+        clear_input(&mut state);
         for c in "fossable/cibox".chars() {
             state.input_push(c);
         }
@@ -978,10 +954,7 @@ mod tests {
         // Committing the facts default clears the override
         state.cursor = rule_index(&state, "docker-build") + 1;
         state.activate_current();
-        let buffer_len = state.input.as_ref().unwrap().buffer.len();
-        for _ in 0..buffer_len {
-            state.input_backspace();
-        }
+        clear_input(&mut state);
         for c in default.chars() {
             state.input_push(c);
         }
@@ -998,9 +971,7 @@ mod tests {
         state.expand_current();
         state.cursor = rule_index(&state, "docker-build") + 1;
         state.activate_current();
-        for _ in 0..state.input.as_ref().unwrap().buffer.len() {
-            state.input_backspace();
-        }
+        clear_input(&mut state);
         for c in "Owner/App; id".chars() {
             state.input_push(c);
         }

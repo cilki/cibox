@@ -114,14 +114,11 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
     for (i, row) in state.rows.iter().enumerate() {
         let is_selected = i == state.cursor;
 
-        let line = match (row, state.editing(row)) {
+        let line = match (row, state.editing(i)) {
             // The knob under edit: its own prefix, then the buffer and caret
-            (_, Some(input)) => Line::from(vec![
+            (Row::TextKnob { .. } | Row::Version { .. }, Some(buffer)) => Line::from(vec![
                 dim(knob_prefix(row)),
-                Span::styled(
-                    format!("{}▏", input.buffer),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(format!("{buffer}▏"), Style::default().fg(Color::Yellow)),
             ]),
             (Row::Rule(rule), _) => rule_line(rule, is_selected),
             (
@@ -524,6 +521,32 @@ mod tests {
         assert!(row("sync_readme").contains("[ ]"));
         assert!(row("linux/amd64").contains("[ ]"));
         assert!(!row("image_name:").contains("[ ]"));
+    }
+
+    /// An edit in progress is drawn on the row it belongs to — the one under
+    /// the cursor — and on no other, including the other rows of the same
+    /// rule
+    #[test]
+    fn test_edit_in_progress_is_drawn_on_the_cursor_row_only() {
+        let (_dir, mut state) = expanded_state();
+        state.cursor = state
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::TextKnob { .. }))
+            .unwrap();
+        state.activate_current();
+        // The buffer starts from the effective image name
+        for _ in 0..state.editing(state.cursor).unwrap().len() {
+            state.input_backspace();
+        }
+        for c in "edited".chars() {
+            state.input_push(c);
+        }
+
+        let lines = rendered_panel(&state);
+        let drawn: Vec<&String> = lines.iter().filter(|line| line.contains('▏')).collect();
+        assert_eq!(drawn.len(), 1, "{}", lines.join("\n"));
+        assert!(drawn[0].contains("image_name: edited▏"), "{:?}", drawn[0]);
     }
 
     /// (text, foreground, background) of every span on a line
