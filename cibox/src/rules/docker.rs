@@ -4,6 +4,29 @@ use crate::config::DockerPlatform;
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
 
+/// QEMU installer for cross-architecture builds, pinned by digest.
+///
+/// This one runs `--privileged`, which on every backend means full
+/// capabilities and the host's devices: whatever the reference resolves to
+/// owns the runner for the rest of the pipeline. `tonistiigi/binfmt` with no
+/// tag at all meant `:latest`, a pointer upstream moves whenever it likes —
+/// so what the release job executed could change with no commit in the
+/// user's repository and nothing for anyone to review. The digest is what
+/// docker resolves; the tag next to it is there to say which release that
+/// digest is, since a bare digest tells a reader nothing.
+const BINFMT_IMAGE: &str =
+    "tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0";
+
+/// Docker Hub description uploader for the README sync, pinned by digest.
+///
+/// Handed DOCKER_USERNAME and DOCKER_PASSWORD by design — it has to log in
+/// to set the description — so a moving reference here is a moving third
+/// party with the registry credentials. `:1` is a major-version pointer, not
+/// a release — it pointed at 1.8.1 until 1.9.0 was published — so it can be
+/// moved again by anyone who gains control of that Docker Hub account.
+const PUSHRM_IMAGE: &str =
+    "chko/docker-pushrm:1.9.0@sha256:812a950e5be7dca26cef33b61eb2076bfcfb6c2a8ec96c126371fc049c3b6608";
+
 fn dockerfile_flag(facts: &ProjectFacts) -> String {
     match &facts.docker {
         Some(d) if d.dockerfile != "Dockerfile" => format!(" -f {}", d.dockerfile),
@@ -132,7 +155,7 @@ impl DockerRelease {
                      DOCKER_USER=\"$DOCKER_USERNAME\" DOCKER_PASS=\"$DOCKER_PASSWORD\" \
                      docker run --rm -e DOCKER_USER -e DOCKER_PASS \
                      -v \"$PWD/README.md\":/workspace/README.md:ro \
-                     chko/docker-pushrm:1 --file /workspace/README.md {}; \
+                     {PUSHRM_IMAGE} --file /workspace/README.md {}; \
                      else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi",
                     self.image
                 ),
@@ -156,17 +179,18 @@ impl DockerRelease {
         linux: &[DockerPlatform],
         tag: &str,
     ) -> Vec<Step> {
-        let mut steps = vec![
-            Step::checkout(),
-            Step::run("Login to registry", self.login_command()),
-        ];
-        // QEMU is only needed to emulate foreign architectures
+        let mut steps = vec![Step::checkout()];
+        // QEMU is only needed to emulate foreign architectures, and it goes
+        // ahead of the login: the installer is a privileged container, so
+        // there is no reason for the registry credentials to be sitting in
+        // the runner's docker config while it runs
         if linux.iter().any(|p| *p != DockerPlatform::LinuxAmd64) {
             steps.push(Step::run(
                 "Set up QEMU",
-                "docker run --privileged --rm tonistiigi/binfmt --install all",
+                format!("docker run --privileged --rm {BINFMT_IMAGE} --install all"),
             ));
         }
+        steps.push(Step::run("Login to registry", self.login_command()));
         steps.push(Step::run("Set up buildx", "docker buildx create --use"));
         let platform_list = linux
             .iter()
@@ -386,7 +410,7 @@ mod tests {
         );
         assert_eq!(
             run_command(job, "Set up QEMU"),
-            "docker run --privileged --rm tonistiigi/binfmt --install all"
+            format!("docker run --privileged --rm {BINFMT_IMAGE} --install all")
         );
         assert_eq!(run_command(job, "Set up buildx"), "docker buildx create --use");
     }
@@ -574,12 +598,14 @@ mod tests {
         assert!(matches!(job.steps.last(), Some(Step::Run { name, .. }) if name == SYNC_STEP));
         assert_eq!(
             run_command(job, SYNC_STEP),
-            "if [ -n \"${DOCKER_USERNAME:-}\" ] && [ -f README.md ]; then \
-             DOCKER_USER=\"$DOCKER_USERNAME\" DOCKER_PASS=\"$DOCKER_PASSWORD\" \
-             docker run --rm -e DOCKER_USER -e DOCKER_PASS \
-             -v \"$PWD/README.md\":/workspace/README.md:ro \
-             chko/docker-pushrm:1 --file /workspace/README.md owner/app; \
-             else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi"
+            format!(
+                "if [ -n \"${{DOCKER_USERNAME:-}}\" ] && [ -f README.md ]; then \
+                 DOCKER_USER=\"$DOCKER_USERNAME\" DOCKER_PASS=\"$DOCKER_PASSWORD\" \
+                 docker run --rm -e DOCKER_USER -e DOCKER_PASS \
+                 -v \"$PWD/README.md\":/workspace/README.md:ro \
+                 {PUSHRM_IMAGE} --file /workspace/README.md owner/app; \
+                 else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi"
+            )
         );
         // The sync reuses the push secrets, so nothing extra is declared
         assert_eq!(job.secrets, vec!["DOCKER_USERNAME", "DOCKER_PASSWORD"]);
@@ -721,5 +747,89 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, Step::Run { name, .. } if name == SYNC_STEP)));
+    }
+
+    /// The image argument of a `docker run` inside `command`, if there is
+    /// one: the first token after `docker run` that is neither a flag nor a
+    /// flag's value.
+    fn docker_run_image(command: &str) -> Option<&str> {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let mut i = tokens.windows(2).position(|w| w == ["docker", "run"])? + 2;
+        while let Some(token) = tokens.get(i) {
+            // The flags the generated commands use that take a value
+            i += if matches!(*token, "-e" | "-v") { 2 } else { 1 };
+            if !token.starts_with('-') {
+                return Some(token);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_third_party_images_are_pinned_by_digest() {
+        // Every container the release job runs is third-party code with
+        // something worth stealing in reach: the QEMU installer is
+        // privileged, and the README uploader is handed the registry
+        // password. A tag is a pointer its publisher can move, so what the
+        // pipeline executes could change with no commit in the user's
+        // repository and no diff for anyone to review; only a digest says
+        // what actually runs.
+        let mut checked = 0;
+        for platforms in [
+            vec![],
+            vec![DockerPlatform::LinuxAmd64],
+            vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64],
+            vec![DockerPlatform::WindowsAmd64, DockerPlatform::LinuxArm64],
+        ] {
+            for sync_readme in [false, true] {
+                let rule = DockerRelease {
+                    image: "owner/app".to_string(),
+                    platforms: platforms.clone(),
+                    sync_readme,
+                };
+                for job in rule.jobs(&docker_facts()) {
+                    for step in &job.steps {
+                        let Step::Run { command, .. } = step else {
+                            continue;
+                        };
+                        let Some(image) = docker_run_image(command) else {
+                            continue;
+                        };
+                        assert!(
+                            image.contains("@sha256:"),
+                            "{}: {image} is not pinned by digest: {command}",
+                            job.id
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        // Guards against the walk silently finding nothing to check
+        assert!(checked >= 2, "only {checked} docker run commands seen");
+    }
+
+    #[test]
+    fn test_qemu_is_installed_before_the_registry_login() {
+        // The QEMU installer is a privileged container — it has the runner's
+        // devices and filesystem. Logging in first would leave the registry
+        // credentials in the runner's docker config for it to read.
+        let rule = DockerRelease {
+            image: "owner/app".to_string(),
+            platforms: vec![DockerPlatform::LinuxAmd64, DockerPlatform::LinuxArm64],
+            sync_readme: false,
+        };
+        let job = &rule.jobs(&docker_facts())[0];
+        let position = |name: &str| {
+            job.steps
+                .iter()
+                .position(|s| matches!(s, Step::Run { name: n, .. } if n == name))
+                .unwrap_or_else(|| panic!("job {} has no step '{name}'", job.id))
+        };
+        assert!(
+            position("Set up QEMU") < position("Login to registry"),
+            "{:?}",
+            job.steps
+        );
     }
 }
