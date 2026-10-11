@@ -19,9 +19,11 @@ fn main() -> Result<()> {
             platform,
             force,
             rules,
-        }) => cibox::cli::commands::handle_update(&config, platform, force, &rules),
+        }) => cibox::cli::commands::handle_update(&config, platform.selected(), force, &rules),
         Some(Commands::Validate { config }) => cibox::cli::commands::handle_validate(&config),
-        Some(Commands::Editor { dir }) => cibox::editor::run_with_args(&dir, None),
+        Some(Commands::Editor { dir, platform }) => {
+            cibox::editor::run_with_args(&dir, platform.selected())
+        }
         Some(Commands::Detect { dir }) => cibox::cli::commands::handle_detect(&dir),
         Some(Commands::Lsp) => {
             let analyzer: roniker::RustAnalyzer = serde_json::from_str(include_str!(concat!(

@@ -21,8 +21,7 @@ fn project() -> tempfile::TempDir {
 
 fn update(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("cibox").unwrap();
-    cmd.current_dir(dir)
-        .args(["update", "--platform", "github"]);
+    cmd.current_dir(dir).args(["update", "--github"]);
     cmd
 }
 

@@ -6,8 +6,9 @@ use crate::error::Result;
 /// style — one entry per rule with an `enabled` override plus whatever knobs
 /// the rule supports. The file itself is optional and every field in it is
 /// optional — an empty `()` (or no file at all) means "do whatever detection
-/// decides". The target platform is not configured here: it comes from
-/// `--platform` or is inferred from existing CI files and the git remote.
+/// decides". The target platform is not configured here: it comes from a
+/// `--github`/`--gitea`/`--gitlab`/`--circleci` flag, or is inferred from
+/// existing CI files and the git remote.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CiboxConfig {
@@ -398,7 +399,8 @@ pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
                 anyhow::anyhow!(
                     "{msg}\ncibox.ron no longer has `platform` or `rules` fields: rule \
                      overrides live at the top level, e.g. `(rust_test: (enabled: false))`, \
-                     and the platform comes from --platform or is inferred"
+                     and the platform comes from a --github/--gitea/--gitlab/--circleci \
+                     flag or is inferred"
                 )
             } else {
                 e.into()

@@ -1,11 +1,10 @@
 use crate::config::{infer_platform, parse_config, CiboxConfig, Platform};
-use crate::detection::{gather_facts, ProjectFacts};
+use crate::detection::gather_facts;
 use crate::error::Result;
 use crate::rules::{resolve, ResolvedRule};
 use anyhow::Context;
 use colored::Colorize;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 /// Load cibox.ron if present. A missing file at the default path is fine —
 /// detection supplies everything; an explicitly named missing file is an error.
@@ -23,14 +22,6 @@ fn load_config(config_path: &str, explicit_required: bool) -> Result<CiboxConfig
         }
         Err(e) => Err(e).with_context(|| format!("Failed to read config file: {config_path}")),
     }
-}
-
-/// CLI flag > inference from the repository
-fn effective_platform(platform_arg: Option<String>, facts: &ProjectFacts) -> Result<Platform> {
-    if let Some(p) = platform_arg {
-        return Platform::from_str(&p).map_err(|_| crate::error::unsupported_platform_error(&p));
-    }
-    Ok(infer_platform(facts))
 }
 
 fn print_rule_table(resolved: &[ResolvedRule]) {
@@ -58,14 +49,15 @@ fn print_rule_table(resolved: &[ResolvedRule]) {
 /// Handle the update command
 pub fn handle_update(
     config_path: &str,
-    platform_arg: Option<String>,
+    platform_arg: Option<Platform>,
     force: bool,
     rules: &[String],
 ) -> Result<()> {
     let working_dir = PathBuf::from(".");
     let facts = gather_facts(&working_dir);
     let config = load_config(config_path, config_path != "cibox.ron")?;
-    let platform = effective_platform(platform_arg, &facts)?;
+    // CLI flag > inference from the repository
+    let platform = platform_arg.unwrap_or_else(|| infer_platform(&facts));
     let resolved = resolve(&facts, &config);
 
     // `--rule` must be validated by hand: nothing else rejects an unknown id

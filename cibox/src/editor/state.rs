@@ -138,11 +138,9 @@ pub struct EditorState {
 impl EditorState {
     pub fn new(
         facts: ProjectFacts,
-        platform_arg: Option<String>,
+        platform_arg: Option<Platform>,
         working_dir: PathBuf,
     ) -> Result<Self> {
-        use std::str::FromStr;
-
         let ron_path = working_dir.join("cibox.ron");
         let (config, has_ron_file) = match std::fs::read_to_string(&ron_path) {
             Ok(ron_str) => (crate::config::parse_config(&ron_str)?, true),
@@ -150,11 +148,7 @@ impl EditorState {
         };
 
         let inferred_platform = infer_platform(&facts);
-        let platform = match platform_arg {
-            Some(p) => Platform::from_str(&p)
-                .map_err(|_| crate::error::unsupported_platform_error(&p))?,
-            None => inferred_platform,
-        };
+        let platform = platform_arg.unwrap_or(inferred_platform);
 
         let existing_yaml =
             std::fs::read_to_string(working_dir.join(platform.output_path())).ok();

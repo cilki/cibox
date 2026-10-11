@@ -1,3 +1,4 @@
+use crate::config::Platform;
 use crate::detection::ProjectFacts;
 use crate::editor::events::handle_key_event;
 use crate::editor::state::EditorState;
@@ -20,7 +21,7 @@ pub struct EditorApp {
 impl EditorApp {
     pub fn new(
         facts: ProjectFacts,
-        platform: Option<String>,
+        platform: Option<Platform>,
         working_dir: PathBuf,
     ) -> Result<Self> {
         Ok(Self {
