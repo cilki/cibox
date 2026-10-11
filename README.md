@@ -35,7 +35,7 @@ another CI platform.
 
 cibox is built around **rules**: small, opinionated units of CI configuration
 like `rust-test`, `rust-release`, or `docker-build`. Each rule is triggered by
-detection — a `Cargo.toml` enables the Rust rules, a `Dockerfile` enables the
+detection — a `Cargo.toml` enables most of the Rust rules, a `Dockerfile` the
 Docker rules, a publishable package enables its release rule — and contributes
 jobs to the generated pipeline. Release rules run only on `v*` git tags (e.g.
 `rust-release` runs `cargo publish`, `aur-release` pushes to the AUR). Build
@@ -95,6 +95,61 @@ all of cibox's jobs, so `cibox update` is also how you hand a pipeline back to
 yourself. A file that would be left with no jobs at all is reported and left
 untouched, since every platform rejects an empty pipeline — delete it yourself
 if you no longer want it.
+
+### What detection looks for
+
+Detection runs per rule, not per ecosystem. For most rules the ecosystem's
+marker file is the whole of it: a `Cargo.toml` enables `rust-test`,
+`rust-fmt`, `rust-clippy`, `rust-audit` and `rust-doc`, a `go.mod` all four
+Go rules, a `build.zig` all three Zig rules, a `pyproject.toml`, `setup.py`
+or `requirements.txt` the three Python checks, a `CMakeLists.txt`
+`cmake-build`, and a `Dockerfile` both docker rules. The rest ask for more
+than the marker, because with the marker alone they would generate a job
+with nothing to run:
+
+- `rust-msrv` needs a `rust-version` in `Cargo.toml` — that declaration is
+  what it checks the build against.
+- `rust-release` and `python-release` need a publishable package: a
+  `[package]` that isn't `publish = false`, or a `pyproject.toml` with a
+  named `[project]`. A workspace with no root package has neither, and
+  publishing its members in dependency order is not something the rule
+  attempts.
+- `rust-feature-combos` needs a library crate (`[lib]` or `src/lib.rs`) with a
+  `[features]` table, and `rust-minimal-versions` a library that is also
+  publishable. Both check what downstream crates get; a binary picks its own
+  features and ships its own lockfile.
+- `rust-build` needs the opposite — a crate that is *not* a library, since
+  the artifacts it uploads are the binaries `cargo build --release` produces.
+- `android-build` needs a Gradle root: a `gradlew` beside a `settings.gradle`
+  or `settings.gradle.kts`, holding a module with
+  `src/main/AndroidManifest.xml`. It is looked for up to three directories
+  below the project root, so an app nested in a larger repository is found
+  too.
+- `node-test` and `node-lint` need a `test` or `lint` script in
+  `package.json`, since running that script is the whole job.
+- `node-typecheck` and `node-fmt` need `typescript` or `prettier` among the
+  project's dependencies as well as the config file. Both tools are run from
+  `node_modules/.bin` and never downloaded, so a `tsconfig.json` committed
+  just for an editor doesn't enable a job that would have no compiler.
+- `cmake-test` needs `enable_testing()` or `include(CTest)` in the root
+  `CMakeLists.txt`; `cmake-fmt` needs a `.clang-format`.
+- `gitleaks` and `aur-release` are never detected. Scanning the full git
+  history for secrets is a choice about a project rather than a fact about
+  it, and an AUR package's `PKGBUILD` lives in the AUR repository rather than
+  in yours — so both rules are there to be asked for.
+
+`cibox detect` prints the verdict for every rule, so the ones that didn't
+fire are listed too — that is where to look for a rule you expected and
+didn't get. Any of them can be switched on regardless, and a rule forced on
+without its facts still generates a working job: `rust-msrv` reads the
+version out of `Cargo.toml` in shell when detection didn't capture it.
+
+```ron
+(
+    gitleaks: (enabled: true),
+    rust_feature_combos: (enabled: true),
+)
+```
 
 ### Token permissions
 
