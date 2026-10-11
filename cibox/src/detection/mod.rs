@@ -4,6 +4,7 @@
 //! missing or unparseable file simply means the fact is absent. Rules consult
 //! the collected [`ProjectFacts`] to decide whether they apply.
 
+mod android;
 mod cmake;
 mod docker;
 mod git;
@@ -16,6 +17,7 @@ mod zig;
 use crate::config::Platform;
 use std::path::Path;
 
+pub use android::AndroidFacts;
 pub use cmake::CmakeFacts;
 pub use docker::DockerFacts;
 pub use git::RemoteHost;
@@ -35,6 +37,7 @@ pub struct ProjectFacts {
     pub zig: Option<ZigFacts>,
     pub cmake: Option<CmakeFacts>,
     pub docker: Option<DockerFacts>,
+    pub android: Option<AndroidFacts>,
     pub is_git_repo: bool,
     /// "owner/repo" parsed from the origin remote URL
     pub repo_slug: Option<String>,
@@ -63,6 +66,7 @@ pub fn gather_facts(path: &Path) -> ProjectFacts {
         zig: zig::gather(path),
         cmake: cmake::gather(path),
         docker: docker::gather(path),
+        android: android::gather(path),
         is_git_repo: git.is_repo,
         repo_slug: git.repo_slug,
         remote_host: git.remote_host,
@@ -101,6 +105,7 @@ mod tests {
         assert!(facts.zig.is_none());
         assert!(facts.cmake.is_none());
         assert!(facts.docker.is_none());
+        assert!(facts.android.is_none());
         assert!(!facts.is_git_repo);
         assert!(facts.existing_ci.is_empty());
     }

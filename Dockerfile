@@ -2,7 +2,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git openssh-client ca-certificates \
-        curl xz-utils build-essential cmake clang-format \
+        curl xz-utils build-essential cmake clang-format default-jdk-headless unzip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=zricethezav/gitleaks:v8.30.1 /usr/bin/gitleaks /usr/local/bin/gitleaks

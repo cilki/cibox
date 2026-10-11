@@ -93,7 +93,7 @@ impl Rule for ZigBuild {
     }
 
     fn description(&self) -> &'static str {
-        "Compile the project with zig build"
+        "Compile with zig build --release=safe and upload zig-out as CI artifacts"
     }
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
@@ -105,7 +105,12 @@ impl Rule for ZigBuild {
             Job::new(self.id(), self.name(), Stage::Build)
                 .with_image(super::CIBOX_IMAGE)
                 .with_timeout(15)
-                .with_steps(vec![Step::checkout(), Step::run("Build", "zig build")]),
+                // Everything the build script installs lands in zig-out
+                .with_artifacts(vec!["zig-out/".to_string()])
+                .with_steps(vec![
+                    Step::checkout(),
+                    Step::run("Build", "zig build --release=safe"),
+                ]),
         )]
     }
 }
@@ -136,9 +141,13 @@ mod tests {
             .env
             .contains(&("ZIG_GLOBAL_CACHE_DIR".into(), ".zig-global-cache".into())));
         assert_eq!(ZigFmt.jobs(&ProjectFacts::default())[0].stage, Stage::Lint);
-        assert_eq!(
-            ZigBuild.jobs(&ProjectFacts::default())[0].stage,
-            Stage::Build
-        );
+        let build = &ZigBuild.jobs(&ProjectFacts::default())[0];
+        assert_eq!(build.stage, Stage::Build);
+        // Build jobs compile in release mode and upload their outputs
+        assert!(build.steps.iter().any(|s| matches!(
+            s,
+            Step::Run { command, .. } if command == "zig build --release=safe"
+        )));
+        assert_eq!(build.artifacts, vec!["zig-out/"]);
     }
 }

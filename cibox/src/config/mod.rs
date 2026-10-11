@@ -1,3 +1,4 @@
+pub mod android;
 pub mod aur;
 pub mod image;
 pub mod infer;

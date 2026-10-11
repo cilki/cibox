@@ -256,6 +256,10 @@ pub fn handle_detect(dir: &str) -> Result<()> {
     if let Some(docker) = &facts.docker {
         println!("  {} Docker ({})", "✓".green(), docker.dockerfile);
     }
+    if let Some(android) = &facts.android {
+        println!("  {} Android ({})", "✓".green(), android.dir);
+        println!("    cargo-ndk pre-build: {}", yes_no(android.rust_dir.is_some()));
+    }
     println!("    git repository: {}", yes_no(facts.is_git_repo));
     if let Some(slug) = &facts.repo_slug {
         println!("    remote: {}", slug);

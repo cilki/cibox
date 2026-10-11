@@ -36,6 +36,10 @@ pub struct CiboxConfig {
     /// Test with the minimal dependency versions Cargo.toml permits
     #[serde(skip_serializing_if = "is_default")]
     pub rust_minimal_versions: RuleToggle,
+    /// Build release binaries with cargo build --release and upload them as
+    /// CI artifacts
+    #[serde(skip_serializing_if = "is_default")]
+    pub rust_build: RuleToggle,
     /// Publish to crates.io on version tags (requires CARGO_REGISTRY_TOKEN)
     #[serde(skip_serializing_if = "is_default")]
     pub rust_release: RuleToggle,
@@ -56,7 +60,7 @@ pub struct CiboxConfig {
     /// official golang image, e.g. "1.24".
     #[serde(skip_serializing_if = "is_default")]
     pub go_test: VersionedRule,
-    /// Compile all packages
+    /// Compile all packages and upload the binaries as CI artifacts
     #[serde(skip_serializing_if = "is_default")]
     pub go_build: RuleToggle,
     /// Lint with golangci-lint
@@ -88,7 +92,8 @@ pub struct CiboxConfig {
     /// Check formatting with zig fmt
     #[serde(skip_serializing_if = "is_default")]
     pub zig_fmt: RuleToggle,
-    /// Compile the project with zig build
+    /// Compile with zig build --release=safe and upload zig-out as CI
+    /// artifacts
     #[serde(skip_serializing_if = "is_default")]
     pub zig_build: RuleToggle,
     /// Configure, build, and run ctest
@@ -112,6 +117,10 @@ pub struct CiboxConfig {
     /// Publish to the AUR on version tags (requires AUR_SSH_PRIVATE_KEY)
     #[serde(skip_serializing_if = "is_default")]
     pub aur_release: AurReleaseRule,
+    /// Build the release APK of a Gradle Android project and upload it as a
+    /// CI artifact
+    #[serde(skip_serializing_if = "is_default")]
+    pub android_build: AndroidBuildRule,
 }
 
 /// Override for a rule without knobs
@@ -204,6 +213,32 @@ pub struct AurReleaseRule {
     /// Lowercase alphanumerics and `@._+-`, not starting with `-` or `.`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packages: Option<Vec<String>>,
+}
+
+/// Override for the android-build rule. Detected when a Gradle Android
+/// project (gradlew + settings.gradle + a module with an AndroidManifest)
+/// exists in the repository, at the root or nested up to three levels down.
+/// The job builds the release APK with `gradlew assembleRelease` and uploads
+/// it as a CI artifact; when the Gradle root sits inside a Rust cdylib crate,
+/// a cargo-ndk pre-build produces the JNI libraries first. The Android SDK
+/// is installed at job runtime into a cached directory inside the checkout.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AndroidBuildRule {
+    /// Force this rule on or off; omit to let detection decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The Gradle project directory, relative to the repository root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// Extra Debian packages the native build needs on the host, e.g.
+    /// ["libasound2-dev", "llvm"]. Installed with apt-get before the build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apt_packages: Option<Vec<String>>,
+    /// Rust toolchain for the cargo-ndk pre-build: "stable" (the default),
+    /// "nightly", or "x.y[.z]". Ignored when there is no Rust crate to build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_toolchain: Option<String>,
 }
 
 /// A target platform for a multi-arch docker image
@@ -311,6 +346,7 @@ rule_overrides! {
         rust_msrv,
         rust_feature_combos,
         rust_minimal_versions,
+        rust_build,
         rust_release,
         python_test,
         python_lint,
@@ -334,6 +370,7 @@ rule_overrides! {
         docker_release,
         gitleaks,
         aur_release,
+        android_build,
     ],
     versions: [rust_test, python_test, go_test, node_test],
 }
@@ -369,6 +406,7 @@ pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
         })?;
     validate_image_names(&config)?;
     validate_aur_packages(&config)?;
+    validate_android_build(&config)?;
     Ok(config)
 }
 
@@ -404,6 +442,40 @@ fn validate_aur_packages(config: &CiboxConfig) -> Result<()> {
                 "aur_release.packages entry {name:?} is not a valid AUR package \
                  name: lowercase alphanumerics and `@._+-`, not starting with \
                  `-` or `.`."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The android-build knobs are interpolated into shell commands in the
+/// generated pipeline (`cd ./<dir> && ./gradlew ...`, `apt-get install -y
+/// <packages>`) or into the job's image reference, so a malformed value is a
+/// config error rather than something to quietly rewrite.
+fn validate_android_build(config: &CiboxConfig) -> Result<()> {
+    if let Some(dir) = config.android_build.dir.as_deref() {
+        if !crate::config::android::is_valid_project_dir(dir) {
+            anyhow::bail!(
+                "android_build.dir {dir:?} is not a valid project directory: \
+                 `/`-separated components of alphanumerics and `._+-`, not \
+                 starting with `-` or `.`."
+            );
+        }
+    }
+    for name in config.android_build.apt_packages.iter().flatten() {
+        if !crate::config::android::is_valid_apt_package(name) {
+            anyhow::bail!(
+                "android_build.apt_packages entry {name:?} is not a valid \
+                 Debian package name: lowercase alphanumerics and `+.-`, at \
+                 least two characters, starting with an alphanumeric."
+            );
+        }
+    }
+    if let Some(toolchain) = config.android_build.rust_toolchain.as_deref() {
+        if !crate::config::android::is_valid_toolchain(toolchain) {
+            anyhow::bail!(
+                "android_build.rust_toolchain {toolchain:?} is not a valid \
+                 toolchain: \"stable\", \"nightly\", or \"x.y[.z]\"."
             );
         }
     }

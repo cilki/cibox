@@ -38,12 +38,16 @@ like `rust-test`, `rust-release`, or `docker-build`. Each rule is triggered by
 detection — a `Cargo.toml` enables the Rust rules, a `Dockerfile` enables the
 Docker rules, a publishable package enables its release rule — and contributes
 jobs to the generated pipeline. Release rules run only on `v*` git tags (e.g.
-`rust-release` runs `cargo publish`, `aur-release` pushes to the AUR).
+`rust-release` runs `cargo publish`, `aur-release` pushes to the AUR). Build
+rules compile in release mode on every push and upload what they produce as CI
+artifacts: `rust-build` collects the `cargo build --release` binaries,
+`go-build` the `go build` binaries, `zig-build` the `zig build --release=safe`
+install outputs, and `android-build` the release APK.
 
 Running `cibox update` in a project with no configuration at all produces a
-working pipeline: detection picks the rules and the target platform is
-inferred from existing CI configuration, then from your git remote's host,
-falling back to GitHub Actions. Pass `--platform` to choose explicitly.
+working pipeline: detection picks the rules and the target platform is inferred
+from existing CI configuration, then from your git remote's host, falling back
+to GitHub Actions. Pass `--platform` to choose explicitly.
 
 ```
 $ cibox                           # interactive TUI to toggle rules
@@ -55,26 +59,26 @@ $ cibox update --platform gitlab  # generate for a specific platform
 
 The files cibox manages, per platform:
 
-| Platform | Files |
-|---|---|
+| Platform       | Files                                                       |
+| -------------- | ----------------------------------------------------------- |
 | GitHub Actions | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
-| Gitea Actions | `.gitea/workflows/ci.yml`, `.gitea/workflows/release.yml` |
-| GitLab CI | `.gitlab-ci.yml` |
-| CircleCI | `.circleci/config.yml` |
+| Gitea Actions  | `.gitea/workflows/ci.yml`, `.gitea/workflows/release.yml`   |
+| GitLab CI      | `.gitlab-ci.yml`                                            |
+| CircleCI       | `.circleci/config.yml`                                      |
 
 `cibox update` is safe to re-run after you customize the generated files.
-Merging happens on a lossless YAML tree, so your comments, formatting, and
-key order survive. It conforms the jobs cibox manages to its current output,
-re-adds managed jobs that are missing, removes managed jobs whose rule you
-disabled, and leaves everything else alone: jobs you added are kept
-untouched. Pass `--force` to rewrite the files from scratch instead — as the
-TUI does when it writes, see [Interactive editor](#interactive-editor).
+Merging happens on a lossless YAML tree, so your comments, formatting, and key
+order survive. It conforms the jobs cibox manages to its current output, re-adds
+managed jobs that are missing, removes managed jobs whose rule you disabled, and
+leaves everything else alone: jobs you added are kept untouched. Pass `--force`
+to rewrite the files from scratch instead — as the TUI does when it writes, see
+[Interactive editor](#interactive-editor).
 
-To keep a managed job out of the pipeline without losing it, comment its
-block out. `update` leaves the block commented but keeps regenerating its
-content (reported as "disabled"), so uncommenting it later gives you a
-current job, not a stale one. To drop a job permanently, disable its rule in
-`cibox.ron` — that removes it, commented or not.
+To keep a managed job out of the pipeline without losing it, comment its block
+out. `update` leaves the block commented but keeps regenerating its content
+(reported as "disabled"), so uncommenting it later gives you a current job, not
+a stale one. To drop a job permanently, disable its rule in `cibox.ron` — that
+removes it, commented or not.
 
 Pass `--rule <RULE>` (repeatable) to touch only the named rules' jobs; every
 other job, cibox-managed or not, is left exactly as it is:
@@ -91,40 +95,40 @@ if you no longer want it.
 
 ### Token permissions
 
-GitHub and Gitea workflows are generated with `permissions: contents: read`,
-so the ambient CI token can check out the code and nothing else — without
-that key the token inherits the repository or organization default, which can
-be write-all. Jobs that genuinely need more ask for it individually:
+GitHub and Gitea workflows are generated with `permissions: contents: read`, so
+the ambient CI token can check out the code and nothing else — without that key
+the token inherits the repository or organization default, which can be
+write-all. Jobs that genuinely need more ask for it individually:
 `docker-release` adds `packages: write` when the image lives on `ghcr.io`.
-`cibox update` only scaffolds the block into a workflow that has none, so if
-you widen the token yourself your version is kept.
+`cibox update` only scaffolds the block into a workflow that has none, so if you
+widen the token yourself your version is kept.
 
 The generated checkout also passes `persist-credentials: false`. By default
-`actions/checkout` writes the token into `.git/config` as an auth header,
-where every later step can read it — including build scripts and test suites
-running third-party code. Nothing cibox generates uses git after the clone,
-so the credential is dropped.
+`actions/checkout` writes the token into `.git/config` as an auth header, where
+every later step can read it — including build scripts and test suites running
+third-party code. Nothing cibox generates uses git after the clone, so the
+credential is dropped.
 
 ### Where credentials come from
 
-On GitHub and Gitea, a credential is read from repository Secrets and only
-from there: `DOCKER_PASSWORD`, `CARGO_REGISTRY_TOKEN`, `TWINE_PASSWORD` and
-`AUR_SSH_PRIVATE_KEY` lower to `NAME: ${{ secrets.NAME }}`. A Variable is not a quieter Secret —
-its value is displayed in the settings UI, handed back in plaintext by the
-variables API and never masked in a log — so cibox offers no `|| vars.NAME`
-fallback for a credential, which would amount to saying that keeping a
-publish token there is fine. Values that aren't sensitive do get the choice:
-`DOCKER_USERNAME` lowers to
-`${{ secrets.DOCKER_USERNAME || vars.DOCKER_USERNAME }}` and can live in
-either store. GitLab and CircleCI read both kinds from project CI variables,
-which the `# Required CI variables:` header at the top of the generated file
-lists for you.
+On GitHub and Gitea, a credential is read from repository Secrets and only from
+there: `DOCKER_PASSWORD`, `CARGO_REGISTRY_TOKEN`, `TWINE_PASSWORD` and
+`AUR_SSH_PRIVATE_KEY` lower to `NAME: ${{ secrets.NAME }}`. A Variable is not a
+quieter Secret — its value is displayed in the settings UI, handed back in
+plaintext by the variables API and never masked in a log — so cibox offers no
+`|| vars.NAME` fallback for a credential, which would amount to saying that
+keeping a publish token there is fine. Values that aren't sensitive do get the
+choice: `DOCKER_USERNAME` lowers to
+`${{ secrets.DOCKER_USERNAME || vars.DOCKER_USERNAME }}` and can live in either
+store. GitLab and CircleCI read both kinds from project CI variables, which the
+`# Required CI variables:` header at the top of the generated file lists for
+you.
 
 ## `cibox.ron`
 
-`cibox.ron` holds only your *overrides* from the detected defaults — no file
-is needed until you want to change something. Each rule has an `enabled`
-switch (like NixOS services) plus a few knobs where they make sense:
+`cibox.ron` holds only your _overrides_ from the detected defaults — no file is
+needed until you want to change something. Each rule has an `enabled` switch
+(like NixOS services) plus a few knobs where they make sense:
 
 ```ron
 (
@@ -139,23 +143,23 @@ switch (like NixOS services) plus a few knobs where they make sense:
 )
 ```
 
-Omitted rules follow detection; an omitted `enabled` leaves detection in
-charge while still applying the knobs. The target platform is not part of
-the file — `cibox update` can generate for any platform, so pass
-`--platform` or let cibox infer it.
+Omitted rules follow detection; an omitted `enabled` leaves detection in charge
+while still applying the knobs. The target platform is not part of the file —
+`cibox update` can generate for any platform, so pass `--platform` or let cibox
+infer it.
 
-`image_name` has to be a valid docker reference, because it ends up as a
-literal argument to `docker build -t`: lowercase alphanumerics separated by
-`.`, `-` or `_`, optionally prefixed with a registry host and suffixed with a
-`:tag`. Anything else is rejected by `cibox validate`. The default is derived
-from the git remote (or the directory name) and normalized to fit, so a
-`Fossable/CiBox` remote becomes `fossable/cibox`.
+`image_name` has to be a valid docker reference, because it ends up as a literal
+argument to `docker build -t`: lowercase alphanumerics separated by `.`, `-` or
+`_`, optionally prefixed with a registry host and suffixed with a `:tag`.
+Anything else is rejected by `cibox validate`. The default is derived from the
+git remote (or the directory name) and normalized to fit, so a `Fossable/CiBox`
+remote becomes `fossable/cibox`.
 
 The registry is inferred from the image name. `docker-release` logs in to
-`ghcr.io` with `GITHUB_TOKEN`, and everywhere else — the host prefix if the
-name has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and
-`DOCKER_PASSWORD` secrets. If the credentials aren't configured in CI, the
-login is skipped, for registries that don't require any.
+`ghcr.io` with `GITHUB_TOKEN`, and everywhere else — the host prefix if the name
+has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and `DOCKER_PASSWORD`
+secrets. If the credentials aren't configured in CI, the login is skipped, for
+registries that don't require any.
 
 `sync_readme` additionally pushes `README.md` to the Docker Hub repository
 description once the image is released, reusing the same two secrets. It is
@@ -178,20 +182,19 @@ default. Listing `platforms` turns it into a multi-arch build:
 
 The available platforms are `LinuxAmd64`, `LinuxArm64`, `LinuxArmV7`,
 `LinuxRiscv64`, and `WindowsAmd64`. Linux targets build together in one
-`docker buildx` job, with QEMU set up when a foreign architecture is
-involved. `WindowsAmd64` can't be emulated, so it gets its own job on a
-Windows runner — that means GitHub Actions or Gitea Actions only (GitLab and
-CircleCI refuse to generate), and the same Dockerfile has to work from a
-Windows base image. Mixing Linux and Windows targets emits three jobs: the
-two per-OS builds push staging tags and a third merges them into one
-multi-platform manifest, so `image_name` must not already carry a tag.
+`docker buildx` job, with QEMU set up when a foreign architecture is involved.
+`WindowsAmd64` can't be emulated, so it gets its own job on a Windows runner —
+that means GitHub Actions or Gitea Actions only (GitLab and CircleCI refuse to
+generate), and the same Dockerfile has to work from a Windows base image. Mixing
+Linux and Windows targets emits three jobs: the two per-OS builds push staging
+tags and a third merges them into one multi-platform manifest, so `image_name`
+must not already carry a tag.
 
 ### Publishing to the AUR
 
-`aur-release` publishes packages to the
-[AUR](https://aur.archlinux.org) when a version tag is pushed. It is off by
-default — the AUR repo, not your project, holds the PKGBUILD, so there is
-nothing to detect — and enabled in `cibox.ron`:
+`aur-release` publishes packages to the [AUR](https://aur.archlinux.org) when a
+version tag is pushed. It is off by default — the AUR repo, not your project,
+holds the PKGBUILD, so there is nothing to detect — and enabled in `cibox.ron`:
 
 ```ron
 (
@@ -202,26 +205,26 @@ nothing to detect — and enabled in `cibox.ron`:
 )
 ```
 
-`packages` defaults to a single package named after the git remote's
-repository. Each name becomes one release job that clones
-`ssh://aur@aur.archlinux.org/<name>.git`, sets `pkgver` from the tag (with
-the leading `v` stripped) and resets `pkgrel`, refreshes the checksums with
-`updpkgsums`, test-builds the package with `makepkg` and lints it with
-`namcap`, regenerates `.SRCINFO`, and pushes. A broken PKGBUILD therefore
-fails the job instead of reaching the AUR. Because `updpkgsums` downloads the
-sources, the PKGBUILD's `source` URL has to be live when the tag is pushed —
-tag-derived archive URLs (codeload, GitLab archives) are, manually-uploaded
-release assets may not be yet.
+`packages` defaults to a single package named after the git remote's repository.
+Each name becomes one release job that clones
+`ssh://aur@aur.archlinux.org/<name>.git`, sets `pkgver` from the tag (with the
+leading `v` stripped) and resets `pkgrel`, refreshes the checksums with
+`updpkgsums`, test-builds the package with `makepkg` and lints it with `namcap`,
+regenerates `.SRCINFO`, and pushes. A broken PKGBUILD therefore fails the job
+instead of reaching the AUR. Because `updpkgsums` downloads the sources, the
+PKGBUILD's `source` URL has to be live when the tag is pushed — tag-derived
+archive URLs (codeload, GitLab archives) are, manually-uploaded release assets
+may not be yet.
 
-Names must be valid AUR package names — lowercase alphanumerics and `@._+-`,
-not starting with `-` or `.` — which `cibox validate` checks.
+Names must be valid AUR package names — lowercase alphanumerics and `@._+-`, not
+starting with `-` or `.` — which `cibox validate` checks.
 
 The job authenticates with the `AUR_SSH_PRIVATE_KEY` secret. Generate a
 dedicated key with `ssh-keygen -t ed25519`, add the public half to your AUR
-account, and store the private half as a Secret (GitHub/Gitea) or a project
-CI variable (GitLab/CircleCI). On GitLab use type Variable with variable
-expansion turned off — the value is multi-line, which rules out masking and
-type File would hand the job a path instead of the key.
+account, and store the private half as a Secret (GitHub/Gitea) or a project CI
+variable (GitLab/CircleCI). On GitLab use type Variable with variable expansion
+turned off — the value is multi-line, which rules out masking and type File
+would hand the job a path instead of the key.
 
 You can use our TUI interface to edit this file or any editor with LSP support.
 Configure your editor to use `cibox lsp` as an LSP and you'll get inline
@@ -244,33 +247,32 @@ language-servers = ["cibox-lsp"]
 ## Interactive editor
 
 `cibox` with no arguments opens the TUI — `cibox editor --dir <path>` for a
-project somewhere else. Rules are on the left, the pipeline they generate on
-the right, with the lines that differ from the file already on disk
-highlighted.
+project somewhere else. Rules are on the left, the pipeline they generate on the
+right, with the lines that differ from the file already on disk highlighted.
 
-| Key | Action |
-|---|---|
-| `↑`/`↓`, `k`/`j` | move through the rules |
-| `Space`/`Enter` | toggle the rule under the cursor, or edit the knob |
+| Key              | Action                                                            |
+| ---------------- | ----------------------------------------------------------------- |
+| `↑`/`↓`, `k`/`j` | move through the rules                                            |
+| `Space`/`Enter`  | toggle the rule under the cursor, or edit the knob                |
 | `→`/`l`, `←`/`h` | show or hide a rule's knobs (the docker and test rules have them) |
-| `d`/`Del` | drop the toolchain version under the cursor |
-| `K`/`J` | scroll the preview |
-| `p` | pick the target platform (`Tab` cycles to the next one) |
-| `w` | write the pipeline files |
-| `q`/`Esc` | quit |
+| `d`/`Del`        | drop the toolchain version under the cursor                       |
+| `K`/`J`          | scroll the preview                                                |
+| `p`              | pick the target platform (`Tab` cycles to the next one)           |
+| `w`              | write the pipeline files                                          |
+| `q`/`Esc`        | quit                                                              |
 
 Expanding `docker-build`/`docker-release` shows the image name and the target
-platforms, and `aur-release` its comma-separated package list; expanding a
-test rule shows its `versions` list, where `Enter` on the trailing add row
-appends a toolchain version and `d` removes the one under the cursor.
+platforms, `aur-release` its comma-separated package list, and `android-build`
+its project directory, apt packages, and rust toolchain; expanding a test rule
+shows its `versions` list, where `Enter` on the trailing add row appends a
+toolchain version and `d` removes the one under the cursor.
 
 Toggling a rule or changing a knob saves `cibox.ron` right away — there is no
-separate save key for it, and the file stays delta-only, so flipping a rule
-back to what detection says drops it from the file again. The platform you
-pick applies to the preview and to `w` for this session only; it is never
-recorded in `cibox.ron`, which holds nothing but rule overrides.
+separate save key for it, and the file stays delta-only, so flipping a rule back
+to what detection says drops it from the file again. The platform you pick
+applies to the preview and to `w` for this session only; it is never recorded in
+`cibox.ron`, which holds nothing but rule overrides.
 
-`w` writes each file from scratch, the way `cibox update --force` does: jobs
-you added to a generated file by hand are dropped, along with your comments
-and formatting. Quit and run `cibox update` instead to keep those edits.
-
+`w` writes each file from scratch, the way `cibox update --force` does: jobs you
+added to a generated file by hand are dropped, along with your comments and
+formatting. Quit and run `cibox update` instead to keep those edits.

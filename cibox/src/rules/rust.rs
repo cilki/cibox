@@ -28,7 +28,7 @@ fn with_cargo_cache(job: Job, key: &str, paths: &[&str]) -> Job {
 }
 
 /// The image providing a user-selected toolchain version
-fn toolchain_image(version: &str) -> String {
+pub(crate) fn toolchain_image(version: &str) -> String {
     match version {
         "stable" => IMAGE.to_string(),
         "nightly" => "rustlang/rust:nightly".to_string(),
@@ -371,6 +371,52 @@ impl Rule for RustMinimalVersions {
     }
 }
 
+/// Build release binaries and upload them as CI artifacts
+pub struct RustBuild;
+
+impl Rule for RustBuild {
+    fn id(&self) -> &'static str {
+        "rust-build"
+    }
+
+    fn name(&self) -> &'static str {
+        "Cargo build"
+    }
+
+    fn description(&self) -> &'static str {
+        "Build release binaries and upload them as CI artifacts"
+    }
+
+    fn detect(&self, facts: &ProjectFacts) -> bool {
+        // A pure library has no binaries worth uploading, and rust-test
+        // already proves it compiles
+        facts.rust.as_ref().is_some_and(|r| !r.is_library)
+    }
+
+    fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
+        vec![with_cargo_cache(
+            Job::new(self.id(), self.name(), Stage::Build)
+                .with_image(IMAGE)
+                .with_timeout(30),
+            // Release artifacts don't mix with the debug-profile rust-cache
+            "rust-build-cache",
+            &["target/", ".cargo/"],
+        )
+        .with_artifacts(vec!["artifacts/".to_string()])
+        .with_steps(vec![
+            Step::checkout(),
+            Step::run("Build", "cargo build --release"),
+            // target/release is full of build intermediates; only the
+            // top-level executables are the job's product
+            Step::run(
+                "Collect artifacts",
+                "mkdir -p artifacts && \
+                 find target/release -maxdepth 1 -type f -executable -exec cp {} artifacts/ \\;",
+            ),
+        ])]
+    }
+}
+
 /// Publish to crates.io when a version tag is pushed
 pub struct RustRelease;
 
@@ -479,6 +525,39 @@ mod tests {
         assert_eq!(entries[0].image, "rust:latest");
         assert_eq!(entries[1].image, "rustlang/rust:nightly");
         assert_eq!(entries[2].image, "rust:1.85");
+    }
+
+    #[test]
+    fn test_build_detects_binary_projects_only() {
+        // A pure library has no binaries worth uploading, and rust-test
+        // already proves it compiles
+        let binary = facts("[package]\nname = \"a\"\nversion = \"0.1.0\"\n");
+        assert!(RustBuild.detect(&binary));
+        assert!(!RustBuild.detect(&library_facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
+        )));
+        assert!(!RustBuild.detect(&ProjectFacts::default()));
+    }
+
+    #[test]
+    fn test_build_job_is_release_mode_with_artifacts() {
+        let jobs = RustBuild.jobs(&ProjectFacts::default());
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.id, "rust-build");
+        assert_eq!(job.stage, Stage::Build);
+        assert!(!job.tags_only);
+        assert_eq!(job.matrix, None, "artifacts are incompatible with a matrix");
+        assert_eq!(job.artifacts, vec!["artifacts/"]);
+        assert!(job.steps.iter().any(
+            |s| matches!(s, Step::Run { command, .. } if command == "cargo build --release")
+        ));
+        // Only the top-level executables, not the build intermediates
+        assert!(job.steps.iter().any(|s| matches!(
+            s,
+            Step::Run { command, .. }
+                if command.contains("find target/release -maxdepth 1 -type f -executable")
+        )));
     }
 
     #[test]

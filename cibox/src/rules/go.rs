@@ -86,7 +86,7 @@ impl Rule for GoBuild {
     }
 
     fn description(&self) -> &'static str {
-        "Compile all packages"
+        "Compile all packages and upload the binaries as CI artifacts"
     }
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
@@ -97,10 +97,14 @@ impl Rule for GoBuild {
         vec![cached(Job::new(self.id(), self.name(), Stage::Build))
             .with_image(IMAGE)
             .with_timeout(15)
+            // Non-main packages are built and discarded; only the
+            // executables land in bin/. Go has no debug mode, so the
+            // binaries are already the release ones.
+            .with_artifacts(vec!["bin/".to_string()])
             .with_steps(vec![
                 Step::checkout(),
                 redirect_caches(),
-                Step::run("Build", "go build -v ./..."),
+                Step::run("Build", "mkdir -p bin && go build -v -o bin/ ./..."),
             ])]
     }
 }
@@ -200,7 +204,15 @@ mod tests {
         let jobs = GoTest::default().jobs(&ProjectFacts::default());
         assert_eq!(jobs[0].id, "go-test");
         assert_eq!(jobs[0].image.as_deref(), Some("golang:1.23"));
-        assert_eq!(GoBuild.jobs(&ProjectFacts::default())[0].stage, Stage::Build);
+        let build = &GoBuild.jobs(&ProjectFacts::default())[0];
+        assert_eq!(build.stage, Stage::Build);
+        // The -o directory is what makes the binaries collectible as
+        // artifacts; non-main packages are built and discarded
+        assert!(build.steps.iter().any(|s| matches!(
+            s,
+            Step::Run { command, .. } if command == "mkdir -p bin && go build -v -o bin/ ./..."
+        )));
+        assert_eq!(build.artifacts, vec!["bin/"]);
     }
 
     #[test]

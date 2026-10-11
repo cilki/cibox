@@ -48,7 +48,13 @@ impl Rule for DockerBuild {
     }
 }
 
-/// Push the image to a registry when a version tag is pushed.
+/// Reads the pushed git tag into `$version` for the release tags that follow.
+/// Shell variables don't survive across steps on GitHub, so every step that
+/// pushes a versioned tag starts with this.
+const READ_VERSION: &str = "version=\"$(git describe --tags --exact-match)\"; ";
+
+/// Push the image to a registry when a version tag is pushed. The image is
+/// pushed under two tags: `latest` and the name of the git tag.
 /// The registry is inferred from the image name: a `ghcr.io/` prefix logs in
 /// to the GitHub Container Registry with GITHUB_TOKEN, any other host prefix
 /// logs in to that registry with Docker Hub-style credentials, and a bare
@@ -74,6 +80,17 @@ pub struct DockerRelease {
 impl DockerRelease {
     fn uses_ghcr(&self) -> bool {
         self.image.starts_with("ghcr.io/")
+    }
+
+    /// `-t` flags for the final image: `latest` plus the git tag name, which
+    /// a preceding [`READ_VERSION`] leaves in `$version`. The expansion is
+    /// quoted, so a hostile tag name stays a single argument for docker to
+    /// reject rather than becoming shell.
+    fn release_tag_flags(&self) -> String {
+        format!(
+            "-t {image}:latest -t \"{image}:$version\"",
+            image = self.image
+        )
     }
 
     /// The login step skips at runtime when the credentials aren't
@@ -164,12 +181,13 @@ impl DockerRelease {
             .collect()
     }
 
-    /// Steps for a buildx job that builds `linux` platforms and pushes `tag`
+    /// Steps for a buildx job that builds `linux` platforms and pushes a
+    /// single staging `tag`, or the final release tags when `tag` is `None`
     fn buildx_steps(
         &self,
         facts: &ProjectFacts,
         linux: &[DockerPlatform],
-        tag: &str,
+        tag: Option<&str>,
     ) -> Vec<Step> {
         let mut steps = vec![
             Step::checkout(),
@@ -188,28 +206,44 @@ impl DockerRelease {
             .map(|p| p.as_str())
             .collect::<Vec<_>>()
             .join(",");
+        let (read_version, tag_flags) = match tag {
+            Some(tag) => ("", format!("-t {tag}")),
+            None => (READ_VERSION, self.release_tag_flags()),
+        };
         steps.push(Step::run(
             "Build and push image",
             format!(
-                "docker buildx build --platform {platform_list}{} -t {tag} --push .",
+                "{read_version}docker buildx build --platform {platform_list}{} {tag_flags} --push .",
                 dockerfile_flag(facts)
             ),
         ));
         steps
     }
 
-    /// Steps for a plain single-architecture build and push of `tag`, used
-    /// both when no platforms are selected and for the Windows-runner job
-    /// (Windows images can't be cross-built with buildx)
-    fn build_push_steps(&self, facts: &ProjectFacts, tag: &str) -> Vec<Step> {
+    /// Steps for a plain single-architecture build and push of a staging
+    /// `tag` (the Windows-runner job — Windows images can't be cross-built
+    /// with buildx), or of the final release tags when `tag` is `None`
+    fn build_push_steps(&self, facts: &ProjectFacts, tag: Option<&str>) -> Vec<Step> {
+        let build_tag = match tag {
+            Some(tag) => tag.to_string(),
+            None => format!("{}:latest", self.image),
+        };
+        let push = match tag {
+            Some(tag) => format!("docker push {tag}"),
+            None => format!(
+                "{READ_VERSION}docker tag {image}:latest \"{image}:$version\"; \
+                 docker push {image}:latest; docker push \"{image}:$version\"",
+                image = self.image
+            ),
+        };
         vec![
             Step::checkout(),
             Step::run("Login to registry", self.login_command()),
             Step::run(
                 "Build image",
-                format!("docker build{} -t {tag} .", dockerfile_flag(facts)),
+                format!("docker build{} -t {build_tag} .", dockerfile_flag(facts)),
             ),
-            Step::run("Push image", format!("docker push {tag}")),
+            Step::run("Push image", push),
         ]
     }
 
@@ -263,7 +297,7 @@ impl Rule for DockerRelease {
             (true, windows_empty) => {
                 let job = self.release_job("", self.name()).with_timeout(30);
                 let job = if windows_empty { job } else { job.on_windows() };
-                let mut steps = self.build_push_steps(facts, &self.image);
+                let mut steps = self.build_push_steps(facts, None);
                 // The sync tool is a Linux container, so skip it on Windows
                 if windows_empty {
                     steps.extend(self.readme_sync_step());
@@ -272,7 +306,7 @@ impl Rule for DockerRelease {
             }
             // Linux only: one buildx job pushes the multi-arch manifest
             (false, true) => {
-                let mut steps = self.buildx_steps(facts, &linux, &self.image);
+                let mut steps = self.buildx_steps(facts, &linux, None);
                 steps.extend(self.readme_sync_step());
                 vec![self
                     .release_job("", self.name())
@@ -286,11 +320,11 @@ impl Rule for DockerRelease {
                 vec![
                     self.release_job("-linux", "Docker push (linux)")
                         .with_timeout(60)
-                        .with_steps(self.buildx_steps(facts, &linux, &linux_tag)),
+                        .with_steps(self.buildx_steps(facts, &linux, Some(&linux_tag))),
                     self.release_job("-windows", "Docker push (windows)")
                         .on_windows()
                         .with_timeout(30)
-                        .with_steps(self.build_push_steps(facts, &windows_tag)),
+                        .with_steps(self.build_push_steps(facts, Some(&windows_tag))),
                     self.release_job("", self.name())
                         .with_timeout(10)
                         .with_needs(vec![
@@ -298,22 +332,21 @@ impl Rule for DockerRelease {
                             format!("{}-windows", self.id()),
                         ])
                         .with_steps({
+                            // imagetools needs no source checkout, but
+                            // `git describe` (and the README sync) read
+                            // from the repository
                             let mut steps = vec![
+                                Step::checkout(),
                                 Step::run("Login to registry", self.login_command()),
                                 Step::run(
                                     "Merge manifests",
                                     format!(
-                                        "docker buildx imagetools create -t {} {linux_tag} {windows_tag}",
-                                        self.image
+                                        "{READ_VERSION}docker buildx imagetools create {} {linux_tag} {windows_tag}",
+                                        self.release_tag_flags()
                                     ),
                                 ),
                             ];
-                            // imagetools needs no source checkout, but the
-                            // README sync reads README.md from disk
-                            if let Some(sync) = self.readme_sync_step() {
-                                steps.insert(0, Step::checkout());
-                                steps.push(sync);
-                            }
+                            steps.extend(self.readme_sync_step());
                             steps
                         }),
                 ]
@@ -369,9 +402,17 @@ mod tests {
         // The password is a credential; the username is configuration
         assert_eq!(job.secrets, vec!["DOCKER_PASSWORD"]);
         assert_eq!(job.variables, vec!["DOCKER_USERNAME"]);
-        assert!(job.steps.iter().any(
-            |s| matches!(s, Step::Run { command, .. } if command == "docker push owner/app")
-        ));
+        assert_eq!(
+            run_command(job, "Build image"),
+            "docker build -t owner/app:latest ."
+        );
+        // The image goes out as both `latest` and the git tag name
+        assert_eq!(
+            run_command(job, "Push image"),
+            "version=\"$(git describe --tags --exact-match)\"; \
+             docker tag owner/app:latest \"owner/app:$version\"; \
+             docker push owner/app:latest; docker push \"owner/app:$version\""
+        );
     }
 
     fn run_command<'a>(job: &'a Job, name: &str) -> &'a str {
@@ -400,7 +441,9 @@ mod tests {
         assert!(job.tags_only);
         assert_eq!(
             run_command(job, "Build and push image"),
-            "docker buildx build --platform linux/amd64,linux/arm64 -t owner/app --push ."
+            "version=\"$(git describe --tags --exact-match)\"; \
+             docker buildx build --platform linux/amd64,linux/arm64 \
+             -t owner/app:latest -t \"owner/app:$version\" --push ."
         );
         assert_eq!(
             run_command(job, "Set up QEMU"),
@@ -423,7 +466,9 @@ mod tests {
             .any(|s| matches!(s, Step::Run { name, .. } if name == "Set up QEMU")));
         assert_eq!(
             run_command(job, "Build and push image"),
-            "docker buildx build --platform linux/amd64 -t owner/app --push ."
+            "version=\"$(git describe --tags --exact-match)\"; \
+             docker buildx build --platform linux/amd64 \
+             -t owner/app:latest -t \"owner/app:$version\" --push ."
         );
     }
 
@@ -465,13 +510,12 @@ mod tests {
         );
         assert_eq!(
             run_command(merge, "Merge manifests"),
-            "docker buildx imagetools create -t owner/app owner/app:linux owner/app:windows-amd64"
+            "version=\"$(git describe --tags --exact-match)\"; \
+             docker buildx imagetools create -t owner/app:latest -t \"owner/app:$version\" \
+             owner/app:linux owner/app:windows-amd64"
         );
-        // imagetools needs no source checkout
-        assert!(!merge
-            .steps
-            .iter()
-            .any(|s| matches!(s, Step::Checkout { .. })));
+        // imagetools needs no source checkout, but `git describe` does
+        assert!(matches!(merge.steps.first(), Some(Step::Checkout { .. })));
 
         // Every job logs in, so every job needs the registry credentials
         for job in &jobs {
@@ -493,7 +537,14 @@ mod tests {
         let job = &jobs[0];
         assert_eq!(job.id, "docker-release");
         assert_eq!(job.runs_on, crate::ir::RunnerOs::Windows);
-        assert_eq!(run_command(job, "Push image"), "docker push owner/app");
+        // Windows runners still get a POSIX shell (Git Bash on GitHub), so
+        // the version read works there too
+        assert_eq!(
+            run_command(job, "Push image"),
+            "version=\"$(git describe --tags --exact-match)\"; \
+             docker tag owner/app:latest \"owner/app:$version\"; \
+             docker push owner/app:latest; docker push \"owner/app:$version\""
+        );
     }
 
     #[test]
@@ -721,8 +772,6 @@ mod tests {
                 job.id
             );
         }
-        // Without the sync the merge job keeps its no-checkout shape
-        assert!(!jobs[2].steps.iter().any(|s| matches!(s, Step::Checkout { .. })));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! default; `cibox.ron` overrides flip individual rules on or off and set the
 //! few knobs some rules have.
 
+pub mod android;
 pub mod aur;
 pub mod cmake;
 pub mod docker;
@@ -20,6 +21,7 @@ use crate::config::CiboxConfig;
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, MatrixEntry};
 
+pub use android::AndroidBuild;
 pub use aur::AurRelease;
 pub use cmake::{CmakeBuild, CmakeFmt, CmakeTest};
 pub use docker::{DockerBuild, DockerRelease};
@@ -28,8 +30,8 @@ pub use go::{GoAudit, GoBuild, GoLint, GoTest};
 pub use node::{NodeFmt, NodeLint, NodeTest, NodeTypecheck};
 pub use python::{PythonFmt, PythonLint, PythonRelease, PythonTest};
 pub use rust::{
-    RustAudit, RustClippy, RustDoc, RustFmt, RustFeatureCombos, RustMinimalVersions, RustMsrv,
-    RustRelease, RustTest,
+    RustAudit, RustBuild, RustClippy, RustDoc, RustFmt, RustFeatureCombos, RustMinimalVersions,
+    RustMsrv, RustRelease, RustTest,
 };
 pub use zig::{ZigBuild, ZigFmt, ZigTest};
 
@@ -174,6 +176,7 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         Box::new(RustMsrv),
         Box::new(RustFeatureCombos),
         Box::new(RustMinimalVersions),
+        Box::new(RustBuild),
         Box::new(RustRelease),
         Box::new(PythonTest {
             versions: clean_versions(config.python_test.versions.as_ref()),
@@ -214,6 +217,11 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
         Box::new(Gitleaks),
         Box::new(AurRelease {
             packages: aur_packages(facts, config),
+        }),
+        Box::new(AndroidBuild {
+            dir: config.android_build.dir.clone(),
+            apt_packages: clean_versions(config.android_build.apt_packages.as_ref()),
+            rust_toolchain: config.android_build.rust_toolchain.clone(),
         }),
     ];
 
@@ -482,7 +490,7 @@ mod tests {
             .any(|c| *c == format!("docker build -t {image} .")));
         assert!(commands
             .iter()
-            .any(|c| *c == format!("docker push {image}")));
+            .any(|c| c.contains(&format!("docker push {image}:latest"))));
     }
 
     #[test]
