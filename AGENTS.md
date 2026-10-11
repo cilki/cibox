@@ -52,7 +52,8 @@ To add a rule:
 
 Jobs that need tools beyond a language toolchain should run on the
 `fossable/cibox` image (`CIBOX_IMAGE`), built from the `Dockerfile` at the
-repo root — add the tool there.
+repo root — add the tool there. The exception is `aur-release`, which runs on
+`archlinux:base-devel` because makepkg only exists on Arch.
 
 ## TO-DO
 

@@ -440,6 +440,42 @@ mod tests {
     }
 
     #[test]
+    fn test_aur_release_renders_valid_output_everywhere() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.aur_release.enabled = Some(true);
+        let resolved = resolve(&facts, &config);
+
+        for platform in Platform::all() {
+            let outputs = generate(&facts, &resolved, platform).unwrap();
+            let (path, content) = outputs
+                .iter()
+                .find(|(_, content)| content.contains("aur-release"))
+                .unwrap_or_else(|| panic!("{platform:?} has no aur-release"));
+            serde_yaml::from_str::<serde_yaml::Value>(content)
+                .unwrap_or_else(|e| panic!("{platform:?} invalid YAML: {e}"));
+            // Tag-gated, so GitHub/Gitea route it to release.yml; the secret
+            // is referenced on GitHub/Gitea and documented on the others
+            match platform {
+                Platform::GitHub | Platform::Gitea => {
+                    assert!(path.ends_with("release.yml"), "{platform:?}: {path:?}");
+                    assert!(
+                        content.contains("secrets.AUR_SSH_PRIVATE_KEY"),
+                        "{platform:?}: {content}"
+                    );
+                }
+                Platform::GitLab | Platform::CircleCI => {
+                    assert!(
+                        content.contains("Required CI variables")
+                            && content.contains("AUR_SSH_PRIVATE_KEY"),
+                        "{platform:?}: {content}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_repo_config_parses_and_generates() {
         // The repo's own cibox.ron should parse and generate everywhere
         let config =

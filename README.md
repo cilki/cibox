@@ -38,7 +38,7 @@ like `rust-test`, `rust-release`, or `docker-build`. Each rule is triggered by
 detection — a `Cargo.toml` enables the Rust rules, a `Dockerfile` enables the
 Docker rules, a publishable package enables its release rule — and contributes
 jobs to the generated pipeline. Release rules run only on `v*` git tags (e.g.
-`rust-release` runs `cargo publish`).
+`rust-release` runs `cargo publish`, `aur-release` pushes to the AUR).
 
 Running `cibox update` in a project with no configuration at all produces a
 working pipeline: detection picks the rules and the target platform is
@@ -108,8 +108,8 @@ so the credential is dropped.
 ### Where credentials come from
 
 On GitHub and Gitea, a credential is read from repository Secrets and only
-from there: `DOCKER_PASSWORD`, `CARGO_REGISTRY_TOKEN` and `TWINE_PASSWORD`
-lower to `NAME: ${{ secrets.NAME }}`. A Variable is not a quieter Secret —
+from there: `DOCKER_PASSWORD`, `CARGO_REGISTRY_TOKEN`, `TWINE_PASSWORD` and
+`AUR_SSH_PRIVATE_KEY` lower to `NAME: ${{ secrets.NAME }}`. A Variable is not a quieter Secret —
 its value is displayed in the settings UI, handed back in plaintext by the
 variables API and never masked in a log — so cibox offers no `|| vars.NAME`
 fallback for a credential, which would amount to saying that keeping a
@@ -186,6 +186,43 @@ Windows base image. Mixing Linux and Windows targets emits three jobs: the
 two per-OS builds push staging tags and a third merges them into one
 multi-platform manifest, so `image_name` must not already carry a tag.
 
+### Publishing to the AUR
+
+`aur-release` publishes packages to the
+[AUR](https://aur.archlinux.org) when a version tag is pushed. It is off by
+default — the AUR repo, not your project, holds the PKGBUILD, so there is
+nothing to detect — and enabled in `cibox.ron`:
+
+```ron
+(
+    aur_release: (enabled: true),
+
+    // Or, for more than one package per repository:
+    // aur_release: (enabled: true, packages: ["app", "app-extras"]),
+)
+```
+
+`packages` defaults to a single package named after the git remote's
+repository. Each name becomes one release job that clones
+`ssh://aur@aur.archlinux.org/<name>.git`, sets `pkgver` from the tag (with
+the leading `v` stripped) and resets `pkgrel`, refreshes the checksums with
+`updpkgsums`, test-builds the package with `makepkg` and lints it with
+`namcap`, regenerates `.SRCINFO`, and pushes. A broken PKGBUILD therefore
+fails the job instead of reaching the AUR. Because `updpkgsums` downloads the
+sources, the PKGBUILD's `source` URL has to be live when the tag is pushed —
+tag-derived archive URLs (codeload, GitLab archives) are, manually-uploaded
+release assets may not be yet.
+
+Names must be valid AUR package names — lowercase alphanumerics and `@._+-`,
+not starting with `-` or `.` — which `cibox validate` checks.
+
+The job authenticates with the `AUR_SSH_PRIVATE_KEY` secret. Generate a
+dedicated key with `ssh-keygen -t ed25519`, add the public half to your AUR
+account, and store the private half as a Secret (GitHub/Gitea) or a project
+CI variable (GitLab/CircleCI). On GitLab use type Variable with variable
+expansion turned off — the value is multi-line, which rules out masking and
+type File would hand the job a path instead of the key.
+
 You can use our TUI interface to edit this file or any editor with LSP support.
 Configure your editor to use `cibox lsp` as an LSP and you'll get inline
 documenation and autocomplete.
@@ -223,9 +260,9 @@ highlighted.
 | `q`/`Esc` | quit |
 
 Expanding `docker-build`/`docker-release` shows the image name and the target
-platforms; expanding a test rule shows its `versions` list, where `Enter` on
-the trailing add row appends a toolchain version and `d` removes the one
-under the cursor.
+platforms, and `aur-release` its comma-separated package list; expanding a
+test rule shows its `versions` list, where `Enter` on the trailing add row
+appends a toolchain version and `d` removes the one under the cursor.
 
 Toggling a rule or changing a knob saves `cibox.ron` right away — there is no
 separate save key for it, and the file stays delta-only, so flipping a rule

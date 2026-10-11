@@ -198,6 +198,16 @@ impl EditorState {
         crate::rules::docker_image(&self.facts, &self.config)
     }
 
+    /// The AUR package list detection would use without any override
+    fn default_aur_packages(&self) -> Vec<String> {
+        crate::rules::aur_packages(&self.facts, &CiboxConfig::default())
+    }
+
+    /// The AUR package list in effect, as the aur-release rule will see it
+    fn effective_aur_packages(&self) -> Vec<String> {
+        crate::rules::aur_packages(&self.facts, &self.config)
+    }
+
     /// The config-option rows of one rule, in display order: the toolchain
     /// versions of a test rule, or the image name (plus docker-release's
     /// booleans) of a docker rule. Empty for every other rule, which is also
@@ -227,6 +237,23 @@ impl EditorState {
                     default_image,
                 }])
                 .collect();
+        }
+
+        if rule_id == "aur-release" {
+            return vec![Row::TextKnob {
+                rule_id,
+                label: "packages",
+                description: "Comma-separated AUR package names, one release job each; \
+                              the default is named after the git remote. Press Enter to \
+                              edit.",
+                override_value: self
+                    .config
+                    .aur_release
+                    .packages
+                    .as_ref()
+                    .map(|packages| packages.join(", ")),
+                effective: self.effective_aur_packages().join(", "),
+            }];
         }
 
         if !matches!(rule_id, "docker-build" | "docker-release") {
@@ -380,10 +407,27 @@ impl EditorState {
         };
         let value = buffer.trim().to_string();
         match self.rows.get(self.cursor).cloned() {
+            // The typed names are written to cibox.ron and from there into
+            // shell commands, so coerce them into valid values rather than
+            // saving something the config parser would reject
+            Some(Row::TextKnob {
+                rule_id: "aur-release",
+                ..
+            }) => {
+                let packages: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(crate::config::aur::coerce_package_name)
+                    .collect();
+                // Normalize exactly as rules::resolve would (dedupe), so
+                // what the preview shows is what the file means
+                let packages = clean_versions(Some(&packages));
+                self.config.aur_release.packages = (!packages.is_empty())
+                    .then_some(packages)
+                    .filter(|packages| *packages != self.default_aur_packages());
+            }
             Some(Row::TextKnob { rule_id, .. }) => {
-                // The typed name is written to cibox.ron and from there into
-                // a shell command, so coerce it into a valid reference rather
-                // than saving something the config parser would reject
                 let override_value = (!value.is_empty())
                     .then(|| crate::config::image::coerce_reference(&value))
                     .filter(|value| *value != self.default_image());
@@ -960,6 +1004,51 @@ mod tests {
         }
         state.commit_input();
         assert!(state.config.is_default());
+    }
+
+    #[test]
+    fn test_aur_packages_editing() {
+        let dir = rust_dir();
+        let mut state = state_for(dir.path());
+
+        // Off by default but still expandable for configuration
+        assert!(!rule_row(&state, "aur-release").enabled);
+        state.cursor = rule_index(&state, "aur-release");
+        state.activate_current();
+        state.expand_current();
+        let idx = rule_index(&state, "aur-release");
+        assert!(matches!(
+            state.rows[idx + 1],
+            Row::TextKnob { label: "packages", .. }
+        ));
+
+        // Typed names are coerced, split on commas, and deduped so the saved
+        // file is something the config parser accepts back
+        state.cursor = idx + 1;
+        state.activate_current();
+        clear_input(&mut state);
+        for c in "foo, Bar baz, foo,".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(
+            state.config.aur_release.packages,
+            Some(vec!["foo".to_string(), "bar-baz".to_string()])
+        );
+        let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
+        crate::config::parse_config(&ron_str).unwrap();
+        assert!(state.yaml_preview.contains("aur-release-foo"), "{}", state.yaml_preview);
+
+        // Committing the facts default (or nothing) clears the override
+        let default = state.default_aur_packages().join(", ");
+        state.cursor = rule_index(&state, "aur-release") + 1;
+        state.activate_current();
+        clear_input(&mut state);
+        for c in default.chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(state.config.aur_release.packages, None);
     }
 
     #[test]

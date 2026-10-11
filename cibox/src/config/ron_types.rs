@@ -109,6 +109,9 @@ pub struct CiboxConfig {
     /// Scan the full git history for hardcoded secrets
     #[serde(skip_serializing_if = "is_default")]
     pub gitleaks: RuleToggle,
+    /// Publish to the AUR on version tags (requires AUR_SSH_PRIVATE_KEY)
+    #[serde(skip_serializing_if = "is_default")]
+    pub aur_release: AurReleaseRule,
 }
 
 /// Override for a rule without knobs
@@ -182,6 +185,25 @@ pub struct DockerReleaseRule {
     /// aren't configured or there is no README.md. Omit for off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_readme: Option<bool>,
+}
+
+/// Override for the aur-release rule. Off by default — the AUR repo, not
+/// this one, holds the PKGBUILD, so there is nothing to detect; set
+/// `enabled: true` to turn it on. The release job clones each package from
+/// the AUR, sets pkgver from the pushed tag, refreshes checksums, test-builds
+/// with makepkg and lints with namcap, regenerates .SRCINFO, and pushes —
+/// authenticating with the AUR_SSH_PRIVATE_KEY secret.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AurReleaseRule {
+    /// Force this rule on or off; omit to let detection decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// AUR package names to publish, one release job each. Omit for a single
+    /// package named after the git remote's repository (or the directory).
+    /// Lowercase alphanumerics and `@._+-`, not starting with `-` or `.`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packages: Option<Vec<String>>,
 }
 
 /// A target platform for a multi-arch docker image
@@ -311,6 +333,7 @@ rule_overrides! {
         docker_build,
         docker_release,
         gitleaks,
+        aur_release,
     ],
     versions: [rust_test, python_test, go_test, node_test],
 }
@@ -345,6 +368,7 @@ pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
             }
         })?;
     validate_image_names(&config)?;
+    validate_aur_packages(&config)?;
     Ok(config)
 }
 
@@ -368,6 +392,22 @@ fn validate_image_name(field: &str, name: Option<&str>) -> Result<()> {
         ),
         _ => Ok(()),
     }
+}
+
+/// Package names are interpolated into `git clone ssh://aur@.../<pkg>.git` in
+/// the generated pipeline, so a malformed one is a config error rather than
+/// something to quietly rewrite.
+fn validate_aur_packages(config: &CiboxConfig) -> Result<()> {
+    for name in config.aur_release.packages.iter().flatten() {
+        if !crate::config::aur::is_valid_package_name(name) {
+            anyhow::bail!(
+                "aur_release.packages entry {name:?} is not a valid AUR package \
+                 name: lowercase alphanumerics and `@._+-`, not starting with \
+                 `-` or `.`."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Serialize a config as a pretty cibox.ron document
@@ -518,6 +558,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("old pipeline-list format"));
+    }
+
+    #[test]
+    fn test_parse_aur_release() {
+        let config =
+            parse_config(r#"(aur_release: (enabled: true, packages: ["cibox"]))"#).unwrap();
+        assert_eq!(config.aur_release.enabled, Some(true));
+        assert_eq!(
+            config.aur_release.packages,
+            Some(vec!["cibox".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_aur_packages_round_trip_is_delta_only() {
+        let mut config = CiboxConfig::default();
+        config.aur_release.packages = Some(vec!["goldboot".to_string()]);
+        assert!(!config.is_default());
+        let ron_str = serialize_config(&config).unwrap();
+        assert!(ron_str.contains("packages"), "{ron_str}");
+        assert!(!ron_str.contains("enabled"), "{ron_str}");
+        assert_eq!(parse_config(&ron_str).unwrap(), config);
+    }
+
+    #[test]
+    fn test_malformed_aur_package_rejected() {
+        for name in ["bad name; curl evil", "-x", "Upper"] {
+            let err =
+                parse_config(&format!(r#"(aur_release: (packages: ["{name}"]))"#)).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("aur_release.packages"), "{msg}");
+            assert!(msg.contains("not a valid AUR package name"), "{msg}");
+        }
     }
 
     #[test]
