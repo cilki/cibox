@@ -87,16 +87,10 @@ pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
 
         // Up/down navigate the rule list
         KeyCode::Up | KeyCode::Char('k') => {
-            if state.cursor > 0 {
-                state.cursor -= 1;
-                state.update_current_item_description();
-            }
+            state.cursor = state.cursor.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if state.cursor < state.rows.len().saturating_sub(1) {
-                state.cursor += 1;
-                state.update_current_item_description();
-            }
+            state.cursor = (state.cursor + 1).min(state.rows.len().saturating_sub(1));
         }
 
         // Tab cycles the platform (alternative to the 'p' menu)

@@ -71,10 +71,11 @@ pub fn render_ui(f: &mut Frame, state: &EditorState) {
 }
 
 fn render_info_bar(f: &mut Frame, area: Rect, state: &EditorState) {
-    let text = if !state.current_item_description.is_empty() {
-        state.current_item_description.clone()
-    } else {
+    let description = state.current_description();
+    let text = if description.is_empty() {
         "Navigate with ↑↓/jk, toggle rules with Space/Enter".to_string()
+    } else {
+        description
     };
 
     let paragraph = Paragraph::new(text)
@@ -187,7 +188,7 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
 /// hold no editable value and so never ask for one.
 fn knob_prefix(row: &Row) -> String {
     match row {
-        Row::TextKnob { label, .. } => format!("       {label}: "),
+        Row::TextKnob { knob, .. } => format!("       {}: ", knob.label()),
         Row::Version { index: Some(_), .. } => "       - ".to_string(),
         Row::Version { index: None, .. } => "       + ".to_string(),
         Row::Rule(_) | Row::Checkbox { .. } => String::new(),

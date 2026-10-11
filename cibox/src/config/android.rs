@@ -47,11 +47,16 @@ pub fn is_valid_apt_package(name: &str) -> bool {
         })
 }
 
+/// The toolchain the cargo-ndk pre-build runs on unless the knob names
+/// another. An override saying so is no override, so the editor collapses it
+/// back to "unset".
+pub const DEFAULT_TOOLCHAIN: &str = "stable";
+
 /// Whether `version` is a valid rust toolchain selector for the cargo-ndk
 /// pre-build: "stable", "nightly", or a bare `major[.minor[.patch]]` — the
 /// shapes that map onto an official docker image tag.
 pub fn is_valid_toolchain(version: &str) -> bool {
-    if matches!(version, "stable" | "nightly") {
+    if matches!(version, DEFAULT_TOOLCHAIN | "nightly") {
         return true;
     }
     let components: Vec<&str> = version.split('.').collect();

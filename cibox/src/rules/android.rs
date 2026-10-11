@@ -1,5 +1,7 @@
 use super::Rule;
-use crate::config::android::{is_safe_path_component, is_valid_project_dir, is_valid_toolchain};
+use crate::config::android::{
+    is_safe_path_component, is_valid_project_dir, is_valid_toolchain, DEFAULT_TOOLCHAIN,
+};
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
 
@@ -218,7 +220,7 @@ impl Rule for AndroidBuild {
                 self.rust_toolchain
                     .as_deref()
                     .filter(|t| is_valid_toolchain(t))
-                    .unwrap_or("stable"),
+                    .unwrap_or(DEFAULT_TOOLCHAIN),
             ),
             None => super::CIBOX_IMAGE.to_string(),
         };

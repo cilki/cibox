@@ -39,11 +39,9 @@ impl RuleRow {
 #[derive(Debug, Clone)]
 pub enum Row {
     Rule(RuleRow),
-    /// A string knob (e.g. image_name)
+    /// One of the string knobs, with the value it currently shows
     TextKnob {
-        rule_id: &'static str,
-        label: &'static str,
-        description: &'static str,
+        knob: TextKnob,
         /// The cibox.ron override, if any
         override_value: Option<String>,
         /// The value in effect (facts-derived default when not overridden)
@@ -60,6 +58,66 @@ pub enum Row {
         /// Image used when the rule has no versions configured
         default_image: &'static str,
     },
+}
+
+/// A string knob the checklist renders as an editable row. Naming the knob
+/// is the whole of what the row has to say about itself: its label and
+/// description come from here, and committing an edit dispatches on it
+/// directly instead of re-deriving the knob from a (rule id, label) pair —
+/// which also keeps [`EditorState::set_knob`] exhaustive, so a knob added to
+/// a rule that already has one cannot be silently routed to the wrong field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextKnob {
+    /// The docker rules' `image_name`. One knob behind two rows: setting it
+    /// on either rule applies to both, so all the row records is which
+    /// field an edit writes to.
+    ImageName { release: bool },
+    /// aur-release's `packages`
+    AurPackages,
+    /// android-build's `dir`
+    AndroidDir,
+    /// android-build's `apt_packages`
+    AndroidAptPackages,
+    /// android-build's `rust_toolchain`
+    AndroidToolchain,
+}
+
+impl TextKnob {
+    /// The cibox.ron field name, shown as the row's label
+    pub fn label(&self) -> &'static str {
+        match self {
+            TextKnob::ImageName { .. } => "image_name",
+            TextKnob::AurPackages => "packages",
+            TextKnob::AndroidDir => "dir",
+            TextKnob::AndroidAptPackages => "apt_packages",
+            TextKnob::AndroidToolchain => "rust_toolchain",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            TextKnob::ImageName { .. } => {
+                "Image name, e.g. \"fossable/cibox\"; applies to both docker rules. Press \
+                 Enter to edit."
+            }
+            TextKnob::AurPackages => {
+                "Comma-separated AUR package names, one release job each; the default is \
+                 named after the git remote. Press Enter to edit."
+            }
+            TextKnob::AndroidDir => {
+                "Gradle project directory relative to the repository root; the default is \
+                 the detected one. Press Enter to edit."
+            }
+            TextKnob::AndroidAptPackages => {
+                "Comma-separated Debian packages the native build needs on the host, e.g. \
+                 \"libasound2-dev, llvm\". Press Enter to edit."
+            }
+            TextKnob::AndroidToolchain => {
+                "Rust toolchain for the cargo-ndk pre-build: \"stable\", \"nightly\", or \
+                 \"x.y[.z]\". Press Enter to edit."
+            }
+        }
+    }
 }
 
 /// A boolean knob the checklist renders as a checkbox. Flipping one is the
@@ -128,7 +186,6 @@ pub struct EditorState {
     pub preview_scroll: u16,
     pub yaml_preview: String,
     pub existing_yaml: Option<String>,
-    pub current_item_description: String,
 
     // Exit flags
     pub should_quit: bool,
@@ -178,13 +235,11 @@ impl EditorState {
             preview_scroll: 0,
             yaml_preview: String::new(),
             existing_yaml,
-            current_item_description: String::new(),
             should_quit: false,
             should_write: false,
         };
 
         state.refresh();
-        state.update_current_item_description();
         Ok(state)
     }
 
@@ -193,19 +248,9 @@ impl EditorState {
         crate::rules::docker_image(&self.facts, &CiboxConfig::default())
     }
 
-    /// The image name in effect, as the docker rules will see it
-    fn effective_image(&self) -> String {
-        crate::rules::docker_image(&self.facts, &self.config)
-    }
-
     /// The AUR package list detection would use without any override
     fn default_aur_packages(&self) -> Vec<String> {
         crate::rules::aur_packages(&self.facts, &CiboxConfig::default())
-    }
-
-    /// The AUR package list in effect, as the aur-release rule will see it
-    fn effective_aur_packages(&self) -> Vec<String> {
-        crate::rules::aur_packages(&self.facts, &self.config)
     }
 
     /// The Gradle project directory detection found, `.` when there is none
@@ -215,6 +260,100 @@ impl EditorState {
             .as_ref()
             .map(|a| a.dir.clone())
             .unwrap_or_else(|| ".".to_string())
+    }
+
+    /// What one text knob's row shows: the cibox.ron override, if any, and
+    /// the value in effect — the facts-derived default when there is none.
+    fn knob_values(&self, knob: TextKnob) -> (Option<String>, String) {
+        let joined = |list: &Option<Vec<String>>| list.as_ref().map(|items| items.join(", "));
+        // An override is the effective value for every knob but image_name,
+        // which is shared: a name set on either docker rule feeds both rows
+        let from_override = |override_value: Option<String>, default: String| {
+            let effective = override_value.clone().unwrap_or(default);
+            (override_value, effective)
+        };
+        let android = &self.config.android_build;
+        match knob {
+            TextKnob::ImageName { release } => (
+                if release {
+                    self.config.docker_release.image_name.clone()
+                } else {
+                    self.config.docker_build.image_name.clone()
+                },
+                crate::rules::docker_image(&self.facts, &self.config),
+            ),
+            TextKnob::AurPackages => (
+                joined(&self.config.aur_release.packages),
+                crate::rules::aur_packages(&self.facts, &self.config).join(", "),
+            ),
+            TextKnob::AndroidDir => from_override(android.dir.clone(), self.default_android_dir()),
+            TextKnob::AndroidAptPackages => {
+                from_override(joined(&android.apt_packages), String::new())
+            }
+            TextKnob::AndroidToolchain => from_override(
+                android.rust_toolchain.clone(),
+                crate::config::android::DEFAULT_TOOLCHAIN.to_string(),
+            ),
+        }
+    }
+
+    /// Store the value committed into one text knob. The values are written
+    /// to cibox.ron and from there into shell commands, so each is coerced
+    /// (or, where there is no sensible coercion, dropped) into something the
+    /// config parser accepts back. A value matching the facts-derived
+    /// default — or an empty one — removes the override, so cibox.ron stays
+    /// delta-only.
+    fn set_knob(&mut self, knob: TextKnob, value: &str) {
+        match knob {
+            TextKnob::ImageName { release } => {
+                let override_value = (!value.is_empty())
+                    .then(|| crate::config::image::coerce_reference(value))
+                    .filter(|value| *value != self.default_image());
+                if release {
+                    self.config.docker_release.image_name = override_value;
+                } else {
+                    self.config.docker_build.image_name = override_value;
+                }
+            }
+            TextKnob::AurPackages => {
+                let packages = comma_list(value, |name| {
+                    Some(crate::config::aur::coerce_package_name(name))
+                });
+                self.config.aur_release.packages = (!packages.is_empty())
+                    .then_some(packages)
+                    .filter(|packages| *packages != self.default_aur_packages());
+            }
+            // A path cannot be coerced into a different one that still
+            // exists, so an invalid dir clears the override instead
+            TextKnob::AndroidDir => {
+                self.config.android_build.dir = Some(value.to_string())
+                    .filter(|v| !v.is_empty())
+                    .filter(|v| crate::config::android::is_valid_project_dir(v))
+                    .filter(|v| *v != self.default_android_dir());
+            }
+            TextKnob::AndroidAptPackages => {
+                let packages = comma_list(value, |name| {
+                    let name = name.to_ascii_lowercase();
+                    crate::config::android::is_valid_apt_package(&name).then_some(name)
+                });
+                self.config.android_build.apt_packages = (!packages.is_empty()).then_some(packages);
+            }
+            TextKnob::AndroidToolchain => {
+                self.config.android_build.rust_toolchain = Some(value.to_string())
+                    .filter(|v| !v.is_empty())
+                    .filter(|v| crate::config::android::is_valid_toolchain(v))
+                    .filter(|v| v != crate::config::android::DEFAULT_TOOLCHAIN);
+            }
+        }
+    }
+
+    fn text_knob_row(&self, knob: TextKnob) -> Row {
+        let (override_value, effective) = self.knob_values(knob);
+        Row::TextKnob {
+            knob,
+            override_value,
+            effective,
+        }
     }
 
     /// The config-option rows of one rule, in display order: the toolchain
@@ -248,106 +387,39 @@ impl EditorState {
                 .collect();
         }
 
-        if rule_id == "aur-release" {
-            return vec![Row::TextKnob {
-                rule_id,
-                label: "packages",
-                description: "Comma-separated AUR package names, one release job each; \
-                              the default is named after the git remote. Press Enter to \
-                              edit.",
-                override_value: self
+        match rule_id {
+            "aur-release" => vec![self.text_knob_row(TextKnob::AurPackages)],
+            "android-build" => [
+                TextKnob::AndroidDir,
+                TextKnob::AndroidAptPackages,
+                TextKnob::AndroidToolchain,
+            ]
+            .into_iter()
+            .map(|knob| self.text_knob_row(knob))
+            .collect(),
+            "docker-build" => vec![self.text_knob_row(TextKnob::ImageName { release: false })],
+            "docker-release" => {
+                let mut rows = vec![
+                    self.text_knob_row(TextKnob::ImageName { release: true }),
+                    Row::Checkbox {
+                        knob: Checkbox::SyncReadme,
+                        value: self.config.docker_release.sync_readme.unwrap_or(false),
+                    },
+                ];
+                let selected = self
                     .config
-                    .aur_release
-                    .packages
-                    .as_ref()
-                    .map(|packages| packages.join(", ")),
-                effective: self.effective_aur_packages().join(", "),
-            }];
+                    .docker_release
+                    .platforms
+                    .clone()
+                    .unwrap_or_default();
+                rows.extend(DockerPlatform::ALL.map(|arch| Row::Checkbox {
+                    knob: Checkbox::Arch(arch),
+                    value: selected.contains(&arch),
+                }));
+                rows
+            }
+            _ => Vec::new(),
         }
-
-        if rule_id == "android-build" {
-            return vec![
-                Row::TextKnob {
-                    rule_id,
-                    label: "dir",
-                    description: "Gradle project directory relative to the repository \
-                                  root; the default is the detected one. Press Enter to \
-                                  edit.",
-                    override_value: self.config.android_build.dir.clone(),
-                    effective: self
-                        .config
-                        .android_build
-                        .dir
-                        .clone()
-                        .unwrap_or_else(|| self.default_android_dir()),
-                },
-                Row::TextKnob {
-                    rule_id,
-                    label: "apt_packages",
-                    description: "Comma-separated Debian packages the native build needs \
-                                  on the host, e.g. \"libasound2-dev, llvm\". Press Enter \
-                                  to edit.",
-                    override_value: self
-                        .config
-                        .android_build
-                        .apt_packages
-                        .as_ref()
-                        .map(|packages| packages.join(", ")),
-                    effective: self
-                        .config
-                        .android_build
-                        .apt_packages
-                        .as_ref()
-                        .map(|packages| packages.join(", "))
-                        .unwrap_or_default(),
-                },
-                Row::TextKnob {
-                    rule_id,
-                    label: "rust_toolchain",
-                    description: "Rust toolchain for the cargo-ndk pre-build: \"stable\", \
-                                  \"nightly\", or \"x.y[.z]\". Press Enter to edit.",
-                    override_value: self.config.android_build.rust_toolchain.clone(),
-                    effective: self
-                        .config
-                        .android_build
-                        .rust_toolchain
-                        .clone()
-                        .unwrap_or_else(|| "stable".to_string()),
-                },
-            ];
-        }
-
-        if !matches!(rule_id, "docker-build" | "docker-release") {
-            return Vec::new();
-        }
-        let mut rows = vec![Row::TextKnob {
-            rule_id,
-            label: "image_name",
-            description: "Image name, e.g. \"fossable/cibox\"; applies to both docker \
-                          rules. Press Enter to edit.",
-            override_value: match rule_id {
-                "docker-build" => self.config.docker_build.image_name.clone(),
-                _ => self.config.docker_release.image_name.clone(),
-            },
-            effective: self.effective_image(),
-        }];
-        if rule_id == "docker-release" {
-            rows.push(Row::Checkbox {
-                knob: Checkbox::SyncReadme,
-                value: self.config.docker_release.sync_readme.unwrap_or(false),
-            });
-            let selected = self
-                .config
-                .docker_release
-                .platforms
-                .clone()
-                .unwrap_or_default();
-            rows.extend(DockerPlatform::ALL.map(|arch| Row::Checkbox {
-                knob: Checkbox::Arch(arch),
-                value: selected.contains(&arch),
-            }));
-        }
-        rows
     }
 
     /// Re-resolve rules against the current config and regenerate the preview
@@ -459,69 +531,14 @@ impl EditorState {
         self.auto_save_ron();
     }
 
-    /// Commit the text being typed into the knob row under the cursor. A
-    /// value matching the facts-derived default (or an empty one) removes the
-    /// override.
+    /// Commit the text being typed into the knob row under the cursor
     pub fn commit_input(&mut self) {
         let Some(buffer) = self.input.take() else {
             return;
         };
         let value = buffer.trim().to_string();
         match self.rows.get(self.cursor).cloned() {
-            // The typed values are written to cibox.ron and from there into
-            // shell commands, so coerce them into valid values rather than
-            // saving something the config parser would reject
-            Some(Row::TextKnob { rule_id, label, .. }) => match (rule_id, label) {
-                ("aur-release", _) => {
-                    let packages: Vec<String> = value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|p| !p.is_empty())
-                        .map(crate::config::aur::coerce_package_name)
-                        .collect();
-                    // Normalize exactly as rules::resolve would (dedupe), so
-                    // what the preview shows is what the file means
-                    let packages = clean_versions(Some(&packages));
-                    self.config.aur_release.packages = (!packages.is_empty())
-                        .then_some(packages)
-                        .filter(|packages| *packages != self.default_aur_packages());
-                }
-                ("docker-build" | "docker-release", _) => {
-                    let override_value = (!value.is_empty())
-                        .then(|| crate::config::image::coerce_reference(&value))
-                        .filter(|value| *value != self.default_image());
-                    match rule_id {
-                        "docker-build" => self.config.docker_build.image_name = override_value,
-                        _ => self.config.docker_release.image_name = override_value,
-                    }
-                }
-                // A path cannot be coerced into a different one that still
-                // exists, so an invalid dir clears the override instead
-                ("android-build", "dir") => {
-                    self.config.android_build.dir = Some(value.clone())
-                        .filter(|v| !v.is_empty())
-                        .filter(|v| crate::config::android::is_valid_project_dir(v))
-                        .filter(|v| *v != self.default_android_dir());
-                }
-                ("android-build", "apt_packages") => {
-                    let packages: Vec<String> = value
-                        .split(',')
-                        .map(|p| p.trim().to_ascii_lowercase())
-                        .filter(|p| crate::config::android::is_valid_apt_package(p))
-                        .collect();
-                    let packages = clean_versions(Some(&packages));
-                    self.config.android_build.apt_packages =
-                        (!packages.is_empty()).then_some(packages);
-                }
-                ("android-build", _) => {
-                    self.config.android_build.rust_toolchain = Some(value.clone())
-                        .filter(|v| !v.is_empty())
-                        .filter(|v| crate::config::android::is_valid_toolchain(v))
-                        // The default; an override saying so is no override
-                        .filter(|v| v != "stable");
-                }
-                _ => {}
-            },
+            Some(Row::TextKnob { knob, .. }) => self.set_knob(knob, &value),
             Some(Row::Version { rule_id, index, .. }) => {
                 let mut versions = self
                     .config
@@ -552,7 +569,6 @@ impl EditorState {
             _ => return,
         }
         self.refresh();
-        self.update_current_item_description();
         self.auto_save_ron();
     }
 
@@ -578,7 +594,6 @@ impl EditorState {
         self.config
             .set_versions_override(rule_id, (!versions.is_empty()).then_some(versions));
         self.refresh();
-        self.update_current_item_description();
         self.auto_save_ron();
     }
 
@@ -629,7 +644,6 @@ impl EditorState {
         if self.expanded.remove(rule.id) {
             self.cursor = parent;
             self.refresh();
-            self.update_current_item_description();
         }
     }
 
@@ -666,10 +680,14 @@ impl EditorState {
         self.platform_menu_open = false;
     }
 
-    pub fn update_current_item_description(&mut self) {
-        self.current_item_description = match self.current_row() {
+    /// What the information bar says about the row under the cursor. Derived
+    /// on demand: cached in a field it would have to be refreshed from every
+    /// cursor move and every rebuild of the rows, and goes stale the moment
+    /// one of them forgets.
+    pub fn current_description(&self) -> String {
+        match self.current_row() {
             Some(Row::Rule(row)) => row.description.to_string(),
-            Some(Row::TextKnob { description, .. }) => description.to_string(),
+            Some(Row::TextKnob { knob, .. }) => knob.description().to_string(),
             Some(Row::Checkbox { knob, .. }) => knob.description(),
             Some(Row::Version { index: Some(_), .. }) => {
                 "Toolchain version run as one matrix leg; Enter to edit, d to remove".to_string()
@@ -682,7 +700,7 @@ impl EditorState {
                 "Add a toolchain version to test against; unset = default image {default_image}"
             ),
             None => String::new(),
-        };
+        }
     }
 
     pub fn scroll_preview_up(&mut self) {
@@ -711,6 +729,21 @@ impl EditorState {
             }
         }
     }
+}
+
+/// Read a comma-separated knob value as a list: each entry goes through
+/// `entry`, which returns the value to store or `None` to drop it, and the
+/// result is normalized exactly as `rules::resolve` would — empties dropped,
+/// duplicates collapsed — so what the preview shows is what the saved file
+/// means.
+fn comma_list(value: &str, entry: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let entries: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .filter_map(entry)
+        .collect();
+    clean_versions(Some(&entries))
 }
 
 #[cfg(test)]
@@ -864,7 +897,10 @@ mod tests {
         let idx = rule_index(&state, "docker-release");
         assert!(matches!(
             state.rows[idx + 1],
-            Row::TextKnob { label: "image_name", .. }
+            Row::TextKnob {
+                knob: TextKnob::ImageName { release: true },
+                ..
+            }
         ));
         assert!(matches!(
             state.rows[idx + 2],
@@ -1104,7 +1140,10 @@ mod tests {
         let idx = rule_index(&state, "aur-release");
         assert!(matches!(
             state.rows[idx + 1],
-            Row::TextKnob { label: "packages", .. }
+            Row::TextKnob {
+                knob: TextKnob::AurPackages,
+                ..
+            }
         ));
 
         // Typed names are coerced, split on commas, and deduped so the saved
@@ -1155,15 +1194,20 @@ mod tests {
         state.cursor = rule_index(&state, "android-build");
         state.expand_current();
         let idx = rule_index(&state, "android-build");
-        assert!(matches!(state.rows[idx + 1], Row::TextKnob { label: "dir", .. }));
-        assert!(matches!(
-            state.rows[idx + 2],
-            Row::TextKnob { label: "apt_packages", .. }
-        ));
-        assert!(matches!(
-            state.rows[idx + 3],
-            Row::TextKnob { label: "rust_toolchain", .. }
-        ));
+        for (offset, knob) in [
+            TextKnob::AndroidDir,
+            TextKnob::AndroidAptPackages,
+            TextKnob::AndroidToolchain,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                matches!(state.rows[idx + 1 + offset], Row::TextKnob { knob: k, .. } if k == knob),
+                "{:?}",
+                state.rows[idx + 1 + offset]
+            );
+        }
 
         // The dir prefills with the detected value, and committing it back
         // stores no override
@@ -1213,6 +1257,116 @@ mod tests {
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         crate::config::parse_config(&ron_str).unwrap();
         assert!(state.yaml_preview.contains("android-build"), "{}", state.yaml_preview);
+    }
+
+    /// Committing the value a knob row already shows has to leave the config
+    /// alone: what the row reads and what a commit writes must be the same
+    /// knob. A row wired to another knob's field would instead save an
+    /// override of that knob's default — and cibox.ron would stop being a
+    /// delta.
+    #[test]
+    fn test_committing_the_shown_value_stores_no_override() {
+        let dir = android_dir();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        let mut state = state_for(dir.path());
+
+        for id in [
+            "docker-build",
+            "docker-release",
+            "aur-release",
+            "android-build",
+        ] {
+            state.cursor = rule_index(&state, id);
+            state.expand_current();
+        }
+        let text_knobs: Vec<usize> = state
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, Row::TextKnob { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        // image_name twice (once per docker rule), packages, and the three
+        // android knobs
+        assert_eq!(text_knobs.len(), 6, "a text knob has no row to edit");
+
+        for index in text_knobs {
+            state.cursor = index;
+            // Enter prefills the buffer with the effective value; committing
+            // it unchanged is the user saying "leave it as it is"
+            state.activate_current();
+            state.commit_input();
+            assert!(
+                state.config.is_default(),
+                "{:?} saved an override of its own default",
+                state.rows[index]
+            );
+        }
+    }
+
+    /// Each knob row writes to its own field and to nothing else, including
+    /// the two rows of the shared image_name knob, which write to different
+    /// rules
+    #[test]
+    fn test_each_knob_row_writes_only_its_own_field() {
+        let dir = android_dir();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        let mut state = state_for(dir.path());
+
+        for id in [
+            "docker-build",
+            "docker-release",
+            "aur-release",
+            "android-build",
+        ] {
+            state.cursor = rule_index(&state, id);
+            state.expand_current();
+        }
+        let rows: Vec<(usize, TextKnob)> = state
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| match row {
+                Row::TextKnob { knob, .. } => Some((index, *knob)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 6, "a text knob has no row to edit");
+
+        for (index, knob) in rows {
+            let typed = match knob {
+                TextKnob::ImageName { release: false } => "owner/build",
+                TextKnob::ImageName { release: true } => "owner/release",
+                TextKnob::AurPackages => "pkgx",
+                TextKnob::AndroidDir => "other/dir",
+                TextKnob::AndroidAptPackages => "llvm",
+                TextKnob::AndroidToolchain => "nightly",
+            };
+            state.cursor = index;
+            state.activate_current();
+            clear_input(&mut state);
+            for c in typed.chars() {
+                state.input_push(c);
+            }
+            state.commit_input();
+        }
+
+        assert_eq!(
+            state.config.docker_build.image_name.as_deref(),
+            Some("owner/build")
+        );
+        assert_eq!(
+            state.config.docker_release.image_name.as_deref(),
+            Some("owner/release")
+        );
+        assert_eq!(
+            state.config.aur_release.packages,
+            Some(vec!["pkgx".to_string()])
+        );
+        let android = &state.config.android_build;
+        assert_eq!(android.dir.as_deref(), Some("other/dir"));
+        assert_eq!(android.apt_packages, Some(vec!["llvm".to_string()]));
+        assert_eq!(android.rust_toolchain.as_deref(), Some("nightly"));
     }
 
     #[test]
