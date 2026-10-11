@@ -152,13 +152,19 @@ pub(crate) const REQUIRED_VARIABLES_PREFIX: &str = "# Required CI variables: ";
 
 /// The secrets header line the given jobs call for, newline included, or
 /// `None` when the platform names secrets inline or no job wants any.
+///
+/// Credentials and plain configuration are one list here: both arrive as
+/// project-level CI variables on these platforms, and the user has to define
+/// either way. (Which of them to mark masked/protected is a GitLab setting,
+/// not something the pipeline can state.)
 pub(crate) fn required_variables_line(platform: Platform, jobs: &[Job]) -> Option<String> {
     if !matches!(platform, Platform::GitLab | Platform::CircleCI) {
         return None;
     }
     let secrets: BTreeSet<&str> = jobs
         .iter()
-        .flat_map(|job| job.secrets.iter().map(String::as_str))
+        .flat_map(|job| job.secrets.iter().chain(job.variables.iter()))
+        .map(String::as_str)
         .collect();
     if secrets.is_empty() {
         return None;

@@ -105,6 +105,21 @@ where every later step can read it — including build scripts and test suites
 running third-party code. Nothing cibox generates uses git after the clone,
 so the credential is dropped.
 
+### Where credentials come from
+
+On GitHub and Gitea, a credential is read from repository Secrets and only
+from there: `DOCKER_PASSWORD`, `CARGO_REGISTRY_TOKEN` and `TWINE_PASSWORD`
+lower to `NAME: ${{ secrets.NAME }}`. A Variable is not a quieter Secret —
+its value is displayed in the settings UI, handed back in plaintext by the
+variables API and never masked in a log — so cibox offers no `|| vars.NAME`
+fallback for a credential, which would amount to saying that keeping a
+publish token there is fine. Values that aren't sensitive do get the choice:
+`DOCKER_USERNAME` lowers to
+`${{ secrets.DOCKER_USERNAME || vars.DOCKER_USERNAME }}` and can live in
+either store. GitLab and CircleCI read both kinds from project CI variables,
+which the `# Required CI variables:` header at the top of the generated file
+lists for you.
+
 ## `cibox.ron`
 
 `cibox.ron` holds only your *overrides* from the detected defaults — no file

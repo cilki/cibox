@@ -151,18 +151,24 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
     }
 
     let mut env: BTreeMap<String, String> = job.env.iter().cloned().collect();
+    // A credential reads from the secrets context and only from there. A
+    // repository Variable is not a weaker secret, it is not a secret at all:
+    // its value is shown in the settings UI, handed back in plaintext by the
+    // variables API, and never registered for log masking — so a token that
+    // lives there is printed verbatim the first time anything echoes its
+    // environment. Offering `|| vars.NAME` for one would tell users that
+    // keeping it there works, which is exactly the problem: it does work.
     for secret in &job.secrets {
-        // Not everything a rule needs is sensitive (e.g. a registry
-        // username), so users reasonably store some of these under the
-        // repository's Variables instead of Secrets; `||` takes whichever
-        // context has the value. GITHUB_TOKEN is runner-provided and exists
-        // only in the secrets context.
-        let value = if secret == "GITHUB_TOKEN" {
-            format!("${{{{ secrets.{secret} }}}}")
-        } else {
-            format!("${{{{ secrets.{secret} || vars.{secret} }}}}")
-        };
-        env.insert(secret.clone(), value);
+        env.insert(secret.clone(), format!("${{{{ secrets.{secret} }}}}"));
+    }
+    // Configuration is different: nothing is exposed by keeping a registry
+    // username in plain Variables, and plenty of users do, so `||` takes
+    // whichever context has the value.
+    for name in &job.variables {
+        env.insert(
+            name.clone(),
+            format!("${{{{ secrets.{name} || vars.{name} }}}}"),
+        );
     }
 
     // A job-level block replaces the workflow-level one rather than adding to
@@ -292,23 +298,56 @@ mod tests {
     #[test]
     fn test_secrets_become_job_env() {
         let workflow = lower_github(
-            &[Job::new("docker-release", "Docker push", Stage::Deploy).with_secrets(vec![
-                "DOCKER_USERNAME".to_string(),
-                "DOCKER_PASSWORD".to_string(),
-                "GITHUB_TOKEN".to_string(),
-            ])],
+            &[Job::new("docker-release", "Docker push", Stage::Deploy)
+                .with_secrets(vec![
+                    "DOCKER_PASSWORD".to_string(),
+                    "GITHUB_TOKEN".to_string(),
+                ])
+                .with_variables(vec!["DOCKER_USERNAME".to_string()])],
             WorkflowKind::Release,
         );
         let env = workflow.jobs["docker-release"].env.as_ref().unwrap();
+        // A credential comes from the secrets context and nowhere else
+        assert_eq!(env["DOCKER_PASSWORD"], "${{ secrets.DOCKER_PASSWORD }}");
+        assert_eq!(env["GITHUB_TOKEN"], "${{ secrets.GITHUB_TOKEN }}");
+        // Configuration may come from either store
         assert_eq!(
             env["DOCKER_USERNAME"],
             "${{ secrets.DOCKER_USERNAME || vars.DOCKER_USERNAME }}"
         );
-        assert_eq!(
-            env["DOCKER_PASSWORD"],
-            "${{ secrets.DOCKER_PASSWORD || vars.DOCKER_PASSWORD }}"
-        );
-        assert_eq!(env["GITHUB_TOKEN"], "${{ secrets.GITHUB_TOKEN }}");
+    }
+
+    /// Nothing a rule declares as a credential may be given a `vars`
+    /// fallback, on any workflow, for any rule: Variables are readable and
+    /// unmasked, so the fallback would make storing a token there work.
+    #[test]
+    fn test_no_credential_reads_from_the_variables_context() {
+        let facts = crate::detection::ProjectFacts::default();
+        let mut config = crate::config::CiboxConfig::default();
+        for r in crate::rules::resolve(&facts, &config) {
+            config.set_enabled_override(r.rule.id(), Some(true));
+        }
+        let jobs: Vec<Job> = crate::rules::resolve(&facts, &config)
+            .iter()
+            .flat_map(|r| r.rule.jobs(&facts))
+            .collect();
+
+        let mut checked = 0;
+        for kind in [WorkflowKind::Ci, WorkflowKind::Release] {
+            for (id, lowered) in lower_github(&jobs, kind).jobs {
+                let job = jobs.iter().find(|j| j.id == id).unwrap();
+                let env = lowered.env.unwrap_or_default();
+                for secret in &job.secrets {
+                    assert_eq!(
+                        env[secret],
+                        format!("${{{{ secrets.{secret} }}}}"),
+                        "{id} reads the credential {secret} from somewhere other than Secrets"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no job declared a credential to check");
     }
 
     #[test]

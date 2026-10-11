@@ -107,9 +107,18 @@ pub struct Job {
     /// Paths preserved as build artifacts
     pub artifacts: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// Secret names the job reads as env vars. GitHub maps each to
-    /// `${{ secrets.NAME }}`; other platforms expect CI-level variables.
+    /// Credential names the job reads as env vars — passwords, registry and
+    /// publish tokens. GitHub/Gitea map each to `${{ secrets.NAME }}` and
+    /// nothing else: a Secret is the only store that masks the value in the
+    /// logs and cannot be read back, so a credential has to come from there.
+    /// Other platforms expect CI-level variables.
     pub secrets: Vec<String>,
+    /// Non-credential configuration the job reads as env vars (e.g. a
+    /// registry username). Nothing here is sensitive, so GitHub/Gitea take it
+    /// from either store — `${{ secrets.NAME || vars.NAME }}` — which is what
+    /// lets a user keep such a value in plain repository Variables. Other
+    /// platforms read it from a CI-level variable, same as [`Self::secrets`].
+    pub variables: Vec<String>,
     /// Extra scopes the job's ambient CI token needs, beyond reading the
     /// repository (e.g. `("packages", "write")` to push to ghcr.io). Honored
     /// by the GitHub/Gitea backends, which otherwise emit a read-only token;
@@ -137,6 +146,7 @@ impl Job {
             artifacts: Vec::new(),
             env: Vec::new(),
             secrets: Vec::new(),
+            variables: Vec::new(),
             permissions: Vec::new(),
             needs: Vec::new(),
             runs_on: RunnerOs::default(),
@@ -196,6 +206,13 @@ impl Job {
 
     pub fn with_secrets(mut self, secrets: Vec<String>) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    /// Declare env vars that are configuration rather than credentials; see
+    /// [`Job::variables`] for what that buys them.
+    pub fn with_variables(mut self, variables: Vec<String>) -> Self {
+        self.variables = variables;
         self
     }
 

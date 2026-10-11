@@ -342,6 +342,34 @@ mod tests {
         }
     }
 
+    /// `Job::variables` buys its names a `${{ secrets.X || vars.X }}`
+    /// fallback, which is only safe for values that are not sensitive: a
+    /// repository Variable is readable and never masked in the logs. A rule
+    /// declaring a password or a token there would quietly make keeping it
+    /// in plain Variables work, so nothing credential-shaped may appear.
+    #[test]
+    fn test_no_rule_declares_a_credential_as_a_plain_variable() {
+        let facts = ProjectFacts::default();
+        let mut config = CiboxConfig::default();
+        for r in resolve(&facts, &config) {
+            config.set_enabled_override(r.rule.id(), Some(true));
+        }
+        for r in resolve(&facts, &config) {
+            for job in r.rule.jobs(&facts) {
+                for name in &job.variables {
+                    assert!(
+                        !["TOKEN", "PASSWORD", "SECRET", "KEY", "CREDENTIAL"]
+                            .iter()
+                            .any(|credential| name.contains(credential)),
+                        "rule {} declares {name} as a plain variable, so it would also be \
+                         readable from repository Variables; declare it with with_secrets",
+                        r.rule.id()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_every_rule_has_an_enabled_override_slot() {
         let resolved = resolve(&ProjectFacts::default(), &CiboxConfig::default());

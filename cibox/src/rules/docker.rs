@@ -97,11 +97,26 @@ impl DockerRelease {
         }
     }
 
+    /// The credentials the push authenticates with
     fn secrets(&self) -> Vec<String> {
         if self.uses_ghcr() {
             vec!["GITHUB_TOKEN".to_string()]
         } else {
-            vec!["DOCKER_USERNAME".to_string(), "DOCKER_PASSWORD".to_string()]
+            vec!["DOCKER_PASSWORD".to_string()]
+        }
+    }
+
+    /// The registry username, which is configuration and not a credential:
+    /// it identifies an account rather than proving ownership of one, and is
+    /// public on Docker Hub anyway (it is in the image name). Declaring it
+    /// separately is what lets users keep it in plain repository Variables
+    /// without the password being invited to follow it there.
+    fn variables(&self) -> Vec<String> {
+        if self.uses_ghcr() {
+            // GITHUB_ACTOR is runner-provided; nothing to declare
+            Vec::new()
+        } else {
+            vec!["DOCKER_USERNAME".to_string()]
         }
     }
 
@@ -203,7 +218,8 @@ impl DockerRelease {
         let job = Job::new(id, name, Stage::Deploy)
             .with_docker()
             .tags_only()
-            .with_secrets(self.secrets());
+            .with_secrets(self.secrets())
+            .with_variables(self.variables());
         if self.uses_ghcr() {
             // ghcr.io authenticates with the ambient CI token, which can't
             // push packages unless the job asks for the scope
@@ -350,7 +366,9 @@ mod tests {
         };
         let job = &rule.jobs(&docker_facts())[0];
         assert!(job.tags_only);
-        assert_eq!(job.secrets, vec!["DOCKER_USERNAME", "DOCKER_PASSWORD"]);
+        // The password is a credential; the username is configuration
+        assert_eq!(job.secrets, vec!["DOCKER_PASSWORD"]);
+        assert_eq!(job.variables, vec!["DOCKER_USERNAME"]);
         assert!(job.steps.iter().any(
             |s| matches!(s, Step::Run { command, .. } if command == "docker push owner/app")
         ));
@@ -455,15 +473,11 @@ mod tests {
             .iter()
             .any(|s| matches!(s, Step::Checkout { .. })));
 
-        // Every job logs in, so every job needs the registry secrets
+        // Every job logs in, so every job needs the registry credentials
         for job in &jobs {
             assert!(job.tags_only, "{}", job.id);
-            assert_eq!(
-                job.secrets,
-                vec!["DOCKER_USERNAME", "DOCKER_PASSWORD"],
-                "{}",
-                job.id
-            );
+            assert_eq!(job.secrets, vec!["DOCKER_PASSWORD"], "{}", job.id);
+            assert_eq!(job.variables, vec!["DOCKER_USERNAME"], "{}", job.id);
         }
     }
 
@@ -491,6 +505,8 @@ mod tests {
         };
         let job = &rule.jobs(&docker_facts())[0];
         assert_eq!(job.secrets, vec!["GITHUB_TOKEN"]);
+        // GITHUB_ACTOR comes from the runner, so there is nothing to declare
+        assert!(job.variables.is_empty());
         let login = run_command(job, "Login to registry");
         assert!(login.contains("docker login ghcr.io"));
         assert!(login.starts_with("if [ -n \"${GITHUB_TOKEN:-}\" ]; then"));
@@ -581,8 +597,9 @@ mod tests {
              chko/docker-pushrm:1 --file /workspace/README.md owner/app; \
              else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi"
         );
-        // The sync reuses the push secrets, so nothing extra is declared
-        assert_eq!(job.secrets, vec!["DOCKER_USERNAME", "DOCKER_PASSWORD"]);
+        // The sync reuses the push credentials, so nothing extra is declared
+        assert_eq!(job.secrets, vec!["DOCKER_PASSWORD"]);
+        assert_eq!(job.variables, vec!["DOCKER_USERNAME"]);
     }
 
     #[test]
