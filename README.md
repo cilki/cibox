@@ -52,9 +52,9 @@ to GitHub Actions. Pass `--platform` to choose explicitly.
 ```
 $ cibox                           # interactive TUI to toggle rules
 $ cibox detect                    # show project facts and which rules fired
-$ cibox validate                  # check cibox.ron and print the resolved rules
 $ cibox update                    # write or refresh the pipeline files
 $ cibox update --platform gitlab  # generate for a specific platform
+$ cibox validate cibox.ron        # check an override file, print the resolved rules
 ```
 
 The files cibox manages, per platform:
@@ -92,6 +92,33 @@ all of cibox's jobs, so `cibox update` is also how you hand a pipeline back to
 yourself. A file that would be left with no jobs at all is reported and left
 untouched, since every platform rejects an empty pipeline — delete it yourself
 if you no longer want it.
+
+### Command-line surface
+
+| Command | Takes |
+|---|---|
+| `cibox`, `cibox editor` | `--dir <PATH>` (default `.`) |
+| `cibox detect` | `--dir <PATH>` (default `.`) |
+| `cibox update` | `[CONFIG]` (default `cibox.ron`), `--platform`, `--force`, `--rule` |
+| `cibox validate` | `[CONFIG]` (default `cibox.ron`) |
+| `cibox lsp` | — |
+
+`update` and `validate` read the override file as a positional argument, so it
+can live somewhere other than `./cibox.ron`. Neither takes `--dir`: they
+always work on the current directory, so point your shell at the project
+instead of the command. `update` treats a missing `cibox.ron` as "no
+overrides" and carries on from detection alone; any other `CONFIG` path has to
+exist, and so does the one `validate` uses — `cibox validate` in a project
+that has no overrides is an error, not an empty report.
+
+`--platform` accepts `github`, `gitea`, `gitlab`, or `circleci`
+(case-insensitive). The names cibox prints back are the human ones — "GitHub
+Actions", "GitLab CI" — and are not accepted as input.
+
+`--force` and `--rule` are mutually exclusive, since `--force` rewrites whole
+files and `--rule` exists to leave untouched everything it doesn't name. An
+unknown rule id is rejected with the full list, which is the same list of ids
+`cibox detect` prints.
 
 ### Token permissions
 
