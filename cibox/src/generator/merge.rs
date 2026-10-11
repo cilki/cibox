@@ -18,6 +18,7 @@ use crate::generator::{JobFilter, PlannedFile};
 use crate::ir::Job;
 use anyhow::{anyhow, bail, Context};
 use serde_yaml::Value;
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr;
@@ -56,32 +57,78 @@ pub fn merge_file(
     filter: &JobFilter,
     existing: &str,
 ) -> Result<MergeOutcome> {
-    let original: Value = serde_yaml::from_str(existing).with_context(|| {
-        format!(
-            "{} is not valid YAML; use --force to overwrite it",
-            file.path.display()
-        )
-    })?;
-    let Value::Mapping(original) = original else {
+    let parse = Parse::of(existing, &file.path)?;
+    if !parse.value.is_mapping() {
         bail!(
             "{} is not a YAML mapping cibox can merge into; use --force to overwrite it",
             file.path.display()
         );
-    };
-    let parsed = parse_lossless(existing, &file.path)?;
-    let scan = disabled::scan(platform, existing, &parsed, filter);
+    }
+    let scan = disabled::scan(platform, existing, &parse.tree, filter);
 
     match platform {
-        Platform::GitHub | Platform::Gitea => merge_github(file, filter, existing, &original, scan),
-        Platform::GitLab => merge_gitlab(file, filter, existing, &original, scan),
-        Platform::CircleCI => merge_circleci(file, filter, existing, &original, &parsed, scan),
+        Platform::GitHub | Platform::Gitea => merge_github(file, filter, existing, &parse, scan),
+        Platform::GitLab => merge_gitlab(file, filter, existing, &parse, scan),
+        Platform::CircleCI => merge_circleci(file, filter, existing, &parse, scan),
     }
 }
 
-fn parse_lossless(text: &str, path: &Path) -> Result<YamlFile> {
-    YamlFile::from_str(text).map_err(|e| {
-        anyhow!("{} is not valid YAML; use --force to overwrite it: {e}", path.display())
-    })
+/// The two views of one pipeline's text a merge needs: the plain value tree
+/// it measures jobs against, and the lossless syntax tree it edits.
+///
+/// Parsing YAML twice over is the bulk of a merge's work, so a parse is made
+/// once per text and shared by every phase that reads it (see
+/// [`Parse::after_edits`]).
+struct Parse {
+    tree: YamlFile,
+    value: Value,
+}
+
+impl Parse {
+    fn of(text: &str, path: &Path) -> Result<Self> {
+        let value: Value = serde_yaml::from_str(text).with_context(|| {
+            format!(
+                "{} is not valid YAML; use --force to overwrite it",
+                path.display()
+            )
+        })?;
+        let tree = YamlFile::from_str(text).map_err(|e| {
+            anyhow!(
+                "{} is not valid YAML; use --force to overwrite it: {e}",
+                path.display()
+            )
+        })?;
+        Ok(Self { tree, value })
+    }
+
+    /// The parse the tree phase has to work on once the text phase has run:
+    /// `None` to keep using the parse of the original text, which came
+    /// through untouched (the common case — only a stale disabled block
+    /// rewrites it), or a fresh parse of the rewritten text.
+    fn after_edits(text: Cow<'_, str>, path: &Path) -> Result<Option<Self>> {
+        match text {
+            Cow::Borrowed(_) => Ok(None),
+            Cow::Owned(text) => Ok(Some(
+                // Failing here is cibox's fault, not the file's: the only
+                // thing the text phase rewrote is comment blocks it
+                // generated itself
+                Parse::of(&text, path).context("regenerated comment blocks reparse")?,
+            )),
+        }
+    }
+
+    /// The document's top-level mapping, as plain values
+    fn values(&self) -> Result<&serde_yaml::Mapping> {
+        self.value.as_mapping().context("document is a mapping")
+    }
+
+    /// The document's top-level mapping, as an editable syntax node
+    fn root(&self) -> Result<Mapping> {
+        self.tree
+            .document()
+            .and_then(|doc| doc.as_mapping())
+            .context("document is a mapping")
+    }
 }
 
 /// The plan measured against the file: which managed jobs stay active, which
@@ -207,13 +254,6 @@ fn canonical_job_mapping(canonical: &Value) -> serde_yaml::Mapping {
         .unwrap_or_default()
 }
 
-fn root_mapping(parsed: &YamlFile) -> Result<Mapping> {
-    parsed
-        .document()
-        .and_then(|doc| doc.as_mapping())
-        .context("document is a mapping")
-}
-
 /// Render `{key: value}` canonically and return the parsed value node, ready
 /// to splice into the user's tree. The document is returned alongside only
 /// to keep its tree alive while the node is used.
@@ -310,29 +350,26 @@ enum JobsAt {
     Root,
 }
 
-/// The tree phase every merge ends with: reparse the text-edited document and
-/// conform the managed jobs on the lossless syntax tree. Returns the parse —
-/// whose tree the caller may keep editing before rendering it — alongside a
-/// plain-value view of the same text.
+/// The tree phase every merge ends with: conform the managed jobs of the
+/// text-edited document on its lossless syntax tree, which the caller may
+/// keep editing before rendering it.
 fn conform_document(
-    text: &str,
+    parse: &Parse,
     at: JobsAt,
     file: &PlannedFile,
     filter: &JobFilter,
     canonical_jobs: &serde_yaml::Mapping,
     adds: &[String],
     counts: &mut Counts,
-) -> Result<(YamlFile, Value)> {
-    let parsed = parse_lossless(text, &file.path)?;
-    let current: Value = serde_yaml::from_str(text).context("regenerated comment blocks reparse")?;
+) -> Result<()> {
     let plan = JobsPlan {
         canonical: canonical_jobs,
         adds,
         filter,
         path: &file.path,
     };
-    let current_map = current.as_mapping().context("document is a mapping")?;
-    let root = root_mapping(&parsed)?;
+    let current_map = parse.values()?;
+    let root = parse.root()?;
     match at {
         JobsAt::Root => {
             conform_jobs(&root, &gitlab_job_keys(current_map), current_map, &plan, counts)?;
@@ -347,7 +384,7 @@ fn conform_document(
             }
         }
     }
-    Ok((parsed, current))
+    Ok(())
 }
 
 /// Text replacements for the disabled blocks: regenerate blocks whose
@@ -387,13 +424,19 @@ fn block_edits(
     Ok(edits)
 }
 
-fn apply_edits(text: &str, mut edits: Vec<(Range<usize>, String)>) -> String {
+/// Apply the text phase's replacements, borrowing `text` unchanged when
+/// there are none — which is what tells the tree phase its parse is still
+/// good (see [`Parse::after_edits`]).
+fn apply_edits(text: &str, mut edits: Vec<(Range<usize>, String)>) -> Cow<'_, str> {
+    if edits.is_empty() {
+        return Cow::Borrowed(text);
+    }
     edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     let mut out = text.to_string();
     for (range, replacement) in edits {
         out.replace_range(range, &replacement);
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Byte offset just past the top-level `jobs:` line, where new jobs can be
@@ -477,11 +520,12 @@ fn merge_github(
     file: &PlannedFile,
     filter: &JobFilter,
     existing: &str,
-    original: &serde_yaml::Mapping,
+    parse: &Parse,
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
 
+    let original = parse.values()?;
     let existing_jobs = existing_job_mapping(original, &file.path)?;
     let existing_keys = string_keys(&existing_jobs);
     let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
@@ -497,11 +541,11 @@ fn merge_github(
     if existing_jobs.is_empty() {
         add_jobs_textually(existing, &split.adds, canonical_jobs, &mut counts, &mut edits)?;
     }
-    let text = apply_edits(existing, edits);
-
     // Tree phase: conform the live jobs on the lossless syntax tree
-    let (parsed, current) = conform_document(
-        &text,
+    let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
+    let parse = edited.as_ref().unwrap_or(parse);
+    conform_document(
+        parse,
         JobsAt::JobsKey,
         file,
         filter,
@@ -509,8 +553,8 @@ fn merge_github(
         &split.adds,
         &mut counts,
     )?;
-    let current_map = current.as_mapping().context("document is a mapping")?;
-    let root = root_mapping(&parsed)?;
+    let current_map = parse.values()?;
+    let root = parse.root()?;
 
     // Only `jobs` is managed; user-tuned triggers/env/permissions are kept.
     // Scaffold `name`/`on`/`permissions` solely when the workflow lacks them.
@@ -524,7 +568,7 @@ fn merge_github(
         }
     }
 
-    let content = parsed.to_string();
+    let content = parse.tree.to_string();
     if content == existing {
         return Ok(MergeOutcome::Unchanged);
     }
@@ -577,11 +621,11 @@ fn merge_gitlab(
     file: &PlannedFile,
     filter: &JobFilter,
     existing: &str,
-    original: &serde_yaml::Mapping,
+    parse: &Parse,
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
-    let existing_keys = gitlab_job_keys(original);
+    let existing_keys = gitlab_job_keys(parse.values()?);
     let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
 
     let canonical =
@@ -591,10 +635,11 @@ fn merge_gitlab(
         .expect("GitLabCI serializes to a mapping");
 
     let edits = block_edits(&split.blocks, canonical_map, &mut counts)?;
-    let text = apply_edits(existing, edits);
 
-    let (parsed, current) = conform_document(
-        &text,
+    let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
+    let parse = edited.as_ref().unwrap_or(parse);
+    conform_document(
+        parse,
         JobsAt::Root,
         file,
         filter,
@@ -602,8 +647,8 @@ fn merge_gitlab(
         &split.adds,
         &mut counts,
     )?;
-    let current_map = current.as_mapping().context("document is a mapping")?;
-    let root = root_mapping(&parsed)?;
+    let current_map = parse.values()?;
+    let root = parse.root()?;
 
     // Conform `stages` to what the final jobs reference. Canonical stages
     // cover the disabled jobs too, so a commented job's stage stays and
@@ -678,7 +723,7 @@ fn merge_gitlab(
         }
     }
 
-    let mut content = parsed.to_string();
+    let mut content = parse.tree.to_string();
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &existing_keys);
     crate::generator::reconcile_required_variables(Platform::GitLab, &header, &mut content);
 
@@ -845,12 +890,12 @@ fn merge_circleci(
     file: &PlannedFile,
     filter: &JobFilter,
     existing: &str,
-    original: &serde_yaml::Mapping,
-    original_parse: &YamlFile,
+    parse: &Parse,
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
 
+    let original = parse.values()?;
     let existing_jobs = existing_job_mapping(original, &file.path)?;
     let existing_keys = string_keys(&existing_jobs);
     let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
@@ -910,7 +955,7 @@ fn merge_circleci(
             let Some(name) = name.as_str() else { continue };
             let Some(entries) = workflow.get("jobs").and_then(Value::as_sequence) else {
                 if name == "main" {
-                    let spans = workflow_spans(existing, original_parse, name);
+                    let spans = workflow_spans(existing, &parse.tree, name);
                     main_append_at = spans
                         .jobs_line_end
                         .map(|at| (at, line_indent(existing, at - 1)));
@@ -920,7 +965,7 @@ fn merge_circleci(
             let (desired, ops, seen) =
                 conform_entries(entries, &canonical_entries, &split.disabled_ids, filter);
             invoked.extend(seen);
-            let spans = workflow_spans(existing, original_parse, name);
+            let spans = workflow_spans(existing, &parse.tree, name);
             if name == "main" {
                 main_append_at = spans
                     .items
@@ -979,10 +1024,10 @@ fn merge_circleci(
         }
     }
 
-    let text = apply_edits(existing, edits);
-
-    let (parsed, _) = conform_document(
-        &text,
+    let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
+    let parse = edited.as_ref().unwrap_or(parse);
+    conform_document(
+        parse,
         JobsAt::JobsKey,
         file,
         filter,
@@ -990,7 +1035,7 @@ fn merge_circleci(
         &split.adds,
         &mut counts,
     )?;
-    let root = root_mapping(&parsed)?;
+    let root = parse.root()?;
 
     if let Some(workflows_node) = root.get_mapping("workflows") {
         for name in &drop_workflows {
@@ -1020,7 +1065,7 @@ fn merge_circleci(
         }
     }
 
-    let mut content = parsed.to_string();
+    let mut content = parse.tree.to_string();
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &existing_keys);
     crate::generator::reconcile_required_variables(Platform::CircleCI, &header, &mut content);
 
