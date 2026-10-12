@@ -250,11 +250,14 @@ language-servers = ["cibox-lsp"]
 project somewhere else. Rules are on the left, the pipeline they generate on the
 right, with the lines that differ from the file already on disk highlighted.
 
+These are the rule list's keys. Editing a value and picking a platform each
+take the keyboard over while they are open, with the keys listed further down.
+
 | Key              | Action                                                            |
 | ---------------- | ----------------------------------------------------------------- |
 | `↑`/`↓`, `k`/`j` | move through the rules                                            |
 | `Space`/`Enter`  | toggle the rule under the cursor, or edit the knob                |
-| `→`/`l`, `←`/`h` | show or hide a rule's knobs (the docker and test rules have them) |
+| `→`/`l`, `←`/`h` | show or hide a rule's knobs (the rules that have them show a `▸`) |
 | `d`/`Del`        | drop the toolchain version under the cursor                       |
 | `K`/`J`          | scroll the preview                                                |
 | `p`              | pick the target platform (`Tab` cycles to the next one)           |
@@ -276,3 +279,42 @@ applies to the preview and to `w` for this session only; it is never recorded in
 `w` writes each file from scratch, the way `cibox update --force` does: jobs you
 added to a generated file by hand are dropped, along with your comments and
 formatting. Quit and run `cibox update` instead to keep those edits.
+
+### Editing a value
+
+`Space`/`Enter` on a knob that holds text — an image name, a package list, a
+toolchain version — starts an edit, prefilled with the value the row shows.
+From there the keyboard belongs to the value: printable keys append to it, and
+nothing else responds until the edit ends, so `q` types a `q` rather than
+quitting and `J` doesn't scroll the preview.
+
+| Key         | Action                             |
+| ----------- | ---------------------------------- |
+| `Enter`     | save the value                     |
+| `Esc`       | cancel, leaving the knob as it was |
+| `Backspace` | delete the last character          |
+
+Saving an empty value is how an override comes back out: the knob returns to
+its detected default and leaves `cibox.ron`. On a version row it removes that
+one entry instead, the same as `d` — and `d` is a version-row key only, so
+emptying the value is the way to clear a text knob. Saving a value that matches
+the default drops the override as well, keeping the file delta-only.
+
+What you save is not always what you typed. Every one of these values ends up
+in a shell command in the generated pipeline, so it is coerced into something
+that command can take: `My Project` saved as an image name becomes
+`my-project`, exactly as it would coming from a git remote, and an AUR package
+name the same way. Where there is no sensible coercion the value is dropped
+instead — an `android-build` `dir` that isn't a relative path, a
+`rust_toolchain` that isn't `stable`, `nightly` or `x.y[.z]`, or an
+`apt_packages` entry that isn't a Debian package name. The list knobs are
+deduped and have their blank entries dropped as well. The row redraws with what
+was actually stored, so it doubles as the confirmation of what the edit did.
+
+### Picking a platform
+
+`p` opens the platform picker: `↑`/`↓` or `k`/`j` move through the four
+platforms, `Enter` switches to the one under the cursor, and `Esc` or `q`
+closes the picker without changing anything. `Tab` is not one of its keys — it
+switches straight to the next platform from the rule list, which is the quicker
+way to flip between two of them.
