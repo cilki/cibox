@@ -226,6 +226,81 @@ variable (GitLab/CircleCI). On GitLab use type Variable with variable expansion
 turned off — the value is multi-line, which rules out masking and type File
 would hand the job a path instead of the key.
 
+### Building an Android APK
+
+`android-build` builds the release APK of a Gradle Android project on every
+push and uploads it as a CI artifact. Nothing is published — release mode is
+the point: F-Droid builds releases from source at version tags, so a release
+configuration that doesn't build should fail here rather than on F-Droid's
+buildserver. cibox hands the build no keystore, so the APK is whatever your
+Gradle release configuration produces, unsigned unless the project signs it
+itself.
+
+Detection looks for a Gradle root — a directory holding `gradlew` and
+`settings.gradle`/`settings.gradle.kts`, with a module containing
+`src/main/AndroidManifest.xml` — at the repository root or nested up to three
+directories below it. The shallowest one wins, and `build`, `target`,
+`node_modules` and hidden directories are never entered. `cibox detect`
+reports the root it settled on:
+
+```
+$ cibox detect
+Project facts:
+  ✓ Android (.)
+    cargo-ndk pre-build: no
+    git repository: yes
+    remote: example/app
+```
+
+The job installs the Android command line tools itself (pinned by URL and
+verified by SHA-256) into `.android-sdk/` inside the checkout, accepts the SDK
+licenses, and leaves the platform and build-tools downloads to the Gradle
+plugin. The SDK is multiple gigabytes, far too much for a prebuilt image, so
+`.android-sdk/` and `.gradle-home/` are cached together and the job's timeout
+is 90 minutes to fit the cold path. The APK is uploaded from
+`<gradle-root>/<module>/build/outputs/apk/release/`.
+
+When the Gradle root's parent directory holds a Rust crate with
+`crate-type = ["cdylib"]` — the Bevy/Tauri mobile layout, reported as
+`cargo-ndk pre-build: yes` above — a `cargo-ndk` pre-build runs first and
+writes the JNI libraries into the app module's `src/main/jniLibs` before Gradle
+packages them. That variant also downloads the NDK (the Gradle plugin brings
+its own, `cargo-ndk` doesn't) and runs on a rust image instead of
+`fossable/cibox`, caching `.cargo/` and `target/` as well. Only `arm64-v8a` is
+built, since the APK is a build canary rather than a shipped artifact, and
+`minSdk` from the app module's `build.gradle(.kts)` becomes cargo-ndk's
+`--platform`.
+
+Three knobs, all unset by default:
+
+```ron
+(
+    android_build: (
+        // The Gradle root, when detection picked the wrong one or none
+        dir: "mobile/android",
+
+        // Extra Debian packages the native build needs on the host
+        apt_packages: ["libasound2-dev", "llvm"],
+
+        // Toolchain for the cargo-ndk pre-build; "stable" otherwise
+        rust_toolchain: "nightly",
+    ),
+)
+```
+
+`dir` redirects the generated commands only — it is not a detection hint, so a
+Gradle root deeper than three directories needs `enabled: true` alongside it,
+and the job then assumes an `app` module and no native pre-build. Setting
+`apt_packages` adds an `apt-get install` step, which also brings in a JDK and
+`unzip` — present in `fossable/cibox` but not in the rust images.
+`rust_toolchain` is ignored when there is no Rust crate to build.
+
+All three end up inside shell commands, so a malformed value is a config error
+rather than something cibox quietly rewrites: `cibox validate` rejects a `dir`
+that isn't `/`-separated components of alphanumerics and `._+-`, an
+`apt_packages` entry that isn't a valid Debian package name, and a
+`rust_toolchain` that isn't `stable`, `nightly` or `x.y[.z]`.
+
 You can use our TUI interface to edit this file or any editor with LSP support.
 Configure your editor to use `cibox lsp` as an LSP and you'll get inline
 documenation and autocomplete.
@@ -254,7 +329,7 @@ right, with the lines that differ from the file already on disk highlighted.
 | ---------------- | ----------------------------------------------------------------- |
 | `↑`/`↓`, `k`/`j` | move through the rules                                            |
 | `Space`/`Enter`  | toggle the rule under the cursor, or edit the knob                |
-| `→`/`l`, `←`/`h` | show or hide a rule's knobs (the docker and test rules have them) |
+| `→`/`l`, `←`/`h` | show or hide a rule's knobs (the docker, test, AUR and Android rules have them) |
 | `d`/`Del`        | drop the toolchain version under the cursor                       |
 | `K`/`J`          | scroll the preview                                                |
 | `p`              | pick the target platform (`Tab` cycles to the next one)           |
