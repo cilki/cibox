@@ -10,6 +10,21 @@ pub(crate) const IMAGE: &str = "archlinux:base-devel";
 /// Where the builder user keeps the key and known_hosts for aur.archlinux.org
 const SSH_DIR: &str = "/home/builder/.ssh";
 
+/// The Ed25519 host key fingerprint of aur.archlinux.org, as published by
+/// the AUR itself at <https://aur.archlinux.org/>.
+///
+/// `ssh-keyscan` trusts whatever host answers, so on its own it authenticates
+/// nothing: anything that can answer for aur.archlinux.org from the runner
+/// gets to serve the PKGBUILD this job then executes through `updpkgsums`
+/// and `makepkg` — in the job holding the AUR key. Checking the scanned key
+/// against the published fingerprint is the verification a human does once
+/// and a pipeline otherwise never does.
+///
+/// Only the Ed25519 key is scanned, so only this fingerprint is accepted. If
+/// the AUR rotates its key the job fails loudly, which is the safe
+/// direction: the alternative is trusting the replacement sight unseen.
+const AUR_HOST_FINGERPRINT: &str = "SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4";
+
 /// Publish packages to the AUR when a version tag is pushed. The AUR repo is
 /// the source of truth for each PKGBUILD: the job clones it over SSH, sets
 /// pkgver from the tag, refreshes the checksums, test-builds the package with
@@ -64,15 +79,24 @@ impl AurRelease {
             // leave the variable unset, so test with `${VAR:-}`. The key
             // reaches the file through a quoted expansion of the job's own
             // environment, never through argv.
+            //
+            // `umask 077` rather than a trailing chmod: the key must never
+            // exist with the default 0644, however briefly, and it makes the
+            // directory 0700 and the config 0600 for free. The scanned host
+            // key is then checked against [`AUR_HOST_FINGERPRINT`] before
+            // anything connects, and a mismatch (or an empty scan) stops the
+            // job — `ssh-keygen -lf` fails and the `grep` with it.
             Step::run(
                 "Set up SSH for the AUR",
                 format!(
-                    "if [ -z \"${{AUR_SSH_PRIVATE_KEY:-}}\" ]; then echo \"AUR_SSH_PRIVATE_KEY is not set; cannot push to the AUR\" >&2; exit 1; fi; \
+                    "umask 077; \
+                     if [ -z \"${{AUR_SSH_PRIVATE_KEY:-}}\" ]; then echo \"AUR_SSH_PRIVATE_KEY is not set; cannot push to the AUR\" >&2; exit 1; fi; \
                      mkdir -p {SSH_DIR}; \
                      printf '%s\\n' \"$AUR_SSH_PRIVATE_KEY\" > {SSH_DIR}/aur; \
-                     ssh-keyscan aur.archlinux.org > {SSH_DIR}/known_hosts; \
+                     ssh-keyscan -t ed25519 aur.archlinux.org > {SSH_DIR}/known_hosts; \
+                     ssh-keygen -lf {SSH_DIR}/known_hosts | grep -qF '{AUR_HOST_FINGERPRINT}' || \
+                     {{ echo \"aur.archlinux.org host key does not match {AUR_HOST_FINGERPRINT} as published at https://aur.archlinux.org/; refusing to continue\" >&2; exit 1; }}; \
                      printf 'Host aur.archlinux.org\\n  User aur\\n  IdentityFile {SSH_DIR}/aur\\n' > {SSH_DIR}/config; \
-                     chmod 700 {SSH_DIR}; chmod 600 {SSH_DIR}/aur {SSH_DIR}/config {SSH_DIR}/known_hosts; \
                      chown -R builder:builder {SSH_DIR}"
                 ),
             ),
@@ -261,10 +285,57 @@ mod tests {
         let job = &rule(&["cibox"]).jobs(&ProjectFacts::default())[0];
         let ssh = run_command(job, "Set up SSH for the AUR");
         assert!(
-            ssh.starts_with("if [ -z \"${AUR_SSH_PRIVATE_KEY:-}\" ]; then"),
+            ssh.starts_with("umask 077; if [ -z \"${AUR_SSH_PRIVATE_KEY:-}\" ]; then"),
             "{ssh}"
         );
         assert!(ssh.contains("exit 1"), "{ssh}");
+    }
+
+    #[test]
+    fn test_aur_host_key_is_verified_against_the_published_fingerprint() {
+        // ssh-keyscan trusts whatever answers, and what it is trusted with
+        // here is the PKGBUILD this job executes. The scan must therefore be
+        // checked against the fingerprint the AUR publishes, and only the
+        // key type that was scanned can be the one verified.
+        let job = &rule(&["cibox"]).jobs(&ProjectFacts::default())[0];
+        let ssh = run_command(job, "Set up SSH for the AUR");
+        assert!(
+            ssh.contains(
+                "ssh-keyscan -t ed25519 aur.archlinux.org > /home/builder/.ssh/known_hosts"
+            ),
+            "{ssh}"
+        );
+        assert!(
+            ssh.contains(&format!(
+                "ssh-keygen -lf /home/builder/.ssh/known_hosts | grep -qF '{AUR_HOST_FINGERPRINT}'"
+            )),
+            "{ssh}"
+        );
+        // A mismatch must stop the job, not merely complain
+        let (_, after_check) = ssh.split_once("grep -qF").expect("fingerprint check");
+        assert!(
+            after_check.contains("|| { echo") && after_check.contains("exit 1; }"),
+            "{ssh}"
+        );
+        // The check guards the clone, so it has to be in the earlier step
+        let position = |name: &str| {
+            job.steps
+                .iter()
+                .position(|s| matches!(s, Step::Run { name: n, .. } if n == name))
+                .unwrap()
+        };
+        assert!(position("Set up SSH for the AUR") < position("Clone cibox from the AUR"));
+    }
+
+    #[test]
+    fn test_private_key_is_never_world_readable() {
+        // A trailing `chmod 600` would leave the key at the default 0644 for
+        // the rest of the step; the umask has to come first
+        let job = &rule(&["cibox"]).jobs(&ProjectFacts::default())[0];
+        let ssh = run_command(job, "Set up SSH for the AUR");
+        let umask = ssh.find("umask 077").expect("umask");
+        let write = ssh.find("> /home/builder/.ssh/aur").expect("key write");
+        assert!(umask < write, "{ssh}");
     }
 
     #[test]
