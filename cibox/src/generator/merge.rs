@@ -230,13 +230,13 @@ fn string_keys(map: &serde_yaml::Mapping) -> Vec<String> {
 /// jobs under one. Holding nothing is legitimate — that is what every job
 /// being commented out or deleted looks like — but a file without the key at
 /// all is not a pipeline cibox can merge into.
-fn existing_job_mapping(
-    original: &serde_yaml::Mapping,
+fn existing_job_mapping<'a>(
+    original: &'a serde_yaml::Mapping,
     path: &Path,
-) -> Result<serde_yaml::Mapping> {
+) -> Result<Cow<'a, serde_yaml::Mapping>> {
     match get(original, "jobs") {
-        Some(Value::Mapping(m)) => Ok(m.clone()),
-        Some(Value::Null) => Ok(serde_yaml::Mapping::new()),
+        Some(Value::Mapping(m)) => Ok(Cow::Borrowed(m)),
+        Some(Value::Null) => Ok(Cow::Owned(serde_yaml::Mapping::new())),
         _ => bail!(
             "{} has no `jobs:` mapping; use --force to overwrite it",
             path.display()
@@ -375,12 +375,12 @@ fn conform_document(
             conform_jobs(&root, &gitlab_job_keys(current_map), current_map, &plan, counts)?;
         }
         JobsAt::JobsKey => {
+            let empty = serde_yaml::Mapping::new();
             let jobs = get(current_map, "jobs")
                 .and_then(Value::as_mapping)
-                .cloned()
-                .unwrap_or_default();
+                .unwrap_or(&empty);
             if let Some(node) = root.get_mapping("jobs") {
-                conform_jobs(&node, &string_keys(&jobs), &jobs, &plan, counts)?;
+                conform_jobs(&node, &string_keys(jobs), jobs, &plan, counts)?;
             }
         }
     }
