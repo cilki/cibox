@@ -26,8 +26,11 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
   LSP (`cibox lsp`).
 - `cibox update` merges into existing files instead of overwriting:
   `generator::plan` lists the managed files and their jobs, and
-  `generator::merge_file` edits a lossless `yaml-edit` syntax tree, so user
-  comments and formatting survive. Managed jobs (ownership via
+  `generator::merge_file` rewrites each managed job's own lines in the text
+  and takes everything else through a lossless `yaml-edit` syntax tree, so
+  user comments and formatting survive — replacing a job on the tree instead
+  pulls the blank lines and comment indentation that follow it into the
+  value being replaced. Managed jobs (ownership via
   `Rule::owns_job_id`, narrowed by `--rule` through `generator::JobFilter`)
   are conformed, re-added when missing, or pruned when their rule is off;
   everything the user added is preserved. A commented-out managed job stays

@@ -1,7 +1,9 @@
 //! Merge canonical cibox output into an existing CI file.
 //!
-//! Editing happens on a lossless `yaml-edit` syntax tree, so user comments,
-//! formatting, and key order survive. For every planned job the
+//! Editing is done so that user comments, formatting, and key order survive:
+//! a job's own lines are rewritten in the text, where nothing around them can
+//! be disturbed, and everything else goes through a lossless `yaml-edit`
+//! syntax tree. For every planned job the
 //! [`JobFilter`] lets cibox manage: a job that is present with stale content
 //! is conformed to canonical output; one that is absent is re-added; one
 //! whose block is commented out stays commented but gets its content
@@ -350,29 +352,20 @@ enum JobsAt {
     Root,
 }
 
-/// The tree phase every merge ends with: conform the managed jobs of the
-/// text-edited document on its lossless syntax tree, which the caller may
+/// The tree phase every merge ends with: conform whatever managed jobs the
+/// text phase left for it on the lossless syntax tree, which the caller may
 /// keep editing before rendering it.
 fn conform_document(
     parse: &Parse,
     at: JobsAt,
-    file: &PlannedFile,
-    filter: &JobFilter,
-    canonical_jobs: &serde_yaml::Mapping,
-    adds: &[String],
+    plan: &JobsPlan,
     counts: &mut Counts,
 ) -> Result<()> {
-    let plan = JobsPlan {
-        canonical: canonical_jobs,
-        adds,
-        filter,
-        path: &file.path,
-    };
     let current_map = parse.values()?;
     let root = parse.root()?;
     match at {
         JobsAt::Root => {
-            conform_jobs(&root, &gitlab_job_keys(current_map), current_map, &plan, counts)?;
+            conform_jobs(&root, &gitlab_job_keys(current_map), current_map, plan, counts)?;
         }
         JobsAt::JobsKey => {
             let empty = serde_yaml::Mapping::new();
@@ -380,7 +373,7 @@ fn conform_document(
                 .and_then(Value::as_mapping)
                 .unwrap_or(&empty);
             if let Some(node) = root.get_mapping("jobs") {
-                conform_jobs(&node, &string_keys(jobs), jobs, &plan, counts)?;
+                conform_jobs(&node, &string_keys(jobs), jobs, plan, counts)?;
             }
         }
     }
@@ -422,6 +415,76 @@ fn block_edits(
         edits.push((block.span.clone(), replacement));
     }
     Ok(edits)
+}
+
+/// Whole-line byte span of one job's body — the lines below its key — plus
+/// the column that body sits at. `None` unless the value is a node that
+/// starts a line of its own, which is every block-style job and nothing
+/// else: a `job: {…}` one-liner, a scalar, or an empty value has no body
+/// lines to replace and goes back to the tree phase.
+fn body_span(jobs: &Mapping, text: &str, key: &str) -> Option<(Range<usize>, usize)> {
+    let node = jobs.get(key)?;
+    let range = node.as_node()?.text_range();
+    let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    if !text[line_start..start].chars().all(char::is_whitespace) {
+        return None;
+    }
+    // Blank lines after the body, and the indentation of a comment line
+    // below it, are inside the value node — the whole point of going through
+    // the text is to leave them alone, so the span stops at the last line
+    // that actually holds content.
+    let content_end = text[..end].trim_end().len();
+    if content_end <= start {
+        return None;
+    }
+    let body_end = text[content_end..]
+        .find('\n')
+        .map_or(text.len(), |i| content_end + i + 1);
+    Some((line_start..body_end, start - line_start))
+}
+
+/// Text replacements that conform the stale managed jobs of `jobs` to
+/// canonical output, where the job's body is a block the text can address.
+///
+/// Conforming a job by replacing its value on the syntax tree loses the
+/// trivia the parser folded into that value: a job followed by a blank line
+/// and a comment comes back with the blank line gone and the comment
+/// un-indented (yaml-edit 0.3). Rewriting the body's own lines instead
+/// leaves everything around it — the blank lines, the comments, and the key
+/// line with whatever the user put on it — byte for byte.
+///
+/// Jobs this can't address are left to [`conform_jobs`], which also removes
+/// the ones no longer generated.
+fn conform_jobs_textually(
+    jobs: &Mapping,
+    text: &str,
+    job_keys: &[String],
+    current: &serde_yaml::Mapping,
+    plan: &JobsPlan,
+    counts: &mut Counts,
+    edits: &mut Vec<(Range<usize>, String)>,
+) -> Result<()> {
+    if jobs.is_flow_style() {
+        return Ok(());
+    }
+    for key in job_keys {
+        if !plan.filter.managed(key) {
+            continue;
+        }
+        let Some(canonical) = get(plan.canonical, key) else {
+            continue;
+        };
+        if get(current, key) == Some(canonical) {
+            continue;
+        }
+        let Some((span, indent)) = body_span(jobs, text, key) else {
+            continue;
+        };
+        edits.push((span, indent_by(&serde_yaml::to_string(canonical)?, indent)));
+        counts.conformed += 1;
+    }
+    Ok(())
 }
 
 /// Apply the text phase's replacements, borrowing `text` unchanged when
@@ -469,22 +532,50 @@ fn indent_by(text: &str, indent: usize) -> String {
         .collect()
 }
 
-/// Render the jobs to add when the file has no live `jobs:` mapping to
-/// splice into, and queue the insertion right below the `jobs:` line.
+/// Where a new job's lines go, and the column its key sits at: just past the
+/// last line the job region holds — the last job's body, or the comments
+/// below it — at the column the region's keys already use. Without a live
+/// mapping to measure (every job commented out, or `jobs:` left empty) it is
+/// the line below `jobs:`, at the canonical column. `None` leaves the adding
+/// to the tree phase, which rejects flow-style job mappings outright.
+fn jobs_append_at(text: &str, jobs: Option<&Mapping>) -> Option<(usize, usize)> {
+    let Some(jobs) = jobs else {
+        return jobs_line_end(text).map(|at| (at, 2));
+    };
+    if jobs.is_flow_style() {
+        return None;
+    }
+    let range = jobs.as_node()?.text_range();
+    let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+    let span = disabled::line_span(text, &(start..end));
+    // Trailing blank lines belong to nothing in particular; a job appended
+    // after them would look detached from the region it joins.
+    let content_end = text[..span.end].trim_end().len();
+    let at = text[content_end..]
+        .find('\n')
+        .map_or(text.len(), |i| content_end + i + 1);
+    Some((at, start - text[..start].rfind('\n').map_or(0, |i| i + 1)))
+}
+
+/// Queue the lines of the jobs that have to be re-added.
+///
+/// Splicing them into the syntax tree instead would, when the region ends in
+/// a blank line and a comment, pull the comment's indentation out from under
+/// it (yaml-edit 0.3) — the same reason [`conform_jobs_textually`] exists.
 fn add_jobs_textually(
     existing: &str,
-    adds: &[String],
-    canonical_jobs: &serde_yaml::Mapping,
+    jobs: Option<&Mapping>,
+    plan: &JobsPlan,
     counts: &mut Counts,
     edits: &mut Vec<(Range<usize>, String)>,
 ) -> Result<()> {
-    let Some(offset) = jobs_line_end(existing) else {
+    let Some((offset, indent)) = jobs_append_at(existing, jobs) else {
         return Ok(());
     };
     let mut rendered = String::new();
-    for id in adds {
-        if let Some(canonical) = get(canonical_jobs, id) {
-            rendered.push_str(&indent_by(&render_job(id, canonical)?, 2));
+    for id in plan.adds {
+        if let Some(canonical) = get(plan.canonical, id) {
+            rendered.push_str(&indent_by(&render_job(id, canonical)?, indent));
             counts.added += 1;
         }
     }
@@ -536,23 +627,34 @@ fn merge_github(
     ))?;
     let canonical_jobs = &canonical_job_mapping(&canonical);
 
-    // Text phase: the commented blocks live outside the YAML value tree
+    // Text phase: the commented blocks live outside the YAML value tree,
+    // and conforming a live job through the text is what keeps the blank
+    // lines and comments around it intact
+    let plan = JobsPlan {
+        canonical: canonical_jobs,
+        adds: &split.adds,
+        filter,
+        path: &file.path,
+    };
     let mut edits = block_edits(&split.blocks, canonical_jobs, &mut counts)?;
-    if existing_jobs.is_empty() {
-        add_jobs_textually(existing, &split.adds, canonical_jobs, &mut counts, &mut edits)?;
+    let jobs_node = parse.root()?.get_mapping("jobs");
+    if let Some(node) = &jobs_node {
+        conform_jobs_textually(
+            node,
+            existing,
+            &existing_keys,
+            &existing_jobs,
+            &plan,
+            &mut counts,
+            &mut edits,
+        )?;
     }
-    // Tree phase: conform the live jobs on the lossless syntax tree
+    add_jobs_textually(existing, jobs_node.as_ref(), &plan, &mut counts, &mut edits)?;
+    // Tree phase: whatever the text phase couldn't address, plus the
+    // document's own scaffolding
     let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
-    conform_document(
-        parse,
-        JobsAt::JobsKey,
-        file,
-        filter,
-        canonical_jobs,
-        &split.adds,
-        &mut counts,
-    )?;
+    conform_document(parse, JobsAt::JobsKey, &plan, &mut counts)?;
     let current_map = parse.values()?;
     let root = parse.root()?;
 
@@ -634,19 +736,28 @@ fn merge_gitlab(
         .as_mapping()
         .expect("GitLabCI serializes to a mapping");
 
-    let edits = block_edits(&split.blocks, canonical_map, &mut counts)?;
+    let plan = JobsPlan {
+        canonical: canonical_map,
+        adds: &split.adds,
+        filter,
+        path: &file.path,
+    };
+    let mut edits = block_edits(&split.blocks, canonical_map, &mut counts)?;
+    let root_node = parse.root()?;
+    conform_jobs_textually(
+        &root_node,
+        existing,
+        &existing_keys,
+        parse.values()?,
+        &plan,
+        &mut counts,
+        &mut edits,
+    )?;
+    add_jobs_textually(existing, Some(&root_node), &plan, &mut counts, &mut edits)?;
 
     let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
-    conform_document(
-        parse,
-        JobsAt::Root,
-        file,
-        filter,
-        canonical_map,
-        &split.adds,
-        &mut counts,
-    )?;
+    conform_document(parse, JobsAt::Root, &plan, &mut counts)?;
     let current_map = parse.values()?;
     let root = parse.root()?;
 
@@ -915,7 +1026,25 @@ fn merge_circleci(
     // Text phase: commented job blocks, plus commented workflow entries —
     // kept in sync with the job's canonical invocations while it stays
     // disabled, dropped when the job is no longer generated at all
+    let plan = JobsPlan {
+        canonical: canonical_jobs,
+        adds: &split.adds,
+        filter,
+        path: &file.path,
+    };
     let mut edits = block_edits(&split.blocks, canonical_jobs, &mut counts)?;
+    let jobs_node = parse.root()?.get_mapping("jobs");
+    if let Some(node) = &jobs_node {
+        conform_jobs_textually(
+            node,
+            existing,
+            &existing_keys,
+            &existing_jobs,
+            &plan,
+            &mut counts,
+            &mut edits,
+        )?;
+    }
     for run in &scan.entries {
         // An id that isn't a disabled job makes this an ordinary comment
         if run.ids.iter().any(|id| !split.disabled_ids.contains(id)) {
@@ -936,9 +1065,7 @@ fn merge_circleci(
         let rendered = serde_yaml::to_string(&Value::Sequence(expected))?;
         edits.push((run.span.clone(), disabled::comment_out(&rendered, run.indent)));
     }
-    if existing_jobs.is_empty() {
-        add_jobs_textually(existing, &split.adds, canonical_jobs, &mut counts, &mut edits)?;
-    }
+    add_jobs_textually(existing, jobs_node.as_ref(), &plan, &mut counts, &mut edits)?;
 
     // A job also appears as an entry in a workflow's `jobs` list — conform
     // or drop those entries to match, leaving custom entries alone. The
@@ -1026,15 +1153,7 @@ fn merge_circleci(
 
     let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
-    conform_document(
-        parse,
-        JobsAt::JobsKey,
-        file,
-        filter,
-        canonical_jobs,
-        &split.adds,
-        &mut counts,
-    )?;
+    conform_document(parse, JobsAt::JobsKey, &plan, &mut counts)?;
     let root = parse.root()?;
 
     if let Some(workflows_node) = root.get_mapping("workflows") {
@@ -1434,6 +1553,115 @@ jobs:
         assert!(content.contains("# trigger notes live here"), "{}", content);
         assert!(content.contains("# keep this hack"), "{}", content);
         assert!(!content.contains("echo stale"), "{}", content);
+    }
+
+    /// Conforming a job used to be a tree edit, which dropped the blank
+    /// lines and comment indentation the parser folds into the value it
+    /// replaced: everything between the job and the next one came back
+    /// crushed against it and flush with the left margin.
+    #[test]
+    fn test_conform_leaves_what_follows_the_job_alone() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        let existing = r#"name: CI
+on:
+  push:
+    branches: [main]
+jobs:
+  rust-test:   # the one I care about
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+
+  # a job I wrote myself
+  my-custom:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo mine
+"#;
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert_eq!(counts.conformed, 1, "{}", content);
+        assert!(!content.contains("echo stale"), "{}", content);
+        assert!(
+            content.contains("  rust-test:   # the one I care about\n"),
+            "{}",
+            content
+        );
+        assert!(
+            content.contains("\n\n  # a job I wrote myself\n  my-custom:\n"),
+            "{}",
+            content
+        );
+    }
+
+    /// As above, where the commented block following the job is a disabled
+    /// managed job: it has to stay indented under `jobs:`, or uncommenting
+    /// it puts the job at the top level
+    #[test]
+    fn test_conform_leaves_a_trailing_disabled_block_indented() {
+        let facts = full_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_clippy.enabled = Some(false);
+        let resolved = resolve(&facts, &config);
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        let existing = r#"name: CI
+on:
+  push:
+    branches: [main]
+jobs:
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+
+  # rust-fmt:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #   - run: cargo fmt -- --check
+"#;
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert_eq!((counts.conformed, counts.disabled), (1, 1), "{}", content);
+        assert!(content.contains("\n  # rust-fmt:\n"), "{}", content);
+        assert!(!content.contains("\n# rust-fmt:\n"), "{}", content);
+    }
+
+    #[test]
+    fn test_gitlab_conform_leaves_what_follows_the_job_alone() {
+        let facts = cargo_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = plan(&facts, &resolved, Platform::GitLab)
+            .unwrap()
+            .swap_remove(0);
+        let filter = no_selection(&resolved);
+
+        let existing = r#"stages:
+- test
+- lint
+
+rust-test:
+  stage: test
+  script:
+  - echo stale
+
+# my own job, hands off
+my-job:
+  stage: lint
+  script:
+  - echo mine
+"#;
+        let (content, counts) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        assert_eq!(counts.conformed, 1, "{}", content);
+        assert!(!content.contains("echo stale"), "{}", content);
+        assert!(
+            content.contains("\n\n# my own job, hands off\nmy-job:\n"),
+            "{}",
+            content
+        );
     }
 
     #[test]
