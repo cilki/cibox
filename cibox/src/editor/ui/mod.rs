@@ -25,6 +25,60 @@ impl DiffType {
     }
 }
 
+/// What the preview panel draws: the previewed output line by line, each
+/// line carrying its diff status against the file on disk.
+///
+/// Built once per change of the preview rather than once per frame. The
+/// editor redraws on every turn of its event loop — ten times a second with
+/// nobody touching the keyboard — and diffing a large existing pipeline is
+/// not free: 3.8ms for ten thousand lines, plus the cost of styling every
+/// one of them, almost all of it off screen.
+#[derive(Debug, Default)]
+pub struct PreviewDiff {
+    lines: Vec<(String, DiffType)>,
+}
+
+impl PreviewDiff {
+    /// Diff the previewed output against the file on disk. Without a file
+    /// there is nothing to compare against and every line stands unchanged.
+    pub fn new(yaml: &str, existing: Option<&str>) -> Self {
+        let lines = match existing {
+            Some(old) => TextDiff::from_lines(old, yaml)
+                .iter_all_changes()
+                .map(|change| {
+                    let diff = match change.tag() {
+                        ChangeTag::Equal => DiffType::Unchanged,
+                        ChangeTag::Delete => DiffType::Removed,
+                        ChangeTag::Insert => DiffType::Added,
+                    };
+                    (change.value().trim_end_matches('\n').to_string(), diff)
+                })
+                .collect(),
+            None => yaml
+                .lines()
+                .map(|line| (line.to_string(), DiffType::Unchanged))
+                .collect(),
+        };
+        Self { lines }
+    }
+
+    /// Syntax-highlighted lines for a panel `rows` rows tall scrolled down
+    /// by `scroll`, each over the background color of its diff status.
+    ///
+    /// Wrapping gives every line at least one row, so the last visible row —
+    /// `scroll + rows` — can only be fed by a line at that index or earlier;
+    /// styling anything beyond it is work the panel throws away. The lines
+    /// above `scroll` do have to be handed over: the offset counts wrapped
+    /// rows, and only the paragraph knows how many rows each line takes.
+    fn visible(&self, scroll: u16, rows: u16) -> Vec<Line<'static>> {
+        let end = usize::from(scroll).saturating_add(usize::from(rows));
+        self.lines[..self.lines.len().min(end)]
+            .iter()
+            .map(|(line, diff)| highlight_line(line, diff.background()))
+            .collect()
+    }
+}
+
 pub fn render_ui(f: &mut Frame, state: &EditorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -249,12 +303,9 @@ fn rule_line(row: &RuleRow, is_selected: bool) -> Line<'static> {
 }
 
 fn render_preview_panel(f: &mut Frame, area: Rect, state: &EditorState) {
-    let preview = Paragraph::new(highlight_yaml(
-        &state.yaml_preview,
-        state.existing_yaml.as_deref(),
-    ))
-    .wrap(Wrap { trim: false })
-    .scroll((state.preview_scroll, 0));
+    let preview = Paragraph::new(state.preview.visible(state.preview_scroll, area.height))
+        .wrap(Wrap { trim: false })
+        .scroll((state.preview_scroll, 0));
 
     let output_path = state.platform.output_path();
     let filename = output_path.to_str().unwrap_or("config.yml");
@@ -320,36 +371,6 @@ fn render_platform_menu(f: &mut Frame, state: &EditorState) {
     );
 
     f.render_widget(list, menu_area);
-}
-
-/// Line-based diff between the file on disk and the previewed output
-fn compute_diff(old: &str, new: &str) -> Vec<(String, DiffType)> {
-    TextDiff::from_lines(old, new)
-        .iter_all_changes()
-        .map(|change| {
-            let diff = match change.tag() {
-                ChangeTag::Equal => DiffType::Unchanged,
-                ChangeTag::Delete => DiffType::Removed,
-                ChangeTag::Insert => DiffType::Added,
-            };
-            (change.value().trim_end_matches('\n').to_string(), diff)
-        })
-        .collect()
-}
-
-/// Syntax-highlight the preview. With `existing` present, every line also
-/// carries the background color of its diff status against the file on disk.
-fn highlight_yaml(yaml: &str, existing: Option<&str>) -> Vec<Line<'static>> {
-    match existing {
-        Some(old) => compute_diff(old, yaml)
-            .into_iter()
-            .map(|(line, diff)| highlight_line(&line, diff.background()))
-            .collect(),
-        None => yaml
-            .lines()
-            .map(|line| highlight_line(line, None))
-            .collect(),
-    }
 }
 
 /// Syntax-highlight one YAML line over an optional diff background color
@@ -550,6 +571,12 @@ mod tests {
         assert!(drawn[0].contains("image_name: edited▏"), "{:?}", drawn[0]);
     }
 
+    /// Every line of the preview, styled — the whole document, not just the
+    /// window a panel would show
+    fn highlight_yaml(yaml: &str, existing: Option<&str>) -> Vec<Line<'static>> {
+        PreviewDiff::new(yaml, existing).visible(0, u16::MAX)
+    }
+
     /// (text, foreground, background) of every span on a line
     fn spans(line: &Line<'static>) -> Vec<(String, Option<Color>, Option<Color>)> {
         line.spans
@@ -642,6 +669,40 @@ mod tests {
         assert_eq!(added.spans[0].style.fg, Some(Color::Cyan));
     }
 
+    /// The panel is handed only the lines that can reach the screen, which
+    /// has to draw exactly what the whole document would have drawn — at any
+    /// scroll offset, and with lines long enough to wrap onto several rows
+    #[test]
+    fn test_visible_window_draws_what_the_whole_document_would() {
+        let line = |i: usize| format!("  key-{i}: {}\n", "value ".repeat(i % 7));
+        let old: String = (0..300).map(line).collect();
+        let new: String = (0..300).filter(|i| i % 11 != 0).map(line).collect();
+        let preview = PreviewDiff::new(&new, Some(&old));
+
+        let (width, height) = (24u16, 10u16);
+        let draw = |lines: Vec<Line<'static>>, scroll: u16| {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    let paragraph = Paragraph::new(lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll, 0));
+                    f.render_widget(paragraph, Rect::new(0, 0, width, height));
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        for scroll in [0, 1, 9, 40, 300, 700] {
+            assert_eq!(
+                draw(preview.visible(scroll, height), scroll),
+                draw(preview.visible(0, u16::MAX), scroll),
+                "scrolled to {scroll}"
+            );
+        }
+    }
+
     /// Toggling a rule inserts or removes a whole job block. Only that block
     /// may be highlighted: everything after it still lines up and has to come
     /// back `Unchanged`, or the preview turns into a wall of red and green
@@ -656,7 +717,7 @@ mod tests {
         let old = format!("head: 1\n{block}{unchanged_tail}");
         let new = format!("head: 1\n{unchanged_tail}");
 
-        let diff = compute_diff(&old, &new);
+        let diff = PreviewDiff::new(&new, Some(&old)).lines;
         let removed: Vec<&str> = diff
             .iter()
             .filter(|(_, d)| *d == DiffType::Removed)

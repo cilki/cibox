@@ -1,5 +1,6 @@
 use crate::config::{infer_platform, serialize_config, CiboxConfig, DockerPlatform};
 use crate::detection::ProjectFacts;
+use crate::editor::ui::PreviewDiff;
 use crate::error::Result;
 use crate::rules::{clean_versions, resolve};
 use std::collections::HashSet;
@@ -186,6 +187,10 @@ pub struct EditorState {
     pub preview_scroll: u16,
     pub yaml_preview: String,
     pub existing_yaml: Option<String>,
+    /// What the preview panel draws: [`yaml_preview`](Self::yaml_preview)
+    /// diffed against [`existing_yaml`](Self::existing_yaml), kept here so a
+    /// redraw never has to compute it again
+    pub preview: PreviewDiff,
 
     // Exit flags
     pub should_quit: bool,
@@ -235,6 +240,7 @@ impl EditorState {
             preview_scroll: 0,
             yaml_preview: String::new(),
             existing_yaml,
+            preview: PreviewDiff::default(),
             should_quit: false,
             should_write: false,
         };
@@ -460,6 +466,7 @@ impl EditorState {
             // Nothing enabled, or the platform refuses a job: say so inline
             Err(e) => format!("# {e}"),
         };
+        self.preview = PreviewDiff::new(&self.yaml_preview, self.existing_yaml.as_deref());
     }
 
     pub fn current_row(&self) -> Option<&Row> {
