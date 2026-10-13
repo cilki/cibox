@@ -21,8 +21,9 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
 - `cibox/src/config/ron_types.rs` defines the `cibox.ron` schema: delta-only
   rule overrides at the top level, nix-services style
   (`rule_name: (enabled: bool, ...knobs)`). The platform is not configured
-  there — it comes from a per-platform CLI flag (`--gitlab`, … ; see
-  `cli::PlatformFlag`) or inference. These types must stay
+  there — it comes from the per-platform CLI flags (`--gitlab`, … ; see
+  `cli::PlatformFlag`, which `update` honours several of at once) or
+  inference. These types must stay
   hand-written literals — `build.rs` feeds this file to roniker for the RON
   LSP (`cibox lsp`).
 - `cibox update` merges into existing files instead of overwriting:

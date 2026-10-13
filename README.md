@@ -48,14 +48,16 @@ Running `cibox update` in a project with no configuration at all produces a
 working pipeline: detection picks the rules and the target platform is inferred
 from existing CI configuration, then from your git remote's host, falling back
 to GitHub Actions. Pass the platform's own flag — `--github`, `--gitea`,
-`--gitlab`, `--circleci` — to choose explicitly.
+`--gitlab`, `--circleci` — to choose explicitly, or several of them to generate
+for several platforms at once.
 
 ```
-$ cibox                     # interactive TUI to toggle rules
-$ cibox detect              # show project facts and which rules fired
-$ cibox update              # write or refresh the pipeline files
-$ cibox update --gitlab     # generate for a specific platform
-$ cibox validate cibox.ron  # check an override file, print the resolved rules
+$ cibox                            # interactive TUI to toggle rules
+$ cibox detect                     # show project facts and which rules fired
+$ cibox update                     # write or refresh the pipeline files
+$ cibox update --gitlab            # generate for a specific platform
+$ cibox update --github --gitlab   # ...or for more than one
+$ cibox validate cibox.ron         # check an override file, print the rules
 ```
 
 The files cibox manages, per platform:
@@ -100,7 +102,7 @@ if you no longer want it.
 |---|---|
 | `cibox`, `cibox editor` | `--dir <PATH>` (default `.`), a platform flag |
 | `cibox detect` | `--dir <PATH>` (default `.`) |
-| `cibox update` | `[CONFIG]` (default `cibox.ron`), a platform flag, `--force`, `--rule` |
+| `cibox update` | `[CONFIG]` (default `cibox.ron`), platform flags, `--force`, `--rule` |
 | `cibox validate` | `[CONFIG]` (default `cibox.ron`) |
 | `cibox lsp` | — |
 
@@ -113,9 +115,14 @@ exist, and so does the one `validate` uses — `cibox validate` in a project
 that has no overrides is an error, not an empty report.
 
 The platform is named by a flag of its own: `--github`, `--gitea`, `--gitlab`,
-or `--circleci`. They are mutually exclusive, and giving none leaves the
-platform to inference. `cibox editor` takes them too, to pick the platform it
-opens on; the editor can switch platform from inside either way.
+or `--circleci`. Giving none leaves the platform to inference. `update` accepts
+several: nothing in the rule resolution is platform-specific, so each named
+platform gets its own files in one pass, and a project that publishes to two
+forges needs one command rather than two. If any named platform can't express
+the resolution — a Windows runner outside GitHub/Gitea — the run fails before
+writing anything, so you never get half of the platforms updated. `cibox editor`
+takes the flags too, to pick the platform it opens on; it previews one platform
+at a time, and its platform menu can switch either way.
 
 `--force` and `--rule` are mutually exclusive, since `--force` rewrites whole
 files and `--rule` exists to leave untouched everything it doesn't name. An
@@ -174,8 +181,8 @@ needed until you want to change something. Each rule has an `enabled` switch
 
 Omitted rules follow detection; an omitted `enabled` leaves detection in charge
 while still applying the knobs. The target platform is not part of the file —
-`cibox update` can generate for any platform, so pass its flag (`--gitlab`, …)
-or let cibox infer it.
+`cibox update` can generate for any platform, or several at once, so pass their
+flags (`--gitlab`, …) or let cibox infer one.
 
 `image_name` has to be a valid docker reference, because it ends up as a literal
 argument to `docker build -t`: lowercase alphanumerics separated by `.`, `-` or

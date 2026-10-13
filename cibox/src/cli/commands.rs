@@ -47,17 +47,25 @@ fn print_rule_table(resolved: &[ResolvedRule]) {
 }
 
 /// Handle the update command
+///
+/// `platform_args` may name several platforms: nothing in the resolution is
+/// platform-specific, so generating for all of them in one pass is the same
+/// work repeated per backend. Empty means infer one.
 pub fn handle_update(
     config_path: &str,
-    platform_arg: Option<Platform>,
+    platform_args: &[Platform],
     force: bool,
     rules: &[String],
 ) -> Result<()> {
     let working_dir = PathBuf::from(".");
     let facts = gather_facts(&working_dir);
     let config = load_config(config_path, config_path != "cibox.ron")?;
-    // CLI flag > inference from the repository
-    let platform = platform_arg.unwrap_or_else(|| infer_platform(&facts));
+    // CLI flags > inference from the repository
+    let platforms: Vec<Platform> = if platform_args.is_empty() {
+        vec![infer_platform(&facts)]
+    } else {
+        platform_args.to_vec()
+    };
     let resolved = resolve(&facts, &config);
 
     // `--rule` must be validated by hand: nothing else rejects an unknown id
@@ -72,36 +80,47 @@ pub fn handle_update(
         selection: selection.as_ref(),
     };
 
+    let names: Vec<&str> = platforms.iter().map(|p| p.name()).collect();
     println!(
         "{} {} for {}",
         "Updating".cyan().bold(),
         "CI configuration".normal(),
-        platform.name().yellow()
+        names.join(", ").yellow()
     );
     print_rule_table(&resolved);
 
-    let planned = crate::generator::plan(&facts, &resolved, platform)
-        .with_context(|| format!("Failed to generate CI configuration for {platform}"))?;
+    // Plan every platform before writing anything, so a platform that cannot
+    // take this resolution (a Windows job outside GitHub/Gitea) fails the run
+    // instead of leaving the other platforms' files half updated.
+    let planned: Vec<(Platform, Vec<crate::generator::PlannedFile>)> = platforms
+        .iter()
+        .map(|&platform| {
+            let files = crate::generator::plan(&facts, &resolved, platform)
+                .with_context(|| format!("Failed to generate CI configuration for {platform}"))?;
+            Ok((platform, files))
+        })
+        .collect::<Result<_>>()?;
+    let all_files = || planned.iter().flat_map(|(_, files)| files);
 
     // With nothing enabled there is still work to do as long as a managed file
     // exists: its cibox jobs are stale and get pruned below. Only when there is
     // neither anything to write nor anything to prune is the empty resolution a
     // mistake worth reporting.
     let prunable = !force
-        && planned.iter().any(|file| {
+        && all_files().any(|file| {
             std::fs::read_to_string(working_dir.join(&file.path))
                 .is_ok_and(|text| !text.trim().is_empty())
         });
-    if planned
-        .iter()
-        .all(|file| crate::generator::managed_jobs(file, &filter).is_empty())
-        && !prunable
+    if all_files().all(|file| crate::generator::managed_jobs(file, &filter).is_empty()) && !prunable
     {
         anyhow::bail!("{}", crate::generator::NOTHING_ENABLED);
     }
 
     println!();
-    for file in planned {
+    let files = planned
+        .iter()
+        .flat_map(|(platform, files)| files.iter().map(|file| (*platform, file)));
+    for (platform, file) in files {
         let output_path = working_dir.join(&file.path);
         let path_label = output_path.display().to_string().yellow();
         let existing = std::fs::read_to_string(&output_path).ok();
@@ -112,7 +131,7 @@ pub fn handle_update(
         // pruned, and everything the user did to it is kept
         let content = match existing {
             Some(text) if !force && !text.trim().is_empty() => {
-                match crate::generator::merge_file(platform, &file, &filter, &text)? {
+                match crate::generator::merge_file(platform, file, &filter, &text)? {
                     crate::generator::MergeOutcome::Unchanged => {
                         println!("  {} {} unchanged", "○".dimmed(), path_label);
                         continue;
@@ -147,7 +166,7 @@ pub fn handle_update(
             }
             _ => {
                 let fresh = crate::generator::PlannedFile {
-                    jobs: crate::generator::managed_jobs(&file, &filter),
+                    jobs: crate::generator::managed_jobs(file, &filter),
                     ..file.clone()
                 };
                 if fresh.jobs.is_empty() {

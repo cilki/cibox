@@ -384,28 +384,9 @@ impl CiboxConfig {
 
 /// Parse a cibox.ron document
 pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
-    if ron_str.trim_start().starts_with('[') {
-        anyhow::bail!(
-            "cibox.ron uses the old pipeline-list format, which has been replaced \
-             by rule overrides. Delete the file and re-run cibox, or see the README \
-             for the new format."
-        );
-    }
-    let config: CiboxConfig = crate::config::ron_options()
-        .from_str(ron_str)
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("`platform`") || msg.contains("`rules`") {
-                anyhow::anyhow!(
-                    "{msg}\ncibox.ron no longer has `platform` or `rules` fields: rule \
-                     overrides live at the top level, e.g. `(rust_test: (enabled: false))`, \
-                     and the platform comes from a --github/--gitea/--gitlab/--circleci \
-                     flag or is inferred"
-                )
-            } else {
-                e.into()
-            }
-        })?;
+    // `deny_unknown_fields` reports a field the schema has not got, which is
+    // all a document written against an older cibox needs to hear
+    let config: CiboxConfig = crate::config::ron_options().from_str(ron_str)?;
     validate_image_names(&config)?;
     validate_aur_packages(&config)?;
     validate_android_build(&config)?;
@@ -613,25 +594,16 @@ mod tests {
     }
 
     #[test]
-    fn test_platform_and_rules_fields_rejected_with_hint() {
+    fn test_documents_from_older_cibox_versions_are_rejected() {
+        // A field the schema has not got is an error rather than something
+        // silently ignored, so a stale file cannot look like it still applies
         for old in [
             "(platform: GitHub)",
             "(rules: (rust_test: (enabled: false)))",
+            r#"[( platform: GitHub, presets: [ Rust(enable_linter: true) ] )]"#,
         ] {
-            let err = parse_config(old).unwrap_err();
-            assert!(err.to_string().contains("top level"), "{old}: {err}");
+            assert!(parse_config(old).is_err(), "{old} parsed");
         }
-    }
-
-    #[test]
-    fn test_old_format_rejected_with_hint() {
-        let err = parse_config(
-            r#"[
-                ( platform: GitHub, presets: [ Rust(enable_linter: true) ] ),
-            ]"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("old pipeline-list format"));
     }
 
     #[test]

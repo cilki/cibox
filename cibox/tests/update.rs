@@ -380,6 +380,73 @@ fn test_nothing_enabled_and_nothing_to_prune_is_an_error() {
 }
 
 #[test]
+fn test_several_platform_flags_generate_for_all_of_them() {
+    let dir = project();
+    Command::cargo_bin("cibox")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["update", "--github", "--gitlab", "--circleci"])
+        .assert()
+        .success();
+
+    // Every named platform's files, and nothing for the one not named
+    let ci = dir.path().join(".github/workflows/ci.yml");
+    assert!(ci.is_file());
+    assert!(dir.path().join(".github/workflows/release.yml").is_file());
+    assert!(dir.path().join(".gitlab-ci.yml").is_file());
+    assert!(dir.path().join(".circleci/config.yml").is_file());
+    assert!(!dir.path().join(".gitea/workflows").exists());
+
+    // Each file is the same one that platform's own run would have produced,
+    // and a second pass over all three is a no-op
+    let single = project();
+    update(single.path()).assert().success();
+    // ...modulo the image name, which defaults to the directory's own name
+    let without_dir_name = |path: &Path, dir: &Path| {
+        // A temp dir's name is `.tmpAbC123`, and a reference may not start with
+        // a dot or carry uppercase, so the image name is the coerced form
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        let coerced = name.trim_start_matches('.').to_ascii_lowercase();
+        fs::read_to_string(path).unwrap().replace(&coerced, "dir")
+    };
+    let single_ci = single.path().join(".github/workflows/ci.yml");
+    assert_eq!(
+        without_dir_name(&single_ci, single.path()),
+        without_dir_name(&ci, dir.path())
+    );
+    Command::cargo_bin("cibox")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["update", "--github", "--gitlab", "--circleci"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+}
+
+#[test]
+fn test_a_platform_that_rejects_the_resolution_writes_nothing() {
+    // Windows runners exist only on GitHub/Gitea, so this resolution cannot be
+    // lowered for GitLab. The run must fail before writing GitHub's half of it
+    // rather than leave the project half configured.
+    let dir = project();
+    fs::write(
+        dir.path().join("cibox.ron"),
+        "(docker_release: (platforms: [LinuxAmd64, WindowsAmd64]))\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("cibox")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["update", "--github", "--gitlab"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Windows runner"));
+    assert!(!dir.path().join(".github/workflows").exists());
+    assert!(!dir.path().join(".gitlab-ci.yml").exists());
+}
+
+#[test]
 fn test_generate_subcommand_is_gone() {
     let dir = project();
     Command::cargo_bin("cibox")

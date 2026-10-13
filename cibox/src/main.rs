@@ -19,10 +19,10 @@ fn main() -> Result<()> {
             platform,
             force,
             rules,
-        }) => cibox::cli::commands::handle_update(&config, platform.selected(), force, &rules),
+        }) => cibox::cli::commands::handle_update(&config, &platform.selected(), force, &rules),
         Some(Commands::Validate { config }) => cibox::cli::commands::handle_validate(&config),
         Some(Commands::Editor { dir, platform }) => {
-            cibox::editor::run_with_args(&dir, platform.selected())
+            cibox::editor::run_with_args(&dir, platform.first())
         }
         Some(Commands::Detect { dir }) => cibox::cli::commands::handle_detect(&dir),
         Some(Commands::Lsp) => {
