@@ -1,17 +1,45 @@
 use cibox::cli::{Cli, Commands};
 use cibox::error::Result;
-use clap::{CommandFactory, FromArgMatches};
+use clap::error::ErrorKind;
+use clap::{ArgMatches, CommandFactory, FromArgMatches};
+
+/// Parse the command line, building the emblem only once clap has said it is
+/// about to print help.
+///
+/// The emblem rides above the help text, as a real image on terminals with a
+/// graphics protocol and in block letters elsewhere, and clap is handed it as
+/// `before_help` so it appears nowhere else. Building it is far from free
+/// though: on a terminal that speaks a graphics protocol the SVG is
+/// rasterized and rescaled, which takes longer than any of the commands spend
+/// on the work they were asked to do. Handing it to clap up front made every
+/// invocation pay for a picture only `--help` ever shows, so it is built here
+/// instead, on the one path that displays it.
+fn matches() -> ArgMatches {
+    match Cli::command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) =>
+        {
+            let mut command = Cli::command();
+            if let Some(emblem) = cilki::terminal::before_help(&cilki::emblem::CIBOX, 56, 7) {
+                command = command.before_help(emblem);
+            }
+            // The same arguments ask for the same help, now rendered from a
+            // template that carries the emblem
+            match command.try_get_matches() {
+                Ok(matches) => matches,
+                Err(err) => err.exit(),
+            }
+        }
+        Err(err) => err.exit(),
+    }
+}
 
 fn main() -> Result<()> {
-    // The emblem rides above the help text, as a real image on terminals with
-    // a graphics protocol and in block letters elsewhere. clap is handed it as
-    // `before_help` so it appears only when help is actually printed, and
-    // never when the output is a pipe or a file.
-    let mut command = Cli::command();
-    if let Some(emblem) = cilki::terminal::before_help(&cilki::emblem::CIBOX, 56, 7) {
-        command = command.before_help(emblem);
-    }
-    let cli = Cli::from_arg_matches(&command.get_matches())?;
+    let cli = Cli::from_arg_matches(&matches())?;
 
     match cli.command {
         Some(Commands::Update {
