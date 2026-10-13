@@ -12,7 +12,7 @@ use crate::config::Platform;
 use crate::generator::JobFilter;
 use serde_yaml::Value;
 use std::ops::Range;
-use yaml_edit::{AsYaml, YamlFile};
+use yaml_edit::{AsYaml, SyntaxKind, YamlFile};
 
 /// One contiguous run of comment lines defining disabled jobs.
 pub(crate) struct DisabledBlock {
@@ -107,25 +107,40 @@ pub(crate) fn scan(platform: Platform, text: &str, file: &YamlFile, filter: &Job
         }
     }
 
-    // Comments under a region node, grouped into runs of adjacent lines
-    // (whitespace-only gaps allowed within a run)
+    // The comments a region holds directly. Asking the document for all of
+    // its comments walks every token in the file, and in a large pipeline
+    // almost all of them sit inside job bodies and are dropped here, so the
+    // regions are read for their own comment children instead. They are
+    // collected region by region, hence sorted back into document order —
+    // adjacent comments are one run no matter which region found them.
+    let mut comments: Vec<(Range<usize>, &Region)> = Vec::new();
+    for (node, region) in &regions {
+        for child in node.children_with_tokens() {
+            let Some(token) = child
+                .into_token()
+                .filter(|t| t.kind() == SyntaxKind::COMMENT)
+            else {
+                continue;
+            };
+            let range = token.text_range();
+            comments.push((usize::from(range.start())..usize::from(range.end()), region));
+        }
+    }
+    comments.sort_by_key(|(range, _)| range.start);
+    // One comment belongs to one run even if two regions are the same node
+    comments.dedup_by_key(|(range, _)| range.start);
+
+    // Grouped into runs of adjacent lines (whitespace-only gaps allowed
+    // within a run)
     let mut runs: Vec<(Region, Range<usize>)> = Vec::new();
-    for comment in doc.comments() {
-        let Some(parent) = comment.syntax().parent() else {
-            continue;
-        };
-        let Some((_, region)) = regions.iter().find(|(node, _)| *node == parent) else {
-            continue;
-        };
-        let range = comment.text_range();
-        let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+    for (range, region) in comments {
         match runs.last_mut() {
             Some((last_region, last))
-                if *last_region == *region && text[last.end..start].trim().is_empty() =>
+                if *last_region == *region && text[last.end..range.start].trim().is_empty() =>
             {
-                last.end = end;
+                last.end = range.end;
             }
-            _ => runs.push((region.clone(), start..end)),
+            _ => runs.push((region.clone(), range)),
         }
     }
 
@@ -360,6 +375,20 @@ mod tests {
         assert!(!text[block.span.clone()].contains("flaky"));
         let body = block.jobs.get("rust-test").unwrap();
         assert!(body.get("steps").is_some());
+    }
+
+    /// Comments are collected one region at a time, so they have to be put
+    /// back in document order before they are grouped into runs: here a note
+    /// trailing the last job attaches to the root — the region looked at
+    /// first — while the commented job above it attaches to the `jobs:`
+    /// mapping.
+    #[test]
+    fn test_scan_groups_runs_in_document_order() {
+        let text = "name: CI\njobs:\n  # rust-test:\n  #   runs-on: x\n  #   steps:\n  #     - run: cargo test\n  other:\n    runs-on: x\n# a trailing note at the root\n";
+        let scan = scan_text(Platform::GitHub, text);
+        assert_eq!(scan.blocks.len(), 1);
+        assert_eq!(scan.blocks[0].ids, vec!["rust-test"]);
+        assert!(!text[scan.blocks[0].span.clone()].contains("trailing"));
     }
 
     #[test]
