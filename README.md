@@ -260,6 +260,7 @@ right, with the lines that differ from the file already on disk highlighted.
 | `p`              | pick the target platform (`Tab` cycles to the next one)           |
 | `w`              | write the pipeline files                                          |
 | `q`/`Esc`        | quit                                                              |
+| `Ctrl+C`         | quit from anywhere, including mid-edit                            |
 
 Expanding `docker-build`/`docker-release` shows the image name and the target
 platforms, `aur-release` its comma-separated package list, and `android-build`
