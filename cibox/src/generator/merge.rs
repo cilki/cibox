@@ -228,21 +228,60 @@ fn string_keys(map: &serde_yaml::Mapping) -> Vec<String> {
         .collect()
 }
 
-/// The existing top-level `jobs:` mapping on the platforms that nest their
-/// jobs under one. Holding nothing is legitimate — that is what every job
-/// being commented out or deleted looks like — but a file without the key at
-/// all is not a pipeline cibox can merge into.
-fn existing_job_mapping<'a>(
-    original: &'a serde_yaml::Mapping,
-    path: &Path,
-) -> Result<Cow<'a, serde_yaml::Mapping>> {
-    match get(original, "jobs") {
-        Some(Value::Mapping(m)) => Ok(Cow::Borrowed(m)),
-        Some(Value::Null) => Ok(Cow::Owned(serde_yaml::Mapping::new())),
-        _ => bail!(
-            "{} has no `jobs:` mapping; use --force to overwrite it",
-            path.display()
-        ),
+/// Where a platform keeps its jobs in the document.
+#[derive(Debug, Clone, Copy)]
+enum JobsAt {
+    /// Under a top-level `jobs:` mapping (GitHub/Gitea, CircleCI)
+    JobsKey,
+    /// At the document root, mixed with configuration keys (GitLab)
+    Root,
+}
+
+/// A platform's job region resolved against one parse: the three views of it
+/// every phase of a merge needs. The region is resolved twice per merge —
+/// once on the original text for the text phase, once on the result for the
+/// tree phase — which is the whole of what a platform has to say about where
+/// its jobs live.
+struct JobsRegion<'a> {
+    /// The region's keys that are jobs, in document order
+    keys: Vec<String>,
+    /// The mapping holding them, as plain values to measure against
+    values: Cow<'a, serde_yaml::Mapping>,
+    /// The editable node, absent when the region has no live mapping (every
+    /// job commented out, or `jobs:` left empty)
+    node: Option<Mapping>,
+}
+
+impl JobsAt {
+    /// Read the job region out of `parse`. An empty region is legitimate —
+    /// that is what every job being commented out or deleted looks like —
+    /// but a `jobs:`-key file without the key at all is not a pipeline cibox
+    /// can merge into.
+    fn resolve<'a>(self, parse: &'a Parse, path: &Path) -> Result<JobsRegion<'a>> {
+        let root_values = parse.values()?;
+        let root = parse.root()?;
+        Ok(match self {
+            JobsAt::Root => JobsRegion {
+                keys: gitlab_job_keys(root_values),
+                values: Cow::Borrowed(root_values),
+                node: Some(root),
+            },
+            JobsAt::JobsKey => {
+                let values = match get(root_values, "jobs") {
+                    Some(Value::Mapping(m)) => Cow::Borrowed(m),
+                    Some(Value::Null) => Cow::Owned(serde_yaml::Mapping::new()),
+                    _ => bail!(
+                        "{} has no `jobs:` mapping; use --force to overwrite it",
+                        path.display()
+                    ),
+                };
+                JobsRegion {
+                    keys: string_keys(&values),
+                    values,
+                    node: root.get_mapping("jobs"),
+                }
+            }
+        })
     }
 }
 
@@ -287,18 +326,15 @@ struct JobsPlan<'a> {
     path: &'a Path,
 }
 
-/// Replace stale managed entries with canonical content, drop managed
-/// entries that are no longer generated, and append the missing ones.
-/// `job_keys` are the keys of `current` that are jobs (GitLab mixes jobs
-/// with reserved configuration keys at the top level).
-fn conform_jobs(
-    jobs: &Mapping,
-    job_keys: &[String],
-    current: &serde_yaml::Mapping,
-    plan: &JobsPlan,
-    counts: &mut Counts,
-) -> Result<()> {
-    let guard = |jobs: &Mapping| -> Result<()> {
+/// The tree phase every merge ends with: on the lossless syntax tree,
+/// replace the stale managed jobs the text phase couldn't address, drop the
+/// managed jobs that are no longer generated, and append the missing ones.
+/// The caller may keep editing the tree before rendering it.
+fn conform_jobs(region: &JobsRegion, plan: &JobsPlan, counts: &mut Counts) -> Result<()> {
+    let Some(jobs) = &region.node else {
+        return Ok(());
+    };
+    let guard = || -> Result<()> {
         if jobs.is_flow_style() {
             bail!(
                 "{} keeps its jobs in flow-style YAML, which cibox cannot edit in place; \
@@ -308,21 +344,21 @@ fn conform_jobs(
         }
         Ok(())
     };
-    for key in job_keys {
+    for key in &region.keys {
         if !plan.filter.managed(key) {
             counts.preserved += 1;
             continue;
         }
-        match plan.canonical.get(Value::from(key.as_str())) {
-            Some(canonical) if get(current, key) == Some(canonical) => {}
+        match get(plan.canonical, key) {
+            Some(canonical) if get(&region.values, key) == Some(canonical) => {}
             Some(canonical) => {
-                guard(jobs)?;
+                guard()?;
                 let (_doc, node) = fragment(key, canonical)?;
                 jobs.set(key.as_str(), node);
                 counts.conformed += 1;
             }
             None => {
-                guard(jobs)?;
+                guard()?;
                 jobs.remove(key.as_str());
                 counts.removed += 1;
             }
@@ -331,50 +367,14 @@ fn conform_jobs(
     for id in plan.adds {
         // Already present: e.g. inserted textually when `jobs:` held only
         // comments, in which case it was counted there
-        if get(current, id).is_some() {
+        if get(&region.values, id).is_some() {
             continue;
         }
-        if let Some(canonical) = plan.canonical.get(Value::from(id.as_str())) {
-            guard(jobs)?;
+        if let Some(canonical) = get(plan.canonical, id) {
+            guard()?;
             let (_doc, node) = fragment(id, canonical)?;
             jobs.set(id.as_str(), node);
             counts.added += 1;
-        }
-    }
-    Ok(())
-}
-
-/// Where a platform keeps its jobs in the document.
-enum JobsAt {
-    /// Under a top-level `jobs:` mapping (GitHub/Gitea, CircleCI)
-    JobsKey,
-    /// At the document root, mixed with configuration keys (GitLab)
-    Root,
-}
-
-/// The tree phase every merge ends with: conform whatever managed jobs the
-/// text phase left for it on the lossless syntax tree, which the caller may
-/// keep editing before rendering it.
-fn conform_document(
-    parse: &Parse,
-    at: JobsAt,
-    plan: &JobsPlan,
-    counts: &mut Counts,
-) -> Result<()> {
-    let current_map = parse.values()?;
-    let root = parse.root()?;
-    match at {
-        JobsAt::Root => {
-            conform_jobs(&root, &gitlab_job_keys(current_map), current_map, plan, counts)?;
-        }
-        JobsAt::JobsKey => {
-            let empty = serde_yaml::Mapping::new();
-            let jobs = get(current_map, "jobs")
-                .and_then(Value::as_mapping)
-                .unwrap_or(&empty);
-            if let Some(node) = root.get_mapping("jobs") {
-                conform_jobs(&node, &string_keys(jobs), jobs, plan, counts)?;
-            }
         }
     }
     Ok(())
@@ -457,25 +457,26 @@ fn body_span(jobs: &Mapping, text: &str, key: &str) -> Option<(Range<usize>, usi
 /// Jobs this can't address are left to [`conform_jobs`], which also removes
 /// the ones no longer generated.
 fn conform_jobs_textually(
-    jobs: &Mapping,
+    region: &JobsRegion,
     text: &str,
-    job_keys: &[String],
-    current: &serde_yaml::Mapping,
     plan: &JobsPlan,
     counts: &mut Counts,
     edits: &mut Vec<(Range<usize>, String)>,
 ) -> Result<()> {
+    let Some(jobs) = &region.node else {
+        return Ok(());
+    };
     if jobs.is_flow_style() {
         return Ok(());
     }
-    for key in job_keys {
+    for key in &region.keys {
         if !plan.filter.managed(key) {
             continue;
         }
         let Some(canonical) = get(plan.canonical, key) else {
             continue;
         };
-        if get(current, key) == Some(canonical) {
+        if get(&region.values, key) == Some(canonical) {
             continue;
         }
         let Some((span, indent)) = body_span(jobs, text, key) else {
@@ -585,6 +586,24 @@ fn add_jobs_textually(
     Ok(())
 }
 
+/// The text phase of a merge, which is the same on every platform: the
+/// commented blocks live outside the YAML value tree, and conforming or
+/// adding a live job through the text is what keeps the blank lines and
+/// comments around it intact. Returns the replacements to apply; what the
+/// text can't address is left to [`conform_jobs`] on the tree afterwards.
+fn text_phase(
+    region: &JobsRegion,
+    existing: &str,
+    blocks: &[DisabledBlock],
+    plan: &JobsPlan,
+    counts: &mut Counts,
+) -> Result<Vec<(Range<usize>, String)>> {
+    let mut edits = block_edits(blocks, plan.canonical, counts)?;
+    conform_jobs_textually(region, existing, plan, counts, &mut edits)?;
+    add_jobs_textually(existing, region.node.as_ref(), plan, counts, &mut edits)?;
+    Ok(edits)
+}
+
 /// The planned jobs whose secrets the file's live pipeline will need: the
 /// managed jobs that end up active, plus unselected planned jobs the file
 /// already runs.
@@ -616,45 +635,31 @@ fn merge_github(
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
 
-    let original = parse.values()?;
-    let existing_jobs = existing_job_mapping(original, &file.path)?;
-    let existing_keys = string_keys(&existing_jobs);
-    let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
+    let region = JobsAt::JobsKey.resolve(parse, &file.path)?;
+    let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
 
     let canonical = serde_yaml::to_value(crate::platforms::github::lower::lower_github(
         &split.kept(),
         file.kind,
     ))?;
-    let canonical_jobs = &canonical_job_mapping(&canonical);
-
-    // Text phase: the commented blocks live outside the YAML value tree,
-    // and conforming a live job through the text is what keeps the blank
-    // lines and comments around it intact
+    let canonical_jobs = canonical_job_mapping(&canonical);
     let plan = JobsPlan {
-        canonical: canonical_jobs,
+        canonical: &canonical_jobs,
         adds: &split.adds,
         filter,
         path: &file.path,
     };
-    let mut edits = block_edits(&split.blocks, canonical_jobs, &mut counts)?;
-    let jobs_node = parse.root()?.get_mapping("jobs");
-    if let Some(node) = &jobs_node {
-        conform_jobs_textually(
-            node,
-            existing,
-            &existing_keys,
-            &existing_jobs,
-            &plan,
-            &mut counts,
-            &mut edits,
-        )?;
-    }
-    add_jobs_textually(existing, jobs_node.as_ref(), &plan, &mut counts, &mut edits)?;
+
+    let edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
     // Tree phase: whatever the text phase couldn't address, plus the
     // document's own scaffolding
     let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
-    conform_document(parse, JobsAt::JobsKey, &plan, &mut counts)?;
+    conform_jobs(
+        &JobsAt::JobsKey.resolve(parse, &file.path)?,
+        &plan,
+        &mut counts,
+    )?;
     let current_map = parse.values()?;
     let root = parse.root()?;
 
@@ -674,9 +679,10 @@ fn merge_github(
     if content == existing {
         return Ok(MergeOutcome::Unchanged);
     }
-    let live_jobs = existing_keys
+    let live_jobs = region
+        .keys
         .iter()
-        .filter(|k| !filter.managed(k) || get(canonical_jobs, k).is_some())
+        .filter(|k| !filter.managed(k) || get(&canonical_jobs, k).is_some())
         .count()
         + split.adds.len();
     if live_jobs == 0 && counts.disabled == 0 {
@@ -727,8 +733,8 @@ fn merge_gitlab(
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
-    let existing_keys = gitlab_job_keys(parse.values()?);
-    let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
+    let region = JobsAt::Root.resolve(parse, &file.path)?;
+    let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
 
     let canonical =
         serde_yaml::to_value(crate::platforms::gitlab::lower::lower_gitlab(&split.kept()))?;
@@ -742,22 +748,11 @@ fn merge_gitlab(
         filter,
         path: &file.path,
     };
-    let mut edits = block_edits(&split.blocks, canonical_map, &mut counts)?;
-    let root_node = parse.root()?;
-    conform_jobs_textually(
-        &root_node,
-        existing,
-        &existing_keys,
-        parse.values()?,
-        &plan,
-        &mut counts,
-        &mut edits,
-    )?;
-    add_jobs_textually(existing, Some(&root_node), &plan, &mut counts, &mut edits)?;
+    let edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
 
     let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
-    conform_document(parse, JobsAt::Root, &plan, &mut counts)?;
+    conform_jobs(&JobsAt::Root.resolve(parse, &file.path)?, &plan, &mut counts)?;
     let current_map = parse.values()?;
     let root = parse.root()?;
 
@@ -765,7 +760,7 @@ fn merge_gitlab(
     // cover the disabled jobs too, so a commented job's stage stays and
     // uncommenting it works without another update.
     let mut final_jobs: Vec<&Value> = Vec::new();
-    for key in &existing_keys {
+    for key in &region.keys {
         if filter.managed(key) {
             if let Some(canonical) = get(canonical_map, key) {
                 final_jobs.push(canonical);
@@ -835,7 +830,7 @@ fn merge_gitlab(
     }
 
     let mut content = parse.tree.to_string();
-    let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &existing_keys);
+    let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::GitLab, &header, &mut content);
 
     if content == existing {
@@ -1007,14 +1002,13 @@ fn merge_circleci(
     let mut counts = Counts::default();
 
     let original = parse.values()?;
-    let existing_jobs = existing_job_mapping(original, &file.path)?;
-    let existing_keys = string_keys(&existing_jobs);
-    let split = split_plan(&file.jobs, &existing_keys, scan.blocks, filter);
+    let region = JobsAt::JobsKey.resolve(parse, &file.path)?;
+    let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
 
     let canonical = serde_yaml::to_value(crate::platforms::circleci::lower::lower_circleci(
         &split.kept(),
     ))?;
-    let canonical_jobs = &canonical_job_mapping(&canonical);
+    let canonical_jobs = canonical_job_mapping(&canonical);
     let canonical_entries: Vec<Value> = canonical
         .get("workflows")
         .and_then(|w| w.get("main"))
@@ -1023,28 +1017,17 @@ fn merge_circleci(
         .cloned()
         .unwrap_or_default();
 
-    // Text phase: commented job blocks, plus commented workflow entries —
-    // kept in sync with the job's canonical invocations while it stays
-    // disabled, dropped when the job is no longer generated at all
     let plan = JobsPlan {
-        canonical: canonical_jobs,
+        canonical: &canonical_jobs,
         adds: &split.adds,
         filter,
         path: &file.path,
     };
-    let mut edits = block_edits(&split.blocks, canonical_jobs, &mut counts)?;
-    let jobs_node = parse.root()?.get_mapping("jobs");
-    if let Some(node) = &jobs_node {
-        conform_jobs_textually(
-            node,
-            existing,
-            &existing_keys,
-            &existing_jobs,
-            &plan,
-            &mut counts,
-            &mut edits,
-        )?;
-    }
+    let mut edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
+
+    // Commented workflow entries are text-only too: kept in sync with the
+    // job's canonical invocations while it stays disabled, dropped when the
+    // job is no longer generated at all
     for run in &scan.entries {
         // An id that isn't a disabled job makes this an ordinary comment
         if run.ids.iter().any(|id| !split.disabled_ids.contains(id)) {
@@ -1065,7 +1048,6 @@ fn merge_circleci(
         let rendered = serde_yaml::to_string(&Value::Sequence(expected))?;
         edits.push((run.span.clone(), disabled::comment_out(&rendered, run.indent)));
     }
-    add_jobs_textually(existing, jobs_node.as_ref(), &plan, &mut counts, &mut edits)?;
 
     // A job also appears as an entry in a workflow's `jobs` list — conform
     // or drop those entries to match, leaving custom entries alone. The
@@ -1153,7 +1135,11 @@ fn merge_circleci(
 
     let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
-    conform_document(parse, JobsAt::JobsKey, &plan, &mut counts)?;
+    conform_jobs(
+        &JobsAt::JobsKey.resolve(parse, &file.path)?,
+        &plan,
+        &mut counts,
+    )?;
     let root = parse.root()?;
 
     if let Some(workflows_node) = root.get_mapping("workflows") {
@@ -1185,7 +1171,7 @@ fn merge_circleci(
     }
 
     let mut content = parse.tree.to_string();
-    let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &existing_keys);
+    let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::CircleCI, &header, &mut content);
 
     if content == existing {
