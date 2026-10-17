@@ -37,6 +37,63 @@ pub enum MergeOutcome {
     Merged { content: String, counts: Counts },
 }
 
+/// Whether a merge has edited anything, and the only way it edits the
+/// syntax tree.
+///
+/// Re-running `update` on an up-to-date pipeline is the common case, and
+/// rendering the syntax tree back to text costs about as much as parsing it
+/// did — all of it wasted on a document nothing was done to. A merge that
+/// edited neither the text nor the tree can finish from the original text
+/// instead of rendering, because the tree it would render is still the
+/// lossless parse of that very text.
+///
+/// Every tree edit goes through here rather than straight at the node, so
+/// that "nothing was edited" cannot be a stale answer: a merge that grows a
+/// new edit has no way to make it without saying so.
+#[derive(Debug, Default, Clone, Copy)]
+struct Changes(bool);
+
+impl Changes {
+    /// Record that the text phase rewrote something
+    fn text(&mut self) {
+        self.0 = true;
+    }
+
+    fn set(&mut self, map: &Mapping, key: impl AsYaml, value: impl AsYaml) {
+        map.set(key, value);
+        self.0 = true;
+    }
+
+    fn insert_before(
+        &mut self,
+        map: &Mapping,
+        before_key: impl AsYaml,
+        key: impl AsYaml,
+        value: impl AsYaml,
+    ) {
+        map.insert_before(before_key, key, value);
+        self.0 = true;
+    }
+
+    /// Removing a key the mapping doesn't have changes nothing, and must not
+    /// count as an edit
+    fn remove(&mut self, map: &Mapping, key: impl AsYaml) {
+        if map.remove(key).is_some() {
+            self.0 = true;
+        }
+    }
+
+    /// The text to finish the merge with: the rendered tree when something
+    /// was edited, the original otherwise
+    fn render(self, tree: &YamlFile, existing: &str) -> String {
+        if self.0 {
+            tree.to_string()
+        } else {
+            existing.to_string()
+        }
+    }
+}
+
 /// How many jobs the merge did each thing to, for the command's summary line
 #[derive(Debug, Default)]
 pub struct Counts {
@@ -330,7 +387,15 @@ struct JobsPlan<'a> {
 /// replace the stale managed jobs the text phase couldn't address, drop the
 /// managed jobs that are no longer generated, and append the missing ones.
 /// The caller may keep editing the tree before rendering it.
-fn conform_jobs(region: &JobsRegion, plan: &JobsPlan, counts: &mut Counts) -> Result<()> {
+///
+/// Its tree edits go through `changes`, so a merge that changed nothing
+/// anywhere can skip rendering the tree (see [`Changes`]).
+fn conform_jobs(
+    region: &JobsRegion,
+    plan: &JobsPlan,
+    counts: &mut Counts,
+    changes: &mut Changes,
+) -> Result<()> {
     let Some(jobs) = &region.node else {
         return Ok(());
     };
@@ -354,12 +419,12 @@ fn conform_jobs(region: &JobsRegion, plan: &JobsPlan, counts: &mut Counts) -> Re
             Some(canonical) => {
                 guard()?;
                 let (_doc, node) = fragment(key, canonical)?;
-                jobs.set(key.as_str(), node);
+                changes.set(jobs, key.as_str(), node);
                 counts.conformed += 1;
             }
             None => {
                 guard()?;
-                jobs.remove(key.as_str());
+                changes.remove(jobs, key.as_str());
                 counts.removed += 1;
             }
         }
@@ -373,7 +438,7 @@ fn conform_jobs(region: &JobsRegion, plan: &JobsPlan, counts: &mut Counts) -> Re
         if let Some(canonical) = get(plan.canonical, id) {
             guard()?;
             let (_doc, node) = fragment(id, canonical)?;
-            jobs.set(id.as_str(), node);
+            changes.set(jobs, id.as_str(), node);
             counts.added += 1;
         }
     }
@@ -491,10 +556,15 @@ fn conform_jobs_textually(
 /// Apply the text phase's replacements, borrowing `text` unchanged when
 /// there are none — which is what tells the tree phase its parse is still
 /// good (see [`Parse::after_edits`]).
-fn apply_edits(text: &str, mut edits: Vec<(Range<usize>, String)>) -> Cow<'_, str> {
+fn apply_edits<'a>(
+    text: &'a str,
+    mut edits: Vec<(Range<usize>, String)>,
+    changes: &mut Changes,
+) -> Cow<'a, str> {
     if edits.is_empty() {
         return Cow::Borrowed(text);
     }
+    changes.text();
     edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     let mut out = text.to_string();
     for (range, replacement) in edits {
@@ -634,6 +704,7 @@ fn merge_github(
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
+    let mut changes = Changes::default();
 
     let region = JobsAt::JobsKey.resolve(parse, &file.path)?;
     let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
@@ -653,12 +724,13 @@ fn merge_github(
     let edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
     // Tree phase: whatever the text phase couldn't address, plus the
     // document's own scaffolding
-    let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
+    let edited = Parse::after_edits(apply_edits(existing, edits, &mut changes), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
     conform_jobs(
         &JobsAt::JobsKey.resolve(parse, &file.path)?,
         &plan,
         &mut counts,
+        &mut changes,
     )?;
     let current_map = parse.values()?;
     let root = parse.root()?;
@@ -671,11 +743,11 @@ fn merge_github(
         }
         if let Some(value) = canonical.get(key) {
             let (_doc, node) = fragment(key, value)?;
-            root.insert_before("jobs", key, node);
+            changes.insert_before(&root, "jobs", key, node);
         }
     }
 
-    let content = parse.tree.to_string();
+    let content = changes.render(&parse.tree, existing);
     if content == existing {
         return Ok(MergeOutcome::Unchanged);
     }
@@ -733,6 +805,7 @@ fn merge_gitlab(
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
+    let mut changes = Changes::default();
     let region = JobsAt::Root.resolve(parse, &file.path)?;
     let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
 
@@ -750,9 +823,14 @@ fn merge_gitlab(
     };
     let edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
 
-    let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
+    let edited = Parse::after_edits(apply_edits(existing, edits, &mut changes), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
-    conform_jobs(&JobsAt::Root.resolve(parse, &file.path)?, &plan, &mut counts)?;
+    conform_jobs(
+        &JobsAt::Root.resolve(parse, &file.path)?,
+        &plan,
+        &mut counts,
+        &mut changes,
+    )?;
     let current_map = parse.values()?;
     let root = parse.root()?;
 
@@ -797,12 +875,10 @@ fn merge_gitlab(
         }
     }
     if stages.is_empty() {
-        if get(current_map, "stages").is_some() {
-            root.remove("stages");
-        }
+        changes.remove(&root, "stages");
     } else if stages != existing_stages {
         let (_doc, node) = fragment("stages", &Value::Sequence(stages))?;
-        root.set("stages", node);
+        changes.set(&root, "stages", node);
     }
 
     // cibox used to hoist every job's environment into the top-level
@@ -817,19 +893,19 @@ fn merge_gitlab(
             for key in vars.keys() {
                 if hoisted.contains(key) {
                     if let Some(key) = key.as_str() {
-                        vars_node.remove(key);
+                        changes.remove(&vars_node, key);
                     }
                 } else {
                     remaining += 1;
                 }
             }
             if remaining == 0 {
-                root.remove("variables");
+                changes.remove(&root, "variables");
             }
         }
     }
 
-    let mut content = parse.tree.to_string();
+    let mut content = changes.render(&parse.tree, existing);
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::GitLab, &header, &mut content);
 
@@ -1000,6 +1076,7 @@ fn merge_circleci(
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
+    let mut changes = Changes::default();
 
     let original = parse.values()?;
     let region = JobsAt::JobsKey.resolve(parse, &file.path)?;
@@ -1133,23 +1210,24 @@ fn merge_circleci(
         }
     }
 
-    let edited = Parse::after_edits(apply_edits(existing, edits), &file.path)?;
+    let edited = Parse::after_edits(apply_edits(existing, edits, &mut changes), &file.path)?;
     let parse = edited.as_ref().unwrap_or(parse);
     conform_jobs(
         &JobsAt::JobsKey.resolve(parse, &file.path)?,
         &plan,
         &mut counts,
+        &mut changes,
     )?;
     let root = parse.root()?;
 
     if let Some(workflows_node) = root.get_mapping("workflows") {
         for name in &drop_workflows {
-            workflows_node.remove(name.as_str());
+            changes.remove(&workflows_node, name.as_str());
         }
         for (name, desired) in &wholesale {
             if let Some(workflow) = workflows_node.get_mapping(name) {
                 let (_doc, seq) = sequence_fragment(desired)?;
-                workflow.set("jobs", seq);
+                changes.set(&workflow, "jobs", seq);
             }
         }
     }
@@ -1159,18 +1237,18 @@ fn merge_circleci(
         match root.get_mapping("workflows") {
             Some(workflows_node) => {
                 let (_doc, node) = fragment("main", &Value::Mapping(main))?;
-                workflows_node.set("main", node);
+                changes.set(&workflows_node, "main", node);
             }
             None => {
                 let mut workflows = serde_yaml::Mapping::new();
                 workflows.insert(Value::from("main"), Value::Mapping(main));
                 let (_doc, node) = fragment("workflows", &Value::Mapping(workflows))?;
-                root.set("workflows", node);
+                changes.set(&root, "workflows", node);
             }
         }
     }
 
-    let mut content = parse.tree.to_string();
+    let mut content = changes.render(&parse.tree, existing);
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::CircleCI, &header, &mut content);
 
@@ -2190,6 +2268,150 @@ workflows:
         assert!(!content.contains("--old-flag"), "{}", content);
         assert!(content.contains("# rust-test:"), "{}", content);
         assert!(content.contains("# - rust-test"), "{}", content);
+        assert!(matches!(
+            merge_file(Platform::CircleCI, &file, &filter, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    /// The merges below each leave a file where the only thing out of date
+    /// is something no job's own lines can express — the workflow preamble,
+    /// GitLab's stage list or global variables, a CircleCI workflow — so
+    /// they are the merge's only edit, with no job rewrite alongside to
+    /// carry them. A merge that renders its output only once it has
+    /// something to render has to count every one of them.
+    #[test]
+    fn test_github_scaffolding_is_the_only_change_needed() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitHub, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        // A workflow from before cibox pinned the token down: current in
+        // every other respect
+        let canonical = render_file(Platform::GitHub, &file).unwrap();
+        let existing = canonical.replace("permissions:\n  contents: read\n", "");
+        assert!(!existing.contains("permissions:"), "fixture rot: {existing}");
+
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, &existing).unwrap());
+        assert_eq!(
+            (counts.conformed, counts.added, counts.removed),
+            (0, 0, 0),
+            "{content}"
+        );
+        assert!(content.contains("permissions:\n  contents: read\n"), "{content}");
+        assert!(matches!(
+            merge_file(Platform::GitHub, &file, &filter, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    /// A job body written inline has no lines of its own to rewrite, so the
+    /// text phase cannot address it and the tree phase is what conforms it
+    #[test]
+    fn test_github_inline_job_body_is_the_only_change_needed() {
+        let facts = cargo_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let selection: std::collections::BTreeSet<String> =
+            std::iter::once("rust-fmt".to_string()).collect();
+        let filter = JobFilter {
+            resolved: &resolved,
+            selection: Some(&selection),
+        };
+        let file = plan(&facts, &resolved, Platform::GitHub)
+            .unwrap()
+            .swap_remove(0);
+
+        let existing = "name: CI\non: [push]\npermissions:\n  contents: read\njobs:\n  \
+                        rust-fmt: {runs-on: ubuntu-latest, steps: [{run: echo stale}]}\n";
+        let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert_eq!(counts.conformed, 1, "{content}");
+        assert!(!content.contains("echo stale"), "{content}");
+        assert!(content.contains("cargo fmt"), "{content}");
+    }
+
+    #[test]
+    fn test_gitlab_stage_list_is_the_only_change_needed() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        // A stage left over from a job that is gone: no job references it,
+        // so declaring it only confuses the pipeline view
+        let canonical = render_file(Platform::GitLab, &file).unwrap();
+        let existing = canonical.replacen("stages:\n", "stages:\n- gone\n", 1);
+        assert!(existing.contains("- gone"), "fixture rot: {existing}");
+
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, &existing).unwrap());
+        assert!(!content.contains("- gone"), "{content}");
+        assert!(matches!(
+            merge_file(Platform::GitLab, &file, &filter, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn test_gitlab_hoisted_variables_are_the_only_change_needed() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        // The jobs already carry their own CARGO_HOME; the global copy is
+        // what an older cibox left behind, and it leaks onto every other job
+        let canonical = render_file(Platform::GitLab, &file).unwrap();
+        let existing = canonical.replacen("stages:\n", "variables:\n  CARGO_HOME: .cargo\nstages:\n", 1);
+
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, &existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        assert!(doc.get("variables").is_none(), "{content}");
+        assert_eq!(
+            doc["rust-test"]["variables"]["CARGO_HOME"].as_str(),
+            Some(".cargo"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn test_circleci_missing_workflow_is_the_only_change_needed() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::CircleCI, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        // Every job is current but nothing invokes any of them: without a
+        // workflow CircleCI runs none of this
+        let canonical = render_file(Platform::CircleCI, &file).unwrap();
+        let existing = canonical[..canonical.find("workflows:").unwrap()].to_string();
+
+        let (content, _) = merged(merge_file(Platform::CircleCI, &file, &filter, &existing).unwrap());
+        assert!(content.contains("workflows:"), "{content}");
+        for job in &file.jobs {
+            assert!(content.contains(&format!("- {}", job.id)), "{}: {content}", job.id);
+        }
+        assert!(matches!(
+            merge_file(Platform::CircleCI, &file, &filter, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn test_circleci_emptied_workflow_is_the_only_change_needed() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::CircleCI, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        // A workflow invoking only a job cibox no longer generates: left
+        // alone CircleCI rejects the config for the dangling reference
+        let canonical = render_file(Platform::CircleCI, &file).unwrap();
+        assert!(!canonical.contains("rust-msrv"), "fixture rot: {canonical}");
+        let existing = format!("{canonical}  stale-only:\n    jobs:\n    - rust-msrv\n");
+
+        let (content, _) = merged(merge_file(Platform::CircleCI, &file, &filter, &existing).unwrap());
+        assert!(!content.contains("stale-only"), "{content}");
+        assert!(!content.contains("rust-msrv"), "{content}");
         assert!(matches!(
             merge_file(Platform::CircleCI, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
