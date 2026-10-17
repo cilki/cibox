@@ -127,7 +127,7 @@ pub struct CiboxConfig {
 
 /// Override for a rule without knobs
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuleToggle {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,7 +136,7 @@ pub struct RuleToggle {
 
 /// Override for a test rule that supports a toolchain-version matrix
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VersionedRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,7 +149,7 @@ pub struct VersionedRule {
 
 /// Override for the docker-build rule: toggle plus image name
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,7 +170,7 @@ pub struct DockerRule {
 /// GitHub/Gitea the credentials are read from repository Secrets, falling
 /// back to Variables for values that needn't be secret (e.g. the username).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerReleaseRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,7 +205,7 @@ pub struct DockerReleaseRule {
 /// with makepkg and lints with namcap, regenerates .SRCINFO, and pushes —
 /// authenticating with the AUR_SSH_PRIVATE_KEY secret.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AurReleaseRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,7 +225,7 @@ pub struct AurReleaseRule {
 /// a cargo-ndk pre-build produces the JNI libraries first. The Android SDK
 /// is installed at job runtime into a cached directory inside the checkout.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AndroidBuildRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -630,6 +630,56 @@ mod tests {
         ] {
             let err = parse_config(old).unwrap_err();
             assert!(err.to_string().contains("top level"), "{old}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_unknown_knob_is_rejected() {
+        // A knob serde quietly dropped would leave `cibox validate` saying
+        // the file is fine while the pipeline ignores what was asked for
+        for (entry, typo, expected) in [
+            ("rust_fmt", "enable", "enabled"),
+            ("rust_test", "version", "versions"),
+            ("docker_build", "image", "image_name"),
+            ("docker_release", "readme_sync", "sync_readme"),
+            ("aur_release", "package", "packages"),
+            ("android_build", "dirs", "dir"),
+        ] {
+            let err = parse_config(&format!("({entry}: ({typo}: true))")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(typo), "{entry}.{typo}: {msg}");
+            assert!(msg.contains(expected), "{entry}.{typo}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_knob_of_another_rule_is_rejected() {
+        // image_name applies to both docker rules, which makes it tempting to
+        // assume platforms does too; and only the test rules take versions
+        for entry in ["docker_build", "docker_release"] {
+            let ok = parse_config(&format!(r#"({entry}: (image_name: "a/b"))"#));
+            assert!(ok.is_ok(), "{entry}: {:?}", ok.err());
+        }
+        assert!(parse_config("(docker_build: (platforms: [LinuxArm64]))").is_err());
+        assert!(parse_config(r#"(rust_fmt: (versions: ["nightly"]))"#).is_err());
+    }
+
+    #[test]
+    fn test_every_rule_entry_rejects_an_unknown_knob() {
+        // Guards against a new rule's override struct being added without
+        // deny_unknown_fields, which would silently swallow its own typos
+        let resolved = crate::rules::resolve(
+            &crate::detection::ProjectFacts::default(),
+            &CiboxConfig::default(),
+        );
+        for r in &resolved {
+            let entry = field_name(r.rule.id());
+            let err = parse_config(&format!("({entry}: (no_such_knob: true))"));
+            assert!(
+                err.is_err(),
+                "{entry} accepts an unknown knob; its override struct needs \
+                 deny_unknown_fields"
+            );
         }
     }
 
