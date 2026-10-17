@@ -5,7 +5,7 @@ pub mod infer;
 pub mod platform;
 pub mod ron_types;
 
-pub use infer::infer_platform;
+pub use infer::{infer_platform, platform_names, target_platforms, TargetSource};
 pub use platform::Platform;
 pub use ron_types::*;
 

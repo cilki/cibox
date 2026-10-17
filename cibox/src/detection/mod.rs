@@ -44,6 +44,9 @@ pub struct ProjectFacts {
     pub remote_host: Option<RemoteHost>,
     /// Platforms with existing CI configuration in the repository
     pub existing_ci: Vec<Platform>,
+    /// Platforms with at least one file cibox manages on disk (see
+    /// [`Platform::managed_paths`]) — what a flagless `cibox update` targets
+    pub managed_ci: Vec<Platform>,
     /// Directory basename, the last-resort default for image naming
     pub dir_name: String,
 }
@@ -71,6 +74,7 @@ pub fn gather_facts(path: &Path) -> ProjectFacts {
         repo_slug: git.repo_slug,
         remote_host: git.remote_host,
         existing_ci: existing_ci(path),
+        managed_ci: managed_ci(path),
         dir_name,
     }
 }
@@ -86,6 +90,15 @@ fn existing_ci(path: &Path) -> Vec<Platform> {
         }
     };
     Platform::all().into_iter().filter(|&p| present(p)).collect()
+}
+
+/// Platforms with a cibox-managed pipeline file in the repository. Unlike
+/// [`existing_ci`], other CI files (a hand-written `deploy.yml`) don't count.
+pub fn managed_ci(path: &Path) -> Vec<Platform> {
+    Platform::all()
+        .into_iter()
+        .filter(|p| p.managed_paths().iter().any(|f| path.join(f).is_file()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -108,6 +121,7 @@ mod tests {
         assert!(facts.android.is_none());
         assert!(!facts.is_git_repo);
         assert!(facts.existing_ci.is_empty());
+        assert!(facts.managed_ci.is_empty());
     }
 
     #[test]
@@ -140,5 +154,30 @@ mod tests {
         fs::write(dir.path().join(".gitlab-ci.yml"), "stages: []\n").unwrap();
         let facts = gather_facts(dir.path());
         assert_eq!(facts.existing_ci, vec![Platform::GitHub, Platform::GitLab]);
+    }
+
+    #[test]
+    fn test_managed_ci_counts_only_cibox_files() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        fs::write(
+            dir.path().join(".github/workflows/deploy.yml"),
+            "on: push\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".gitea/workflows")).unwrap();
+        fs::write(
+            dir.path().join(".gitea/workflows/release.yml"),
+            "on: push\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".gitlab-ci.yml"), "stages: []\n").unwrap();
+        let facts = gather_facts(dir.path());
+        // GitHub only has a workflow cibox doesn't manage
+        assert_eq!(facts.managed_ci, vec![Platform::Gitea, Platform::GitLab]);
+        assert_eq!(
+            facts.existing_ci,
+            vec![Platform::GitHub, Platform::Gitea, Platform::GitLab]
+        );
     }
 }

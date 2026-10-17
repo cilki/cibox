@@ -16,7 +16,7 @@ use crate::platforms::gitlab::lower::lower_gitlab;
 use crate::rules::{enabled_jobs, ResolvedRule};
 use anyhow::bail;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which jobs `update` may touch: ownership (per [`crate::rules::Rule::owns_job_id`])
 /// narrowed by an optional `--rule` selection.
@@ -96,21 +96,21 @@ pub fn plan(
 
     match platform {
         Platform::GitHub | Platform::Gitea => {
-            let workflow_dir = match platform {
-                Platform::GitHub => ".github/workflows",
-                _ => ".gitea/workflows",
-            };
+            let [ci_path, release_path]: [PathBuf; 2] = platform
+                .managed_paths()
+                .try_into()
+                .expect("GitHub/Gitea manage ci.yml and release.yml");
             let (release, ci): (Vec<Job>, Vec<Job>) =
                 jobs.into_iter().partition(|job| job.tags_only);
 
             Ok(vec![
                 PlannedFile {
-                    path: PathBuf::from(workflow_dir).join("ci.yml"),
+                    path: ci_path,
                     jobs: ci,
                     kind: WorkflowKind::Ci,
                 },
                 PlannedFile {
-                    path: PathBuf::from(workflow_dir).join("release.yml"),
+                    path: release_path,
                     jobs: release,
                     kind: WorkflowKind::Release,
                 },
@@ -199,6 +199,129 @@ pub(crate) fn reconcile_required_variables(platform: Platform, jobs: &[Job], con
     if let Some(line) = desired {
         content.insert_str(0, &line);
     }
+}
+
+/// What `cibox update` would do to one managed file
+#[derive(Debug)]
+pub struct FileUpdate {
+    /// Relative to the working directory
+    pub path: PathBuf,
+    /// The file's current content; `None` when it doesn't exist yet
+    pub existing: Option<String>,
+    pub change: FileChange,
+}
+
+#[derive(Debug)]
+pub enum FileChange {
+    /// Already matches byte for byte; left alone
+    Unchanged,
+    /// Merging would strip every active job; left alone (see
+    /// [`MergeOutcome::WouldEmpty`])
+    WouldEmpty,
+    /// Written with `content`. `counts` is `Some` for a merge into an
+    /// existing file, `None` when the file gets the full canonical output
+    /// (missing, empty, or `--force`).
+    Write {
+        content: String,
+        counts: Option<Counts>,
+    },
+}
+
+/// Decide what `cibox update` does to each planned file, without writing
+/// anything — the one place that decision is made, shared by the command and
+/// the editor's preview so the two can't drift apart.
+///
+/// A missing or empty file gets the full canonical content (as does
+/// `force`), narrowed to the jobs `filter` manages; a file with content is
+/// merged, so cibox-managed jobs are conformed, re-added, or pruned and
+/// everything the user did to it is kept. Files there is nothing to create
+/// for are left out of the result.
+pub fn pending_update(
+    working_dir: &Path,
+    platform: Platform,
+    planned: &[PlannedFile],
+    filter: &JobFilter,
+    force: bool,
+) -> Result<Vec<FileUpdate>> {
+    let mut updates = Vec::new();
+    for file in planned {
+        let existing = std::fs::read_to_string(working_dir.join(&file.path)).ok();
+        let change = match existing.as_deref() {
+            Some(text) if !force && !text.trim().is_empty() => {
+                match merge_file(platform, file, filter, text)? {
+                    MergeOutcome::Unchanged => FileChange::Unchanged,
+                    MergeOutcome::WouldEmpty => FileChange::WouldEmpty,
+                    MergeOutcome::Merged { content, counts } => FileChange::Write {
+                        content,
+                        counts: Some(counts),
+                    },
+                }
+            }
+            _ => {
+                let fresh = PlannedFile {
+                    jobs: managed_jobs(file, filter),
+                    ..file.clone()
+                };
+                if fresh.jobs.is_empty() {
+                    continue;
+                }
+                FileChange::Write {
+                    content: render_file(platform, &fresh)?,
+                    counts: None,
+                }
+            }
+        };
+        updates.push(FileUpdate {
+            path: file.path.clone(),
+            existing,
+            change,
+        });
+    }
+    Ok(updates)
+}
+
+/// The planned files of every target platform, in order.
+pub type Plans = Vec<(Platform, Vec<PlannedFile>)>;
+
+/// [`plan`] each of `platforms`. All of them are planned before anything is
+/// decided or written, so one platform refusing a job (e.g. a Windows runner
+/// on GitLab) stops the whole update rather than leaving it half applied.
+pub fn plan_all(
+    facts: &ProjectFacts,
+    resolved: &[ResolvedRule],
+    platforms: &[Platform],
+) -> Result<Plans> {
+    platforms
+        .iter()
+        .map(|&platform| {
+            let files = plan(facts, resolved, platform).map_err(|e| {
+                e.context(format!(
+                    "Failed to generate CI configuration for {platform}"
+                ))
+            })?;
+            Ok((platform, files))
+        })
+        .collect()
+}
+
+/// [`pending_update`] for every platform in `plans`, concatenated in order
+pub fn pending_updates(
+    working_dir: &Path,
+    plans: &Plans,
+    filter: &JobFilter,
+    force: bool,
+) -> Result<Vec<FileUpdate>> {
+    let mut updates = Vec::new();
+    for (platform, files) in plans {
+        updates.extend(pending_update(
+            working_dir,
+            *platform,
+            files,
+            filter,
+            force,
+        )?);
+    }
+    Ok(updates)
 }
 
 /// Generate all output files for one platform, skipping empty ones.

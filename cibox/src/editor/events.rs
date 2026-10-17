@@ -1,4 +1,4 @@
-use crate::editor::state::{EditorState, Platform};
+use crate::editor::state::{EditorState, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
@@ -20,14 +20,22 @@ pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
 
     // crossterm reports a chord as its bare key plus a modifier, so without
     // this every binding below answers to Ctrl/Alt + its letter as well:
-    // Ctrl+W wrote the pipeline files, Ctrl+D dropped a toolchain version,
-    // Ctrl+P opened the platform menu, and Ctrl/Alt + any letter was typed
-    // into the knob under edit and saved straight to cibox.ron. Shift is
-    // deliberately absent — `J`/`K` arrive carrying it.
+    // Ctrl+D dropped a toolchain version, Ctrl+Q quit, and Ctrl/Alt + any
+    // letter was typed into the knob under edit and saved straight to
+    // cibox.ron. Shift is deliberately absent — `?` arrives carrying it.
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
+        return;
+    }
+
+    // The help dialog swallows all input except '?'/Esc to close it, so a
+    // stray key can't act on the rules hidden behind it
+    if state.help_open {
+        if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+            state.help_open = false;
+        }
         return;
     }
 
@@ -43,86 +51,52 @@ pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
         return;
     }
 
-    // If platform menu is open, handle menu navigation
-    if state.platform_menu_open {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                state.close_platform_menu();
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if state.platform_menu_cursor > 0 {
-                    state.platform_menu_cursor -= 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if state.platform_menu_cursor < Platform::all().len() - 1 {
-                    state.platform_menu_cursor += 1;
-                }
-            }
-            KeyCode::Enter => {
-                state.select_platform_from_menu();
-            }
-            _ => {}
+    // Keys every panel answers to
+    match key.code {
+        KeyCode::Char('q') => {
+            state.should_quit = true;
+            return;
         }
-        return;
+        KeyCode::Char('?') => {
+            state.help_open = true;
+            return;
+        }
+        KeyCode::Tab => {
+            state.toggle_focus();
+            return;
+        }
+        _ => {}
     }
 
-    match key.code {
-        // Quit
-        KeyCode::Char('q') | KeyCode::Esc => {
-            state.should_quit = true;
-        }
+    match state.focus {
+        Focus::Rules => match key.code {
+            KeyCode::Esc => state.should_quit = true,
 
-        // Write CI pipeline files
-        KeyCode::Char('w') | KeyCode::Char('W') => {
-            state.should_write = true;
-        }
+            // Toggle the rule/option under the cursor, or edit a text knob
+            KeyCode::Enter | KeyCode::Char(' ') => state.activate_current(),
 
-        // Open platform menu
-        KeyCode::Char('p') => {
-            state.open_platform_menu();
-        }
+            // Expand/collapse a rule's config options
+            KeyCode::Right => state.expand_current(),
+            KeyCode::Left => state.collapse_current(),
 
-        // Toggle the rule/option under the cursor, or edit a text knob
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            state.activate_current();
-        }
+            // Remove the toolchain version under the cursor
+            KeyCode::Char('d') | KeyCode::Delete => state.delete_current_version(),
 
-        // Expand/collapse a rule's config options
-        KeyCode::Right | KeyCode::Char('l') => {
-            state.expand_current();
-        }
-        KeyCode::Left | KeyCode::Char('h') => {
-            state.collapse_current();
-        }
-
-        // Remove the toolchain version under the cursor
-        KeyCode::Char('d') | KeyCode::Delete => {
-            state.delete_current_version();
-        }
-
-        // Shift-J/K scroll the preview
-        KeyCode::Char('K') => {
-            state.scroll_preview_up();
-        }
-        KeyCode::Char('J') => {
-            state.scroll_preview_down();
-        }
-
-        // Up/down navigate the rule list
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.cursor = state.cursor.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.cursor = (state.cursor + 1).min(state.rows.len().saturating_sub(1));
-        }
-
-        // Tab cycles the platform (alternative to the 'p' menu)
-        KeyCode::Tab => {
-            state.cycle_platform();
-        }
-
-        _ => {}
+            KeyCode::Up => state.cursor = state.cursor.saturating_sub(1),
+            KeyCode::Down => {
+                state.cursor = (state.cursor + 1).min(state.rows.len().saturating_sub(1));
+            }
+            _ => {}
+        },
+        Focus::Preview => match key.code {
+            // Back out of the preview rather than out of the editor
+            KeyCode::Esc => state.focus = Focus::Rules,
+            KeyCode::Up => state.scroll_preview(-1),
+            KeyCode::Down => state.scroll_preview(1),
+            KeyCode::PageUp => state.scroll_preview(-state.preview_page()),
+            KeyCode::PageDown => state.scroll_preview(state.preview_page()),
+            _ => {}
+        },
     }
 }
 
@@ -146,9 +120,25 @@ mod tests {
         dir
     }
 
+    const CI_YML: &str = ".github/workflows/ci.yml";
+
+    /// [`project_dir`] with a stale GitHub pipeline on disk, so there is a
+    /// pending update for the preview to show
+    fn project_with_pipeline() -> tempfile::TempDir {
+        let dir = project_dir();
+        fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        fs::write(
+            dir.path().join(CI_YML),
+            "on: push\njobs:\n  rust-test:\n    runs-on: ubuntu-latest\n    steps:\n      \
+             - run: echo stale\n",
+        )
+        .unwrap();
+        dir
+    }
+
     fn state_for(dir: &std::path::Path) -> EditorState {
         let facts = crate::detection::gather_facts(dir);
-        EditorState::new(facts, None, dir.to_path_buf()).unwrap()
+        EditorState::new(facts, dir.to_path_buf()).unwrap()
     }
 
     fn press(state: &mut EditorState, code: KeyCode) {
@@ -170,7 +160,7 @@ mod tests {
     /// Put the cursor on docker-build's `image_name` row and start editing it
     fn start_editing_image_name(state: &mut EditorState) {
         state.cursor = rule_index(state, "docker-build");
-        press(state, KeyCode::Char('l'));
+        press(state, KeyCode::Right);
         state.cursor += 1;
         assert!(
             matches!(state.current_row(), Some(Row::TextKnob { .. })),
@@ -204,38 +194,120 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_c_quits_with_the_platform_menu_open() {
+    fn test_editor_never_writes_the_pipeline() {
+        // Pipelines are only written by `cibox update`; the keys that used
+        // to write them, or pick the platform to write, do nothing
+        let dir = project_with_pipeline();
+        let mut state = state_for(dir.path());
+        let before = fs::read_to_string(dir.path().join(CI_YML)).unwrap();
+        let platforms = state.platforms.clone();
+
+        for c in ['w', 'W', 'p'] {
+            press(&mut state, KeyCode::Char(c));
+        }
+        assert_eq!(fs::read_to_string(dir.path().join(CI_YML)).unwrap(), before);
+        assert!(!dir.path().join(".github/workflows/release.yml").exists());
+        assert_eq!(state.platforms, platforms);
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn test_vim_keys_are_unbound() {
+        let dir = project_with_pipeline();
+        let mut state = state_for(dir.path());
+        state.cursor = 1;
+        let rows = state.rows.len();
+
+        for c in ['h', 'j', 'k', 'l', 'J', 'K'] {
+            press(&mut state, KeyCode::Char(c));
+        }
+        assert_eq!(state.cursor, 1);
+        assert_eq!(state.rows.len(), rows, "nothing was expanded");
+        assert_eq!(state.preview_scroll, 0);
+    }
+
+    #[test]
+    fn test_tab_moves_focus_between_rules_and_preview() {
+        let dir = project_with_pipeline();
+        let mut state = state_for(dir.path());
+        assert!(state.preview_shown());
+        assert_eq!(state.focus, Focus::Rules);
+
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.focus, Focus::Preview);
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.focus, Focus::Rules);
+    }
+
+    #[test]
+    fn test_tab_does_not_focus_a_hidden_preview() {
+        // The pipeline on disk is already what update would write, so there
+        // is nothing to preview
         let dir = project_dir();
         let mut state = state_for(dir.path());
-        press(&mut state, KeyCode::Char('p'));
-        assert!(state.platform_menu_open);
+        let resolved = crate::rules::resolve(&state.facts, &state.config);
+        for (path, content) in
+            crate::generator::generate(&state.facts, &resolved, state.platforms[0]).unwrap()
+        {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        state.refresh();
+        assert!(!state.preview_shown());
 
-        chord(&mut state, KeyModifiers::CONTROL, 'c');
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.focus, Focus::Rules);
+    }
+
+    #[test]
+    fn test_esc_in_the_preview_returns_to_the_rules() {
+        let dir = project_with_pipeline();
+        let mut state = state_for(dir.path());
+        press(&mut state, KeyCode::Tab);
+
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.focus, Focus::Rules);
+        assert!(!state.should_quit);
+
+        // From the rules, Esc still quits
+        press(&mut state, KeyCode::Esc);
         assert!(state.should_quit);
     }
 
     #[test]
-    fn test_ctrl_w_does_not_write_the_pipeline() {
-        // ^W is "delete the last word" in readline and "close the tab" in a
-        // browser; neither should put files in the user's repository
-        let dir = project_dir();
+    fn test_arrows_scroll_the_focused_preview() {
+        let dir = project_with_pipeline();
         let mut state = state_for(dir.path());
-        chord(&mut state, KeyModifiers::CONTROL, 'w');
-        assert!(!state.should_write);
+        state.preview_viewport = (80, 5);
+        let cursor = state.cursor;
+        press(&mut state, KeyCode::Tab);
 
-        press(&mut state, KeyCode::Char('w'));
-        assert!(state.should_write);
-    }
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.preview_scroll, 2);
+        assert_eq!(state.cursor, cursor, "the rules cursor stays put");
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.preview_scroll, 1);
 
-    #[test]
-    fn test_ctrl_p_does_not_open_the_platform_menu() {
-        let dir = project_dir();
-        let mut state = state_for(dir.path());
-        chord(&mut state, KeyModifiers::CONTROL, 'p');
-        assert!(!state.platform_menu_open);
+        press(&mut state, KeyCode::PageDown);
+        assert_eq!(state.preview_scroll, 5);
+        press(&mut state, KeyCode::PageUp);
+        press(&mut state, KeyCode::PageUp);
+        assert_eq!(state.preview_scroll, 0, "never above the top");
 
-        press(&mut state, KeyCode::Char('p'));
-        assert!(state.platform_menu_open);
+        // Never past the end either: paging down stops somewhere
+        let mut max = state.preview_scroll;
+        loop {
+            press(&mut state, KeyCode::PageDown);
+            if state.preview_scroll == max {
+                break;
+            }
+            max = state.preview_scroll;
+        }
+        assert!(max > 5);
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.preview_scroll, max);
     }
 
     #[test]
@@ -248,7 +320,7 @@ mod tests {
         .unwrap();
         let mut state = state_for(dir.path());
         state.cursor = rule_index(&state, "rust-test");
-        press(&mut state, KeyCode::Char('l'));
+        press(&mut state, KeyCode::Right);
         state.cursor += 1;
         assert!(matches!(
             state.current_row(),
@@ -285,20 +357,66 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_still_reaches_the_preview_scroll_keys() {
-        // J/K arrive carrying SHIFT, so the chord filter must let it through
+    fn test_question_mark_toggles_help() {
         let dir = project_dir();
         let mut state = state_for(dir.path());
+        // Terminals report '?' carrying SHIFT
         handle_key_event(
             &mut state,
-            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
         );
-        assert_eq!(state.preview_scroll, 1);
+        assert!(state.help_open);
 
-        handle_key_event(
-            &mut state,
-            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT),
-        );
-        assert_eq!(state.preview_scroll, 0);
+        press(&mut state, KeyCode::Char('?'));
+        assert!(!state.help_open);
+    }
+
+    #[test]
+    fn test_esc_closes_help_without_quitting() {
+        let dir = project_dir();
+        let mut state = state_for(dir.path());
+        press(&mut state, KeyCode::Char('?'));
+
+        press(&mut state, KeyCode::Esc);
+        assert!(!state.help_open);
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn test_help_swallows_other_keys() {
+        let dir = project_dir();
+        let mut state = state_for(dir.path());
+        press(&mut state, KeyCode::Char('?'));
+        let cursor = state.cursor;
+
+        press(&mut state, KeyCode::Char('q'));
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Tab);
+        assert!(state.help_open);
+        assert!(!state.should_quit);
+        assert_eq!(state.focus, Focus::Rules);
+        assert_eq!(state.cursor, cursor);
+    }
+
+    #[test]
+    fn test_ctrl_c_quits_with_help_open() {
+        let dir = project_dir();
+        let mut state = state_for(dir.path());
+        press(&mut state, KeyCode::Char('?'));
+
+        chord(&mut state, KeyModifiers::CONTROL, 'c');
+        assert!(state.should_quit);
+    }
+
+    #[test]
+    fn test_question_mark_is_typed_into_a_knob() {
+        let dir = project_dir();
+        let mut state = state_for(dir.path());
+        start_editing_image_name(&mut state);
+        let buffer = state.input.clone().unwrap();
+
+        press(&mut state, KeyCode::Char('?'));
+        assert!(!state.help_open);
+        assert_eq!(state.input.as_deref(), Some(format!("{buffer}?").as_str()));
     }
 }

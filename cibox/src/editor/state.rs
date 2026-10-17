@@ -1,7 +1,8 @@
-use crate::config::{infer_platform, serialize_config, CiboxConfig, DockerPlatform};
+use crate::config::{serialize_config, target_platforms, CiboxConfig, DockerPlatform};
 use crate::detection::ProjectFacts;
 use crate::editor::ui::PreviewDiff;
 use crate::error::Result;
+use crate::generator::JobFilter;
 use crate::rules::{clean_versions, resolve};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -163,8 +164,11 @@ pub struct EditorState {
     /// keeps the file up to date even when the delta becomes empty again
     pub has_ron_file: bool,
 
-    pub inferred_platform: Platform,
-    pub platform: Platform,
+    /// The platforms a plain `cibox update` would target: every one with a
+    /// cibox-managed file on disk, or the inferred one when there is none
+    /// yet. Re-derived on every refresh, since an update run elsewhere can
+    /// create a file.
+    pub platforms: Vec<Platform>,
 
     // Rule checklist
     pub rows: Vec<Row>,
@@ -182,67 +186,56 @@ pub struct EditorState {
     pub input: Option<String>,
 
     // UI state
-    pub platform_menu_open: bool,
-    pub platform_menu_cursor: usize,
-    pub preview_scroll: u16,
-    pub yaml_preview: String,
-    pub existing_yaml: Option<String>,
-    /// What the preview panel draws: [`yaml_preview`](Self::yaml_preview)
-    /// diffed against [`existing_yaml`](Self::existing_yaml), kept here so a
-    /// redraw never has to compute it again
+    /// Which panel the arrow keys act on
+    pub focus: Focus,
+    /// Whether the keybindings dialog (opened with `?`) is showing
+    pub help_open: bool,
+    /// What the next `cibox update` would change in the pipeline files on
+    /// disk, kept here so a redraw never has to compute it again. Empty when
+    /// there is nothing to show, which hides the panel.
     pub preview: PreviewDiff,
+    /// Rows the preview is scrolled down by
+    pub preview_scroll: u16,
+    /// Inner (width, height) of the preview panel as last drawn, which
+    /// paging and the scroll limit are measured against; zero while hidden
+    pub preview_viewport: (u16, u16),
 
     // Exit flags
     pub should_quit: bool,
-    pub should_write: bool,
+}
+
+/// The panel keyboard navigation goes to
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Rules,
+    Preview,
 }
 
 impl EditorState {
-    pub fn new(
-        facts: ProjectFacts,
-        platform_arg: Option<String>,
-        working_dir: PathBuf,
-    ) -> Result<Self> {
-        use std::str::FromStr;
-
+    pub fn new(facts: ProjectFacts, working_dir: PathBuf) -> Result<Self> {
         let ron_path = working_dir.join("cibox.ron");
         let (config, has_ron_file) = match std::fs::read_to_string(&ron_path) {
             Ok(ron_str) => (crate::config::parse_config(&ron_str)?, true),
             Err(_) => (CiboxConfig::default(), false),
         };
 
-        let inferred_platform = infer_platform(&facts);
-        let platform = match platform_arg {
-            Some(p) => Platform::from_str(&p)
-                .map_err(|_| crate::error::unsupported_platform_error(&p))?,
-            None => inferred_platform,
-        };
-
-        let existing_yaml =
-            std::fs::read_to_string(working_dir.join(platform.output_path())).ok();
-
         let mut state = Self {
             facts,
             working_dir,
             config,
             has_ron_file,
-            inferred_platform,
-            platform,
+            platforms: Vec::new(),
             rows: Vec::new(),
             cursor: 0,
             expanded: HashSet::new(),
             input: None,
-            platform_menu_open: false,
-            platform_menu_cursor: Platform::all()
-                .iter()
-                .position(|&p| p == platform)
-                .unwrap_or(0),
-            preview_scroll: 0,
-            yaml_preview: String::new(),
-            existing_yaml,
+            focus: Focus::Rules,
+            help_open: false,
             preview: PreviewDiff::default(),
+            preview_scroll: 0,
+            preview_viewport: (0, 0),
             should_quit: false,
-            should_write: false,
         };
 
         state.refresh();
@@ -428,7 +421,9 @@ impl EditorState {
         }
     }
 
-    /// Re-resolve rules against the current config and regenerate the preview
+    /// Re-resolve rules against the current config and recompute what
+    /// `cibox update` would change. The pipeline files are re-read every time,
+    /// so an update run from another terminal shows up on the next edit.
     pub fn refresh(&mut self) {
         let resolved = resolve(&self.facts, &self.config);
         self.rows = Vec::new();
@@ -453,20 +448,55 @@ impl EditorState {
             self.cursor = self.rows.len().saturating_sub(1);
         }
 
-        self.preview_scroll = 0;
-        self.yaml_preview = match crate::generator::generate(&self.facts, &resolved, self.platform)
-        {
-            // A single file is previewed verbatim; several get path banners
-            Ok(outputs) if outputs.len() == 1 => outputs.into_iter().next().unwrap().1,
-            Ok(outputs) => outputs
-                .into_iter()
-                .map(|(path, content)| format!("# ==> {} <==\n{}", path.display(), content))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            // Nothing enabled, or the platform refuses a job: say so inline
-            Err(e) => format!("# {e}"),
+        // Exactly what a plain `cibox update` would decide: the platforms it
+        // would pick, every rule selected, merging rather than forcing
+        self.facts.managed_ci = crate::detection::managed_ci(&self.working_dir);
+        self.platforms = target_platforms(&self.facts, &[]).0;
+        let filter = JobFilter {
+            resolved: &resolved,
+            selection: None,
         };
-        self.preview = PreviewDiff::new(&self.yaml_preview, self.existing_yaml.as_deref());
+        let pending = crate::generator::plan_all(&self.facts, &resolved, &self.platforms)
+            .and_then(|plans| {
+                crate::generator::pending_updates(&self.working_dir, &plans, &filter, false)
+            });
+        self.preview = match pending {
+            Ok(updates) => PreviewDiff::from_updates(&updates),
+            // e.g. a pipeline file that isn't valid YAML: update would refuse
+            // too, and the reason is what the user needs to see
+            Err(e) => PreviewDiff::error(&format!("{e:#}")),
+        };
+        self.preview_scroll = 0;
+        if self.preview.is_empty() {
+            self.focus = Focus::Rules;
+        }
+    }
+
+    /// Whether there is anything for the preview panel to show
+    pub fn preview_shown(&self) -> bool {
+        !self.preview.is_empty()
+    }
+
+    /// Tab: move between the rules and the preview, which can only take
+    /// focus while it is shown
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Rules if self.preview_shown() => Focus::Preview,
+            _ => Focus::Rules,
+        };
+    }
+
+    /// Scroll the preview by `rows`, up when negative, never past its end
+    pub fn scroll_preview(&mut self, rows: i32) {
+        let (width, height) = self.preview_viewport;
+        let max = self.preview.max_scroll(width, height);
+        let scroll = i32::from(self.preview_scroll).saturating_add(rows);
+        self.preview_scroll = scroll.clamp(0, i32::from(max)) as u16;
+    }
+
+    /// One screenful of the preview, keeping a line of overlap
+    pub fn preview_page(&self) -> i32 {
+        i32::from(self.preview_viewport.1.saturating_sub(1).max(1))
     }
 
     pub fn current_row(&self) -> Option<&Row> {
@@ -654,39 +684,6 @@ impl EditorState {
         }
     }
 
-    pub fn cycle_platform(&mut self) {
-        let platforms = Platform::all();
-        let current_index = platforms
-            .iter()
-            .position(|&p| p == self.platform)
-            .unwrap_or(0);
-        self.switch_to_platform(platforms[(current_index + 1) % platforms.len()]);
-    }
-
-    /// Switch the target platform for this session; the choice is not
-    /// persisted — cibox.ron holds only rule overrides
-    pub fn switch_to_platform(&mut self, platform: Platform) {
-        self.platform = platform;
-        self.existing_yaml =
-            std::fs::read_to_string(self.working_dir.join(platform.output_path())).ok();
-        self.refresh();
-    }
-
-    pub fn open_platform_menu(&mut self) {
-        self.platform_menu_open = true;
-    }
-
-    pub fn close_platform_menu(&mut self) {
-        self.platform_menu_open = false;
-    }
-
-    pub fn select_platform_from_menu(&mut self) {
-        if let Some(&platform) = Platform::all().get(self.platform_menu_cursor) {
-            self.switch_to_platform(platform);
-        }
-        self.platform_menu_open = false;
-    }
-
     /// What the information bar says about the row under the cursor. Derived
     /// on demand: cached in a field it would have to be refreshed from every
     /// cursor move and every rebuild of the rows, and goes stale the moment
@@ -708,14 +705,6 @@ impl EditorState {
             ),
             None => String::new(),
         }
-    }
-
-    pub fn scroll_preview_up(&mut self) {
-        self.preview_scroll = self.preview_scroll.saturating_sub(1);
-    }
-
-    pub fn scroll_preview_down(&mut self) {
-        self.preview_scroll = self.preview_scroll.saturating_add(1);
     }
 
     /// Export the override config as a RON string
@@ -777,7 +766,25 @@ mod tests {
 
     fn state_for(dir: &std::path::Path) -> EditorState {
         let facts = crate::detection::gather_facts(dir);
-        EditorState::new(facts, None, dir.to_path_buf()).unwrap()
+        EditorState::new(facts, dir.to_path_buf()).unwrap()
+    }
+
+    /// Every file the state's rules generate, with path banners — what the
+    /// rules emit, independent of whether a pipeline exists on disk to diff
+    fn generated(state: &EditorState) -> String {
+        let resolved = resolve(&state.facts, &state.config);
+        let mut out = String::new();
+        for &platform in &state.platforms {
+            match crate::generator::generate(&state.facts, &resolved, platform) {
+                Ok(outputs) => {
+                    for (path, content) in outputs {
+                        out.push_str(&format!("# ==> {} <==\n{content}", path.display()));
+                    }
+                }
+                Err(e) => out.push_str(&format!("# {e}\n")),
+            }
+        }
+        out
     }
 
     fn rule_row<'a>(state: &'a EditorState, id: &str) -> &'a RuleRow {
@@ -815,7 +822,7 @@ mod tests {
         assert!(rule_row(&state, "rust-release").enabled);
         assert!(!rule_row(&state, "go-test").enabled);
         assert!(!rule_row(&state, "docker-build").enabled);
-        assert!(state.yaml_preview.contains("cargo test"));
+        assert!(generated(&state).contains("cargo test"));
     }
 
     #[test]
@@ -835,19 +842,6 @@ mod tests {
         // Toggling back removes the override entirely
         state.activate_current();
         assert!(state.config.is_default());
-    }
-
-    #[test]
-    fn test_platform_switch_is_session_only() {
-        let dir = rust_dir();
-        let mut state = state_for(dir.path());
-        assert_eq!(state.platform, Platform::GitHub);
-
-        // Switching platforms never touches cibox.ron — it only holds rules
-        state.switch_to_platform(Platform::GitLab);
-        assert_eq!(state.platform, Platform::GitLab);
-        assert!(state.config.is_default());
-        assert!(!dir.path().join("cibox.ron").exists());
     }
 
     #[test]
@@ -874,13 +868,13 @@ mod tests {
     }
 
     #[test]
-    fn test_preview_shows_merged_pipeline_for_multiple_environments() {
+    fn test_rules_generate_for_multiple_environments() {
         let dir = docker_dir();
         let state = state_for(dir.path());
-        // GitHub preview concatenates ci.yml and release.yml
-        assert!(state.yaml_preview.contains("cargo test"), "{}", state.yaml_preview);
-        assert!(state.yaml_preview.contains("docker build"), "{}", state.yaml_preview);
-        assert!(state.yaml_preview.contains("release.yml"), "{}", state.yaml_preview);
+        // GitHub splits the jobs over ci.yml and release.yml
+        assert!(generated(&state).contains("cargo test"), "{}", generated(&state));
+        assert!(generated(&state).contains("docker build"), "{}", generated(&state));
+        assert!(generated(&state).contains("release.yml"), "{}", generated(&state));
     }
 
     #[test]
@@ -954,7 +948,7 @@ mod tests {
         ));
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         assert!(ron_str.contains("sync_readme"), "{ron_str}");
-        assert!(state.yaml_preview.contains("docker-pushrm"), "{}", state.yaml_preview);
+        assert!(generated(&state).contains("docker-pushrm"), "{}", generated(&state));
 
         // Toggling back off matches the default, so the override disappears
         state.activate_current();
@@ -997,7 +991,7 @@ mod tests {
             state.input_push(c);
         }
         state.commit_input();
-        assert!(state.yaml_preview.contains("matrix"), "{}", state.yaml_preview);
+        assert!(generated(&state).contains("matrix"), "{}", generated(&state));
 
         // cibox.ron stays delta-only
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
@@ -1082,7 +1076,7 @@ mod tests {
         );
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         assert!(ron_str.contains("LinuxArm64"), "{ron_str}");
-        assert!(state.yaml_preview.contains("buildx"), "{}", state.yaml_preview);
+        assert!(generated(&state).contains("buildx"), "{}", generated(&state));
 
         // Unselecting everything removes the key entirely
         toggle(&mut state, DockerPlatform::LinuxArm64);
@@ -1121,7 +1115,7 @@ mod tests {
             state.config.docker_build.image_name.as_deref(),
             Some("fossable/cibox")
         );
-        assert!(state.yaml_preview.contains("fossable/cibox"));
+        assert!(generated(&state).contains("fossable/cibox"));
 
         // Committing the facts default clears the override
         state.cursor = rule_index(&state, "docker-build") + 1;
@@ -1168,7 +1162,7 @@ mod tests {
         );
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         crate::config::parse_config(&ron_str).unwrap();
-        assert!(state.yaml_preview.contains("aur-release-foo"), "{}", state.yaml_preview);
+        assert!(generated(&state).contains("aur-release-foo"), "{}", generated(&state));
 
         // Committing the facts default (or nothing) clears the override
         let default = state.default_aur_packages().join(", ");
@@ -1263,7 +1257,7 @@ mod tests {
         // What the editor saves has to be something it can read back
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         crate::config::parse_config(&ron_str).unwrap();
-        assert!(state.yaml_preview.contains("android-build"), "{}", state.yaml_preview);
+        assert!(generated(&state).contains("android-build"), "{}", generated(&state));
     }
 
     /// Committing the value a knob row already shows has to leave the config
@@ -1398,6 +1392,6 @@ mod tests {
         // What the editor saves has to be something it can read back
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         crate::config::parse_config(&ron_str).unwrap();
-        assert!(!state.yaml_preview.contains("; id"), "{}", state.yaml_preview);
+        assert!(!generated(&state).contains("; id"), "{}", generated(&state));
     }
 }

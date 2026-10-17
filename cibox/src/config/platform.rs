@@ -40,6 +40,20 @@ impl Platform {
         }
     }
 
+    /// Every file cibox manages for this platform. GitHub/Gitea split
+    /// branch/PR jobs (`ci.yml`) from tag-only jobs (`release.yml`); the
+    /// other platforms keep everything in one file.
+    pub fn managed_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Platform::GitHub | Platform::Gitea => {
+                let dir = self.output_path();
+                let dir = dir.parent().expect("workflow files live in a directory");
+                vec![dir.join("ci.yml"), dir.join("release.yml")]
+            }
+            Platform::GitLab | Platform::CircleCI => vec![self.output_path()],
+        }
+    }
+
     pub fn output_path(&self) -> PathBuf {
         match self {
             Platform::GitHub => PathBuf::from(".github/workflows/ci.yml"),

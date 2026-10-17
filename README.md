@@ -47,14 +47,18 @@ install outputs, and `android-build` the release APK.
 Running `cibox update` in a project with no configuration at all produces a
 working pipeline: detection picks the rules and the target platform is inferred
 from existing CI configuration, then from your git remote's host, falling back
-to GitHub Actions. Pass `--platform` to choose explicitly.
+to GitHub Actions. After that, a plain `cibox update` refreshes every platform
+that has a cibox-managed file (listed below) on disk, and creates nothing for
+the others. Pass `--github`, `--gitea`, `--gitlab` or `--circleci` to choose
+the platforms explicitly, in any combination.
 
 ```
-$ cibox                           # interactive TUI to toggle rules
-$ cibox detect                    # show project facts and which rules fired
-$ cibox validate                  # check cibox.ron and print the resolved rules
-$ cibox update                    # write or refresh the pipeline files
-$ cibox update --platform gitlab  # generate for a specific platform
+$ cibox                             # interactive TUI to toggle rules
+$ cibox detect                      # show project facts and which rules fired
+$ cibox validate                    # check cibox.ron and print the resolved rules
+$ cibox update                      # write or refresh the pipeline files
+$ cibox update --gitlab             # generate for a specific platform
+$ cibox update --github --gitlab    # ...or for several at once
 ```
 
 The files cibox manages, per platform:
@@ -71,8 +75,7 @@ Merging happens on a lossless YAML tree, so your comments, formatting, and key
 order survive. It conforms the jobs cibox manages to its current output, re-adds
 managed jobs that are missing, removes managed jobs whose rule you disabled, and
 leaves everything else alone: jobs you added are kept untouched. Pass `--force`
-to rewrite the files from scratch instead — as the TUI does when it writes, see
-[Interactive editor](#interactive-editor).
+to rewrite the files from scratch instead.
 
 To keep a managed job out of the pipeline without losing it, comment its block
 out. `update` leaves the block commented but keeps regenerating its content
@@ -145,8 +148,8 @@ needed until you want to change something. Each rule has an `enabled` switch
 
 Omitted rules follow detection; an omitted `enabled` leaves detection in charge
 while still applying the knobs. The target platform is not part of the file —
-`cibox update` can generate for any platform, so pass `--platform` or let cibox
-infer it.
+`cibox update` can generate for any platform, so pass `--github`, `--gitlab`,
+etc., or let cibox use the pipelines already on disk.
 
 `image_name` has to be a valid docker reference, because it ends up as a literal
 argument to `docker build -t`: lowercase alphanumerics separated by `.`, `-` or
@@ -247,20 +250,23 @@ language-servers = ["cibox-lsp"]
 ## Interactive editor
 
 `cibox` with no arguments opens the TUI — `cibox editor --dir <path>` for a
-project somewhere else. Rules are on the left, the pipeline they generate on the
-right, with the lines that differ from the file already on disk highlighted.
+project somewhere else. Rules are on the left. On the right is a preview of
+what the next `cibox update` would change in the pipeline files on disk, as
+diff hunks per file. Files `update` would create are shown whole, so in a
+repository without CI config yet the preview is the entire pipeline. The preview
+is hidden when `update` would change nothing.
 
-| Key              | Action                                                            |
-| ---------------- | ----------------------------------------------------------------- |
-| `↑`/`↓`, `k`/`j` | move through the rules                                            |
-| `Space`/`Enter`  | toggle the rule under the cursor, or edit the knob                |
-| `→`/`l`, `←`/`h` | show or hide a rule's knobs (the docker and test rules have them) |
-| `d`/`Del`        | drop the toolchain version under the cursor                       |
-| `K`/`J`          | scroll the preview                                                |
-| `p`              | pick the target platform (`Tab` cycles to the next one)           |
-| `w`              | write the pipeline files                                          |
-| `q`/`Esc`        | quit                                                              |
-| `Ctrl+C`         | quit from anywhere, including mid-edit                            |
+| Key               | Action                                                            |
+| ----------------- | ----------------------------------------------------------------- |
+| `↑`/`↓`           | move through the rules, or scroll the preview when it has focus   |
+| `PgUp`/`PgDn`     | scroll the preview a page                                         |
+| `Space`/`Enter`   | toggle the rule under the cursor, or edit the knob                |
+| `→`/`←`           | show or hide a rule's knobs (the docker and test rules have them) |
+| `d`/`Del`         | drop the toolchain version under the cursor                       |
+| `Tab`             | move focus between the rules and the preview                      |
+| `?`               | show the keybindings                                              |
+| `q`/`Esc`         | quit (`Esc` in the preview returns to the rules)                  |
+| `Ctrl+C`          | quit from anywhere, including mid-edit                            |
 
 Expanding `docker-build`/`docker-release` shows the image name and the target
 platforms, `aur-release` its comma-separated package list, and `android-build`
@@ -270,10 +276,10 @@ toolchain version and `d` removes the one under the cursor.
 
 Toggling a rule or changing a knob saves `cibox.ron` right away — there is no
 separate save key for it, and the file stays delta-only, so flipping a rule back
-to what detection says drops it from the file again. The platform you pick
-applies to the preview and to `w` for this session only; it is never recorded in
-`cibox.ron`, which holds nothing but rule overrides.
+to what detection says drops it from the file again.
 
-`w` writes each file from scratch, the way `cibox update --force` does: jobs you
-added to a generated file by hand are dropped, along with your comments and
-formatting. Quit and run `cibox update` instead to keep those edits.
+The editor never writes the pipeline files themselves; run `cibox update` to
+apply what the preview shows. The preview targets the platforms a plain
+`cibox update` would (every one with a cibox pipeline on disk, or the inferred
+one) and merges the same way, so jobs you added by hand never show up as
+removed.

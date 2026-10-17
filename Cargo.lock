@@ -335,6 +335,7 @@ dependencies = [
  "crossterm",
  "predicates",
  "ratatui",
+ "ratatui-image",
  "ron",
  "roniker",
  "serde",

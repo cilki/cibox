@@ -44,12 +44,12 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Update {
             config,
-            platform,
+            targets,
             force,
             rules,
-        }) => cibox::cli::commands::handle_update(&config, platform, force, &rules),
+        }) => cibox::cli::commands::handle_update(&config, &targets.selected(), force, &rules),
         Some(Commands::Validate { config }) => cibox::cli::commands::handle_validate(&config),
-        Some(Commands::Editor { dir }) => cibox::editor::run_with_args(&dir, None),
+        Some(Commands::Editor { dir }) => cibox::editor::run_with_args(&dir),
         Some(Commands::Detect { dir }) => cibox::cli::commands::handle_detect(&dir),
         Some(Commands::Lsp) => {
             let analyzer: roniker::RustAnalyzer = serde_json::from_str(include_str!(concat!(
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         }
         _ => {
             // Default to editor if no command specified
-            cibox::editor::run_with_args(".", None)
+            cibox::editor::run_with_args(".")
         }
     }
 }

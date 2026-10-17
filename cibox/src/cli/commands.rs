@@ -1,11 +1,11 @@
-use crate::config::{infer_platform, parse_config, CiboxConfig, Platform};
-use crate::detection::{gather_facts, ProjectFacts};
+use crate::config::{parse_config, platform_names, target_platforms, CiboxConfig, Platform};
+use crate::detection::gather_facts;
 use crate::error::Result;
+use crate::generator::FileChange;
 use crate::rules::{resolve, ResolvedRule};
 use anyhow::Context;
 use colored::Colorize;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 /// Load cibox.ron if present. A missing file at the default path is fine —
 /// detection supplies everything; an explicitly named missing file is an error.
@@ -23,14 +23,6 @@ fn load_config(config_path: &str, explicit_required: bool) -> Result<CiboxConfig
         }
         Err(e) => Err(e).with_context(|| format!("Failed to read config file: {config_path}")),
     }
-}
-
-/// CLI flag > inference from the repository
-fn effective_platform(platform_arg: Option<String>, facts: &ProjectFacts) -> Result<Platform> {
-    if let Some(p) = platform_arg {
-        return Platform::from_str(&p).map_err(|_| crate::error::unsupported_platform_error(&p));
-    }
-    Ok(infer_platform(facts))
 }
 
 fn print_rule_table(resolved: &[ResolvedRule]) {
@@ -58,14 +50,14 @@ fn print_rule_table(resolved: &[ResolvedRule]) {
 /// Handle the update command
 pub fn handle_update(
     config_path: &str,
-    platform_arg: Option<String>,
+    requested: &[Platform],
     force: bool,
     rules: &[String],
 ) -> Result<()> {
     let working_dir = PathBuf::from(".");
     let facts = gather_facts(&working_dir);
     let config = load_config(config_path, config_path != "cibox.ron")?;
-    let platform = effective_platform(platform_arg, &facts)?;
+    let (platforms, _) = target_platforms(&facts, requested);
     let resolved = resolve(&facts, &config);
 
     // `--rule` must be validated by hand: nothing else rejects an unknown id
@@ -84,85 +76,75 @@ pub fn handle_update(
         "{} {} for {}",
         "Updating".cyan().bold(),
         "CI configuration".normal(),
-        platform.name().yellow()
+        platform_names(&platforms).yellow()
     );
     print_rule_table(&resolved);
 
-    let planned = crate::generator::plan(&facts, &resolved, platform)
-        .with_context(|| format!("Failed to generate CI configuration for {platform}"))?;
+    let plans = crate::generator::plan_all(&facts, &resolved, &platforms)?;
+    let planned = || plans.iter().flat_map(|(_, files)| files);
 
     // With nothing enabled there is still work to do as long as a managed file
     // exists: its cibox jobs are stale and get pruned below. Only when there is
-    // neither anything to write nor anything to prune is the empty resolution a
-    // mistake worth reporting.
+    // neither anything to write nor anything to prune, on any target platform,
+    // is the empty resolution a mistake worth reporting.
     let prunable = !force
-        && planned.iter().any(|file| {
+        && planned().any(|file| {
             std::fs::read_to_string(working_dir.join(&file.path))
                 .is_ok_and(|text| !text.trim().is_empty())
         });
-    if planned
-        .iter()
-        .all(|file| crate::generator::managed_jobs(file, &filter).is_empty())
-        && !prunable
-    {
+    if planned().all(|file| crate::generator::managed_jobs(file, &filter).is_empty()) && !prunable {
         anyhow::bail!("{}", crate::generator::NOTHING_ENABLED);
     }
 
-    println!();
-    for file in planned {
-        let output_path = working_dir.join(&file.path);
-        let path_label = output_path.display().to_string().yellow();
-        let existing = std::fs::read_to_string(&output_path).ok();
+    // Every file's fate is decided before the first one is written, so a
+    // file update refuses to merge leaves the others untouched too
+    let updates = crate::generator::pending_updates(&working_dir, &plans, &filter, force)?;
 
-        // A missing or empty file gets the full canonical content (as does
-        // --force), narrowed to the selected rules under --rule; a file with
-        // content is merged: cibox-managed jobs are conformed, re-added, or
-        // pruned, and everything the user did to it is kept
-        let content = match existing {
-            Some(text) if !force && !text.trim().is_empty() => {
-                match crate::generator::merge_file(platform, &file, &filter, &text)? {
-                    crate::generator::MergeOutcome::Unchanged => {
-                        println!("  {} {} unchanged", "○".dimmed(), path_label);
-                        continue;
-                    }
-                    crate::generator::MergeOutcome::WouldEmpty => {
-                        println!(
-                            "  {} {} would be left without jobs — remove it yourself if unwanted",
-                            "!".yellow().bold(),
-                            path_label
-                        );
-                        continue;
-                    }
-                    crate::generator::MergeOutcome::Merged { content, counts } => {
-                        let mut parts = vec![format!("{} updated", counts.conformed)];
-                        if counts.added > 0 {
-                            parts.push(format!("{} added", counts.added));
-                        }
-                        parts.push(format!("{} removed", counts.removed));
-                        if counts.disabled > 0 {
-                            parts.push(format!("{} disabled", counts.disabled));
-                        }
-                        parts.push(format!("{} kept", counts.preserved));
-                        println!(
-                            "  {} {} ({})",
-                            "✓".green().bold(),
-                            path_label,
-                            parts.join(", ")
-                        );
-                        content
-                    }
-                }
+    println!();
+    for update in updates {
+        let output_path = working_dir.join(&update.path);
+        let path_label = output_path.display().to_string().yellow();
+
+        let content = match update.change {
+            FileChange::Unchanged => {
+                println!("  {} {} unchanged", "○".dimmed(), path_label);
+                continue;
             }
-            _ => {
-                let fresh = crate::generator::PlannedFile {
-                    jobs: crate::generator::managed_jobs(&file, &filter),
-                    ..file.clone()
-                };
-                if fresh.jobs.is_empty() {
-                    continue;
+            FileChange::WouldEmpty => {
+                println!(
+                    "  {} {} would be left without jobs — remove it yourself if unwanted",
+                    "!".yellow().bold(),
+                    path_label
+                );
+                continue;
+            }
+            FileChange::Write {
+                content,
+                counts: Some(counts),
+            } => {
+                let mut parts = vec![format!("{} updated", counts.conformed)];
+                if counts.added > 0 {
+                    parts.push(format!("{} added", counts.added));
                 }
+                parts.push(format!("{} removed", counts.removed));
+                if counts.disabled > 0 {
+                    parts.push(format!("{} disabled", counts.disabled));
+                }
+                parts.push(format!("{} kept", counts.preserved));
+                println!(
+                    "  {} {} ({})",
+                    "✓".green().bold(),
+                    path_label,
+                    parts.join(", ")
+                );
+                content
+            }
+            FileChange::Write {
+                content,
+                counts: None,
+            } => {
                 println!("  {} {}", "✓".green().bold(), path_label);
-                crate::generator::render_file(platform, &fresh)?
+                content
             }
         };
 
@@ -194,8 +176,12 @@ pub fn handle_validate(config_path: &str) -> Result<()> {
     println!("\n{}", "Configuration is valid!".green().bold());
 
     let facts = gather_facts(Path::new("."));
-    let platform = infer_platform(&facts);
-    println!("  Platform: {} (inferred)", platform.name().yellow());
+    let (platforms, source) = target_platforms(&facts, &[]);
+    println!(
+        "  Target platforms: {} ({})",
+        platform_names(&platforms).yellow(),
+        source.describe()
+    );
     println!("  Rules:");
     print_rule_table(&resolve(&facts, &config));
 
@@ -270,10 +256,12 @@ pub fn handle_detect(dir: &str) -> Result<()> {
     }
 
     println!();
+    let (platforms, source) = target_platforms(&facts, &[]);
     println!(
-        "{} {}",
-        "Inferred platform:".cyan().bold(),
-        infer_platform(&facts).name().yellow()
+        "{} {} ({})",
+        "Target platforms:".cyan().bold(),
+        platform_names(&platforms).yellow(),
+        source.describe()
     );
 
     println!();

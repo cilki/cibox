@@ -20,11 +20,21 @@ fn project() -> tempfile::TempDir {
 }
 
 fn update(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("cibox").unwrap();
-    cmd.current_dir(dir)
-        .args(["update", "--platform", "github"]);
+    let mut cmd = bare_update(dir);
+    cmd.arg("--github");
     cmd
 }
+
+/// `cibox update` with no platform flag
+fn bare_update(dir: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("cibox").unwrap();
+    cmd.current_dir(dir).arg("update");
+    cmd
+}
+
+const CI_YML: &str = ".github/workflows/ci.yml";
+const RELEASE_YML: &str = ".github/workflows/release.yml";
+const GITLAB_YML: &str = ".gitlab-ci.yml";
 
 fn read_yaml(path: &Path) -> Value {
     serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
@@ -389,4 +399,129 @@ fn test_generate_subcommand_is_gone() {
         .arg("generate")
         .assert()
         .failure();
+}
+
+#[test]
+fn test_platform_flag_is_gone() {
+    let dir = project();
+    bare_update(dir.path())
+        .args(["--platform", "github"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--platform"));
+    assert!(!dir.path().join(CI_YML).exists());
+}
+
+#[test]
+fn test_platform_flags_combine() {
+    let dir = project();
+    bare_update(dir.path())
+        .args(["--github", "--gitlab"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GitHub Actions, GitLab CI"));
+    assert!(dir.path().join(CI_YML).is_file());
+    assert!(dir.path().join(RELEASE_YML).is_file());
+    assert!(dir.path().join(GITLAB_YML).is_file());
+    assert!(!dir.path().join(".circleci").exists());
+    assert!(!dir.path().join(".gitea").exists());
+}
+
+/// Without flags, update refreshes every platform cibox already manages
+/// and creates nothing for the others
+#[test]
+fn test_no_flags_updates_every_existing_pipeline() {
+    let dir = project();
+    bare_update(dir.path())
+        .args(["--github", "--gitlab"])
+        .assert()
+        .success();
+
+    // Both go stale: rust-test's command changes in each file
+    let stale = |path: &Path| {
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("cargo test"), "{content}");
+        fs::write(path, content.replace("cargo test", "cargo stale")).unwrap();
+    };
+    stale(&dir.path().join(CI_YML));
+    stale(&dir.path().join(GITLAB_YML));
+
+    bare_update(dir.path()).assert().success();
+    for path in [CI_YML, GITLAB_YML] {
+        let content = fs::read_to_string(dir.path().join(path)).unwrap();
+        assert!(!content.contains("cargo stale"), "{path}: {content}");
+    }
+    assert!(!dir.path().join(".circleci").exists());
+    assert!(!dir.path().join(".gitea").exists());
+}
+
+/// Only one of a platform's managed files has to exist for it to count
+#[test]
+fn test_no_flags_completes_a_partially_present_platform() {
+    let dir = project();
+    fs::create_dir_all(dir.path().join(".gitea/workflows")).unwrap();
+    fs::write(
+        dir.path().join(".gitea/workflows/release.yml"),
+        "on: push\njobs:\n  mine:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo mine\n",
+    )
+    .unwrap();
+
+    bare_update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Gitea Actions"));
+    assert!(dir.path().join(".gitea/workflows/ci.yml").is_file());
+    assert!(!dir.path().join(".github").exists(), "nothing for GitHub");
+}
+
+/// With nothing on disk, update falls back to the inferred platform
+#[test]
+fn test_no_flags_and_no_pipeline_falls_back_to_inference() {
+    let dir = project();
+    bare_update(dir.path()).assert().success();
+    assert!(dir.path().join(CI_YML).is_file(), "GitHub is the default");
+    assert!(!dir.path().join(GITLAB_YML).exists());
+}
+
+/// A workflow cibox doesn't manage is not a cibox pipeline: next to a real
+/// one for GitLab, a hand-written GitHub deploy.yml doesn't make GitHub a
+/// target too
+#[test]
+fn test_hand_written_workflow_is_not_a_managed_pipeline() {
+    let dir = project();
+    bare_update(dir.path()).arg("--gitlab").assert().success();
+    fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+    let deploy = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      \
+                  - run: echo deploy\n";
+    fs::write(dir.path().join(".github/workflows/deploy.yml"), deploy).unwrap();
+
+    bare_update(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GitHub").not());
+    assert!(!dir.path().join(CI_YML).exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".github/workflows/deploy.yml")).unwrap(),
+        deploy
+    );
+}
+
+/// A platform that can't take the jobs stops the whole update before any
+/// platform is written
+#[test]
+fn test_one_unplannable_platform_writes_nothing() {
+    let dir = project();
+    fs::write(
+        dir.path().join("cibox.ron"),
+        "(docker_release: (platforms: [WindowsAmd64]))",
+    )
+    .unwrap();
+
+    bare_update(dir.path())
+        .args(["--github", "--gitlab"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Windows runner"));
+    assert!(!dir.path().join(".github").exists());
+    assert!(!dir.path().join(GITLAB_YML).exists());
 }

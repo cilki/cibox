@@ -21,7 +21,9 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
 - `cibox/src/config/ron_types.rs` defines the `cibox.ron` schema: delta-only
   rule overrides at the top level, nix-services style
   (`rule_name: (enabled: bool, ...knobs)`). The platform is not configured
-  there — it comes from `--platform` or inference. These types must stay
+  there — `config::target_platforms` takes the `--github`/`--gitea`/
+  `--gitlab`/`--circleci` flags, else every platform with a cibox-managed
+  file on disk (`Platform::managed_paths`), else inference. These types must stay
   hand-written literals — `build.rs` feeds this file to roniker for the RON
   LSP (`cibox lsp`).
 - `cibox update` merges into existing files instead of overwriting:
@@ -37,8 +39,13 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
   commented but gets its content regenerated ("disabled") —
   `generator::disabled` finds those blocks by uncommenting candidate comment
   runs and parsing them. Missing/empty files and `--force` get the full
-  `generator::render_file` output. The editor TUI still overwrites (it
-  previews a diff).
+  `generator::render_file` output. What happens to each file is decided by
+  `generator::pending_update`, which writes nothing.
+- The editor TUI (`cibox/src/editor/`) only ever writes `cibox.ron`. Its
+  preview pane diffs `generator::pending_update` against the files on disk.
+  That is the same decision `cibox update` makes, so the preview can't
+  drift from the command. Files update would create show as all-added; the
+  pane is hidden only when nothing would change.
 
 To add a rule:
 
