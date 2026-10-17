@@ -188,7 +188,7 @@ pub fn handle_validate(config_path: &str) -> Result<()> {
         "Failed to parse RON config. Check syntax and structure:\n\
          - Ensure all fields are properly formatted\n\
          - Check for missing commas\n\
-         - Verify rule names match the documented set"
+         - Verify rule and knob names match the documented set"
     })?;
 
     println!("\n{}", "Configuration is valid!".green().bold());

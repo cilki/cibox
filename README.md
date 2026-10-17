@@ -148,6 +148,11 @@ while still applying the knobs. The target platform is not part of the file —
 `cibox update` can generate for any platform, so pass `--platform` or let cibox
 infer it.
 
+Names you did not mean are errors rather than silent no-ops: a rule entry cibox
+doesn't know, or a knob the rule doesn't have (`versions` on a rule without a
+matrix, `platforms` on `docker_build`), is rejected with the position in the
+file and the fields that rule does accept.
+
 `image_name` has to be a valid docker reference, because it ends up as a literal
 argument to `docker build -t`: lowercase alphanumerics separated by `.`, `-` or
 `_`, optionally prefixed with a registry host and suffixed with a `:tag`.
