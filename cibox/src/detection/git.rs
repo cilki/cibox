@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Forge hosting the origin remote
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,15 +17,15 @@ pub(super) struct GitFacts {
     pub remote_host: Option<RemoteHost>,
 }
 
-/// Read git facts straight from `.git/config` — no git subprocess needed
+/// Read git facts straight from the repository's config — no git subprocess
+/// needed
 pub(super) fn gather(path: &Path) -> GitFacts {
-    let git_dir = path.join(".git");
-    if !git_dir.exists() {
+    if !path.join(".git").exists() {
         return GitFacts::default();
     }
 
-    let url = fs::read_to_string(git_dir.join("config"))
-        .ok()
+    let url = config_dir(path)
+        .and_then(|dir| fs::read_to_string(dir.join("config")).ok())
         .and_then(|config| origin_url(&config));
 
     let (remote_host, repo_slug) = match url {
@@ -43,20 +43,95 @@ pub(super) fn gather(path: &Path) -> GitFacts {
     }
 }
 
+/// The directory holding the repository's `config`. Usually `<path>/.git`,
+/// but `.git` is a *file* holding `gitdir: <path>` in a linked worktree or a
+/// submodule, and a linked worktree's own git dir keeps no config — it shares
+/// the main one's, named by its `commondir`. Reading `<path>/.git/config`
+/// blindly finds nothing in either case, which silently costs the remote and
+/// everything derived from it (platform inference, the default image and AUR
+/// package names).
+fn config_dir(path: &Path) -> Option<PathBuf> {
+    let dot_git = path.join(".git");
+    let git_dir = if fs::metadata(&dot_git).ok()?.is_dir() {
+        dot_git
+    } else {
+        let pointer = fs::read_to_string(&dot_git).ok()?;
+        let target = pointer
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("gitdir:"))?;
+        resolve_against(path, target.trim())
+    };
+
+    match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(common) => Some(resolve_against(&git_dir, common.trim())),
+        Err(_) => Some(git_dir),
+    }
+}
+
+/// Git's pointer files hold either an absolute path or one relative to the
+/// file's own directory
+fn resolve_against(base: &Path, target: &str) -> PathBuf {
+    let target = Path::new(target);
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    }
+}
+
 /// Extract the url from the `[remote "origin"]` section of a git config
 fn origin_url(config: &str) -> Option<String> {
     let mut in_origin = false;
     for line in config.lines() {
         let line = line.trim();
-        if line.starts_with('[') {
-            in_origin = line == "[remote \"origin\"]";
+        if let Some(rest) = line.strip_prefix('[') {
+            let header = rest.split_once(']').map_or(rest, |(header, _)| header);
+            // Section names are case-insensitive, subsection names are not
+            let (section, subsection) = match header.trim().split_once(char::is_whitespace) {
+                Some((section, subsection)) => (section, subsection.trim()),
+                None => (header.trim(), ""),
+            };
+            in_origin = section.eq_ignore_ascii_case("remote") && subsection == "\"origin\"";
         } else if in_origin {
-            if let Some(url) = line.strip_prefix("url") {
-                return Some(url.trim_start_matches([' ', '=']).trim().to_string());
+            // Key names are case-insensitive too, and `url` has to match the
+            // whole of one: a prefix match also answers to `urlsomething`
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("url") {
+                    return Some(unquote_value(value));
+                }
             }
         }
     }
     None
+}
+
+/// Read a git config value the way git does: a `"` toggles quoting rather
+/// than being part of the value, and `\` escapes the next character.
+/// go-git, libgit2 and JGit all write `url = "https://..."`, so taking the
+/// text verbatim leaves the closing quote stuck on the end of the slug —
+/// enough to stop `.git` being stripped and to mangle the derived names.
+fn unquote_value(value: &str) -> String {
+    // Whitespace around the value is not part of it; whitespace *inside* the
+    // quotes is, and the quotes keep it out of this trim
+    let value = value.trim();
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {}
+            // Only git's own escapes mean anything; anything else is kept
+            // verbatim rather than silently swallowing the backslash
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{8}'),
+                Some(escaped) => out.push(escaped),
+                None => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Split a remote URL into (host kind, "owner/repo").
@@ -143,5 +218,131 @@ mod tests {
         assert!(facts.is_repo);
         assert_eq!(facts.remote_host, Some(RemoteHost::GitHub));
         assert_eq!(facts.repo_slug.as_deref(), Some("fossable/cibox"));
+    }
+
+    /// Write a conventional `.git` directory holding `config`
+    fn git_dir(root: &Path, config: &str) -> PathBuf {
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("config"), config).unwrap();
+        git_dir
+    }
+
+    fn origin(url: &str) -> String {
+        format!("[remote \"origin\"]\n\turl = {url}\n")
+    }
+
+    /// go-git, libgit2 and JGit write the url quoted; the quotes are syntax,
+    /// not part of the value
+    #[test]
+    fn test_quoted_config_values() {
+        assert_eq!(
+            origin_url(&origin("\"git@github.com:fossable/cibox.git\"")).as_deref(),
+            Some("git@github.com:fossable/cibox.git")
+        );
+        let (host, slug) =
+            parse_remote_url(&origin_url(&origin("\"https://git.cilki.net/cilki/cibox\"")).unwrap());
+        assert_eq!(host, Some(RemoteHost::Other));
+        assert_eq!(slug.as_deref(), Some("cilki/cibox"));
+    }
+
+    #[test]
+    fn test_escapes_in_a_quoted_value() {
+        assert_eq!(
+            origin_url(&origin(r#""https://host/o/say-\"hi\"""#)).as_deref(),
+            Some(r#"https://host/o/say-"hi""#)
+        );
+    }
+
+    /// Only the quotes bound whitespace that belongs to the value
+    #[test]
+    fn test_whitespace_around_a_value_is_dropped_but_not_inside_it() {
+        assert_eq!(
+            origin_url("[remote \"origin\"]\n\turl =   \" a/b \"  \n").as_deref(),
+            Some(" a/b ")
+        );
+    }
+
+    /// Section and key names are case-insensitive, and `url` has to be the
+    /// whole key — not just its prefix
+    #[test]
+    fn test_key_and_section_names_are_matched_the_way_git_matches_them() {
+        assert_eq!(
+            origin_url("[REMOTE \"origin\"]\n\tURL = https://host/o/r\n").as_deref(),
+            Some("https://host/o/r")
+        );
+        assert_eq!(
+            origin_url("[remote \"origin\"]\n\turlsomething = nope\n\turl = https://host/o/r\n")
+                .as_deref(),
+            Some("https://host/o/r")
+        );
+        // A different remote's url is not origin's
+        assert_eq!(
+            origin_url("[remote \"upstream\"]\n\turl = https://host/o/r\n"),
+            None
+        );
+    }
+
+    /// `git worktree add` leaves a `.git` file pointing at a git dir that
+    /// holds no config of its own — the shared one is named by `commondir`
+    #[test]
+    fn test_linked_worktree_finds_the_shared_config() {
+        let dir = tempdir().unwrap();
+        let main = dir.path().join("main");
+        fs::create_dir_all(&main).unwrap();
+        let git_dir = git_dir(&main, &origin("git@github.com:fossable/cibox.git"));
+
+        let worktree_git = git_dir.join("worktrees/feature");
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+
+        let worktree = dir.path().join("feature");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        let facts = gather(&worktree);
+        assert!(facts.is_repo);
+        assert_eq!(facts.remote_host, Some(RemoteHost::GitHub));
+        assert_eq!(facts.repo_slug.as_deref(), Some("fossable/cibox"));
+    }
+
+    /// A submodule's `.git` file points straight at a git dir with a config,
+    /// by a path relative to the submodule's own directory
+    #[test]
+    fn test_submodule_follows_a_relative_gitdir() {
+        let dir = tempdir().unwrap();
+        let super_git = git_dir(dir.path(), "[core]\n\tbare = false\n");
+        let module_git = super_git.join("modules/sub");
+        fs::create_dir_all(&module_git).unwrap();
+        fs::write(
+            module_git.join("config"),
+            origin("https://gitlab.com/owner/sub.git"),
+        )
+        .unwrap();
+
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+
+        let facts = gather(&sub);
+        assert!(facts.is_repo);
+        assert_eq!(facts.remote_host, Some(RemoteHost::GitLab));
+        assert_eq!(facts.repo_slug.as_deref(), Some("owner/sub"));
+    }
+
+    /// A `.git` file that points nowhere useful still marks a repository;
+    /// detection never fails, the facts behind it are just absent
+    #[test]
+    fn test_dangling_gitdir_pointer_leaves_the_remote_absent() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".git"), "gitdir: ./nowhere\n").unwrap();
+        let facts = gather(dir.path());
+        assert!(facts.is_repo);
+        assert!(facts.repo_slug.is_none());
+        assert!(facts.remote_host.is_none());
     }
 }
