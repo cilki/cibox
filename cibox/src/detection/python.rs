@@ -4,9 +4,8 @@ use std::path::Path;
 /// Facts about a Python project
 #[derive(Debug, Clone, Default)]
 pub struct PythonFacts {
+    /// A pyproject.toml is present, so the project installs with `pip install .`
     pub has_pyproject: bool,
-    pub has_setup_py: bool,
-    pub has_requirements_txt: bool,
     /// pyproject.toml declares a `[project]` with a name, so the package can
     /// be built and uploaded to PyPI
     pub publishable: bool,
@@ -33,8 +32,6 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
 
     Some(PythonFacts {
         has_pyproject,
-        has_setup_py,
-        has_requirements_txt,
         publishable,
     })
 }
@@ -56,7 +53,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("requirements.txt"), "requests\n").unwrap();
         let facts = gather(dir.path()).unwrap();
-        assert!(facts.has_requirements_txt);
+        assert!(!facts.has_pyproject);
         assert!(!facts.publishable);
     }
 

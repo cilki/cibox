@@ -34,7 +34,6 @@ pub struct NodeFacts {
     pub has_lockfile: bool,
     pub has_test_script: bool,
     pub has_lint_script: bool,
-    pub has_build_script: bool,
     pub has_tsconfig: bool,
     pub has_prettier_config: bool,
     /// `typescript` is a declared dependency, so the install step puts `tsc`
@@ -66,7 +65,6 @@ pub(super) fn gather(path: &Path) -> Option<NodeFacts> {
         has_lockfile,
         has_test_script,
         has_lint_script: script("lint").is_some(),
-        has_build_script: script("build").is_some(),
         has_tsconfig: path.join("tsconfig.json").is_file(),
         has_prettier_config: has_prettier_config(path, &manifest),
         has_typescript_dep: has_dependency(&manifest, "typescript"),
@@ -193,13 +191,12 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
-            r#"{"scripts": {"test": "vitest", "lint": "eslint .", "build": "tsc"}}"#,
+            r#"{"scripts": {"test": "vitest", "lint": "eslint ."}}"#,
         )
         .unwrap();
         let facts = gather(dir.path()).unwrap();
         assert!(facts.has_test_script);
         assert!(facts.has_lint_script);
-        assert!(facts.has_build_script);
         assert!(!facts.has_tsconfig);
         assert!(!facts.has_prettier_config);
     }

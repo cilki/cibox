@@ -6,8 +6,6 @@ use std::path::Path;
 #[derive(Debug, Clone, Default)]
 pub struct RustFacts {
     pub is_workspace: bool,
-    /// The root manifest has a `[package]` section
-    pub has_package: bool,
     /// The root package exists and is not `publish = false`
     pub publishable: bool,
     pub package_name: Option<String>,
@@ -56,7 +54,6 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
 
     Some(RustFacts {
         is_workspace: manifest.workspace.is_some(),
-        has_package: package.is_some(),
         publishable,
         package_name: package.map(|p| p.name().to_string()),
         msrv,
@@ -86,7 +83,6 @@ mod tests {
     #[test]
     fn test_package_is_publishable() {
         let facts = facts_for("[package]\nname = \"lib\"\nversion = \"0.1.0\"\n").unwrap();
-        assert!(facts.has_package);
         assert!(facts.publishable);
         assert!(!facts.is_workspace);
         assert_eq!(facts.package_name.as_deref(), Some("lib"));
@@ -182,7 +178,7 @@ mod tests {
     fn test_workspace_without_root_package() {
         let facts = facts_for("[workspace]\nmembers = [\"a\", \"b\"]\n").unwrap();
         assert!(facts.is_workspace);
-        assert!(!facts.has_package);
+        assert_eq!(facts.package_name, None);
         assert!(!facts.publishable);
     }
 }

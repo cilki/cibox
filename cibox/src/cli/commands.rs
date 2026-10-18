@@ -232,7 +232,7 @@ pub fn handle_detect(dir: &str) -> Result<()> {
         );
         println!("    typescript: {}", yes_no(node.has_tsconfig));
     }
-    if facts.zig.is_some() {
+    if facts.zig {
         println!("  {} Zig", "✓".green());
     }
     if let Some(cmake) = &facts.cmake {

@@ -25,7 +25,6 @@ pub use go::GoFacts;
 pub use node::{NodeFacts, NodePackageManager};
 pub use python::PythonFacts;
 pub use rust::RustFacts;
-pub use zig::ZigFacts;
 
 /// Everything cibox knows about the project directory
 #[derive(Debug, Clone, Default)]
@@ -34,7 +33,8 @@ pub struct ProjectFacts {
     pub python: Option<PythonFacts>,
     pub go: Option<GoFacts>,
     pub node: Option<NodeFacts>,
-    pub zig: Option<ZigFacts>,
+    /// A build.zig sits in the root; there is nothing more to know
+    pub zig: bool,
     pub cmake: Option<CmakeFacts>,
     pub docker: Option<DockerFacts>,
     pub android: Option<AndroidFacts>,
@@ -115,7 +115,7 @@ mod tests {
         assert!(facts.python.is_none());
         assert!(facts.go.is_none());
         assert!(facts.node.is_none());
-        assert!(facts.zig.is_none());
+        assert!(!facts.zig);
         assert!(facts.cmake.is_none());
         assert!(facts.docker.is_none());
         assert!(facts.android.is_none());
