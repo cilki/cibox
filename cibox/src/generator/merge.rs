@@ -143,15 +143,54 @@ struct Parse {
     value: Value,
 }
 
+/// How big a pipeline has to be before a merge parses it on two threads.
+///
+/// The saving only grows past a thread's own cost once the file runs to a few
+/// kilobytes — at 7.5 KB it is 0.4 ms of a 3.9 ms `update`, at 30 KB it is
+/// 2.5 ms of 9.8 ms. Below that a whole merge is a fraction of a millisecond,
+/// so the small pipelines that are the common case don't spawn anything.
+const PARALLEL_PARSE_FROM: usize = 8 * 1024;
+
 impl Parse {
     fn of(text: &str, path: &Path) -> Result<Self> {
-        let value: Value = serde_yaml::from_str(text).with_context(|| {
+        // The two parses read the same text and share nothing, and together
+        // they are nearly the whole cost of a merge: of the 56 ms a 230 KB
+        // GitLab pipeline took, 26 ms was serde_yaml and 29 ms was yaml-edit,
+        // against 7 ms for everything the merge then did with them. So for a
+        // pipeline big enough to pay for a thread they run side by side.
+        //
+        // The value tree is the one that travels, because a `YamlFile` holds
+        // rowan's mutable red tree and is not `Send`.
+        if text.len() < PARALLEL_PARSE_FROM {
+            return Self::check(serde_yaml::from_str(text), YamlFile::from_str(text), path);
+        }
+        std::thread::scope(|scope| {
+            let value = scope.spawn(|| serde_yaml::from_str(text));
+            let tree = YamlFile::from_str(text);
+            // A parser panic is cibox's bug to report, not a YAML error, so
+            // it keeps its own backtrace instead of becoming a message
+            let value = value
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            Self::check(value, tree, path)
+        })
+    }
+
+    /// Report whichever parse rejected the text, preferring serde_yaml's
+    /// error: it reads the stricter of the two grammars, so when both fail
+    /// its message is the one about the real mistake.
+    fn check(
+        value: std::result::Result<Value, serde_yaml::Error>,
+        tree: std::result::Result<YamlFile, yaml_edit::YamlError>,
+        path: &Path,
+    ) -> Result<Self> {
+        let value = value.with_context(|| {
             format!(
                 "{} is not valid YAML; use --force to overwrite it",
                 path.display()
             )
         })?;
-        let tree = YamlFile::from_str(text).map_err(|e| {
+        let tree = tree.map_err(|e| {
             anyhow!(
                 "{} is not valid YAML; use --force to overwrite it: {e}",
                 path.display()
@@ -1926,6 +1965,71 @@ my-job:
         assert_eq!(counts.conformed, 1);
         assert_eq!(counts.added, file.jobs.len() - 1);
         assert_eq!((counts.removed, counts.preserved), (0, 1));
+    }
+
+    /// A pipeline of `jobs` user jobs, each with a comment above it, plus one
+    /// stale `rust-test`. Big enough to cross [`PARALLEL_PARSE_FROM`] at a
+    /// few hundred jobs, which is what puts a merge on the two-thread path.
+    fn padded_gitlab_pipeline(jobs: usize) -> String {
+        let mut text = String::from("stages: [test]\nrust-test:\n  stage: test\n  script: [echo stale]\n");
+        for i in 0..jobs {
+            text.push_str(&format!(
+                "# what mine-{i} is for\nmine-{i}:\n  stage: test\n  script:\n    - echo mine {i}\n"
+            ));
+        }
+        text
+    }
+
+    /// A pipeline parsed on two threads has to come out of a merge exactly as
+    /// one parsed on a single thread would: same conforming, same preserving,
+    /// every user job and comment still there.
+    #[test]
+    fn test_gitlab_merge_of_a_pipeline_big_enough_to_parse_in_parallel() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        let small = padded_gitlab_pipeline(4);
+        let big = padded_gitlab_pipeline(300);
+        assert!(small.len() < PARALLEL_PARSE_FROM, "fixture rot: {}", small.len());
+        assert!(big.len() >= PARALLEL_PARSE_FROM, "fixture rot: {}", big.len());
+
+        for (label, existing, users) in [("small", &small, 4), ("big", &big, 300)] {
+            let (content, counts) =
+                merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+            assert!(content.contains("cargo test"), "{label}");
+            assert!(!content.contains("echo stale"), "{label}");
+            for i in 0..users {
+                assert!(content.contains(&format!("echo mine {i}")), "{label} job {i}");
+                assert!(content.contains(&format!("what mine-{i} is for")), "{label} comment {i}");
+            }
+            assert_eq!(counts.conformed, 1, "{label}");
+            assert_eq!(counts.added, file.jobs.len() - 1, "{label}");
+            assert_eq!((counts.removed, counts.disabled, counts.preserved), (0, 0, users), "{label}");
+        }
+    }
+
+    /// The parse errors a merge reports must not depend on how many threads
+    /// carried the parses
+    #[test]
+    fn test_invalid_yaml_is_reported_at_every_size() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        for pad in [0, 400] {
+            let mut text = padded_gitlab_pipeline(pad);
+            text.push_str("broken:\n  script: [unclosed\n");
+            let big = text.len() >= PARALLEL_PARSE_FROM;
+            assert_eq!(big, pad > 0, "fixture rot: {}", text.len());
+            let err = merge_file(Platform::GitLab, &file, &filter, &text).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("is not valid YAML; use --force to overwrite it"),
+                "pad {pad}: {err:#}"
+            );
+        }
     }
 
     #[test]
