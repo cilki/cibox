@@ -4,8 +4,6 @@ use std::path::Path;
 /// Facts about a Zig project (build.zig)
 #[derive(Debug, Clone, Default)]
 pub struct ZigFacts {
-    /// Whether a build.zig.zon package manifest is present
-    pub has_zon: bool,
     /// Whether build.zig declares a `test` step for `zig build test` to run
     pub has_test_step: bool,
 }
@@ -16,7 +14,6 @@ pub(super) fn gather(path: &Path) -> Option<ZigFacts> {
         return None;
     }
     Some(ZigFacts {
-        has_zon: path.join("build.zig.zon").is_file(),
         has_test_step: fs::read_to_string(&build).is_ok_and(|s| declares_test_step(&s)),
     })
 }
@@ -49,17 +46,7 @@ mod tests {
     fn test_build_zig_detected() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("build.zig"), "pub fn build() void {}\n").unwrap();
-        let facts = gather(dir.path()).unwrap();
-        assert!(!facts.has_zon);
-        assert!(!facts.has_test_step);
-    }
-
-    #[test]
-    fn test_zon_detected() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("build.zig"), "").unwrap();
-        fs::write(dir.path().join("build.zig.zon"), ".{}\n").unwrap();
-        assert!(gather(dir.path()).unwrap().has_zon);
+        assert!(!gather(dir.path()).unwrap().has_test_step);
     }
 
     #[test]
