@@ -4,8 +4,10 @@ use std::path::Path;
 /// Facts about a Python project
 #[derive(Debug, Clone, Default)]
 pub struct PythonFacts {
+    /// A pyproject.toml is present, so the project installs with `pip install .`
     pub has_pyproject: bool,
-    pub has_setup_py: bool,
+    /// A requirements.txt is present, so the project's dependencies install
+    /// with `pip install -r requirements.txt`
     pub has_requirements_txt: bool,
     /// The checkout is a distribution pip can build, so `pip install .`
     /// installs the project and its dependencies: a `setup.py`, or a
@@ -50,7 +52,6 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
 
     Some(PythonFacts {
         has_pyproject,
-        has_setup_py,
         has_requirements_txt,
         installable: has_setup_py
             || unparsed_pyproject
