@@ -14,4 +14,7 @@
     rust_build: (
         enabled: false,
     ),
+    rust_release: (
+        enabled: true,
+    ),
 )

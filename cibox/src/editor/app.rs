@@ -51,10 +51,7 @@ impl EditorApp {
         result
     }
 
-    fn event_loop<B: ratatui::backend::Backend>(
-        &mut self,
-        terminal: &mut Terminal<B>,
-    ) -> Result<()>
+    fn event_loop<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
     where
         B::Error: Send + Sync + 'static,
     {
@@ -64,8 +61,9 @@ impl EditorApp {
             terminal.draw(|f| {
                 preview_area = render_ui(f, &self.state, self.help_image.as_mut());
             })?;
-            self.state.preview_viewport =
-                preview_area.map_or((0, 0), |area| (area.width, area.height));
+            self.state.set_preview_viewport(
+                preview_area.map_or((0, 0), |area| (area.width, area.height)),
+            );
 
             // Handle events
             if event::poll(Duration::from_millis(100))? {

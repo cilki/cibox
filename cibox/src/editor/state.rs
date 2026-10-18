@@ -50,7 +50,10 @@ pub enum Row {
         effective: String,
     },
     /// A checkbox for one of the boolean knobs
-    Checkbox { knob: Checkbox, value: bool },
+    Checkbox {
+        knob: Checkbox,
+        value: bool,
+    },
     /// One configured toolchain version under an expanded test rule, or —
     /// with `index: None` — the trailing "add a version" action row
     Version {
@@ -456,19 +459,79 @@ impl EditorState {
             resolved: &resolved,
             selection: None,
         };
-        let pending = crate::generator::plan_all(&self.facts, &resolved, &self.platforms)
-            .and_then(|plans| {
+        let pending =
+            crate::generator::plan_all(&self.facts, &resolved, &self.platforms).and_then(|plans| {
                 crate::generator::pending_updates(&self.working_dir, &plans, &filter, false)
             });
+        // The rule each job key in the files belongs to, so the preview can
+        // tell which lines are whose
+        let owner = |key: &str| {
+            resolved
+                .iter()
+                .find(|r| r.rule.owns_job_id(key))
+                .map(|r| r.rule.id())
+        };
         self.preview = match pending {
-            Ok(updates) => PreviewDiff::from_updates(&updates),
+            Ok(updates) => PreviewDiff::from_updates(&updates, &owner),
             // e.g. a pipeline file that isn't valid YAML: update would refuse
             // too, and the reason is what the user needs to see
             Err(e) => PreviewDiff::error(&format!("{e:#}")),
         };
+        // Land on what the edit just changed, if the selected rule's job is
+        // part of it, and at the top otherwise
         self.preview_scroll = 0;
+        self.follow_cursor();
         if self.preview.is_empty() {
             self.focus = Focus::Rules;
+        }
+    }
+
+    /// The rule the row under the cursor belongs to: the rule itself, or the
+    /// rule a config-option row sits under
+    pub fn selected_rule(&self) -> Option<&'static str> {
+        match self.rows.get(self.parent_rule_index(self.cursor)?)? {
+            Row::Rule(rule) => Some(rule.id),
+            _ => None,
+        }
+    }
+
+    /// Scroll the preview so the selected rule's job is at the top. Left
+    /// where it is when the job isn't in the diff — update leaves it alone,
+    /// so there is nothing of it to show.
+    pub fn follow_cursor(&mut self) {
+        let Some(line) = self
+            .selected_rule()
+            .and_then(|rule| self.preview.anchor(rule))
+        else {
+            return;
+        };
+        let (width, height) = self.preview_viewport;
+        self.preview_scroll = if width == 0 {
+            // Not drawn yet, so there is no width to wrap at: count lines,
+            // and let `set_preview_viewport` correct it once there is
+            u16::try_from(line).unwrap_or(u16::MAX)
+        } else {
+            self.preview
+                .rows_before(line, width)
+                .min(self.preview.max_scroll(width, height))
+        };
+    }
+
+    /// Move the rules cursor by `delta` rows, within the list, taking the
+    /// preview along to the job of the rule it lands on
+    pub fn move_cursor(&mut self, delta: isize) {
+        let last = self.rows.len().saturating_sub(1);
+        self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        self.follow_cursor();
+    }
+
+    /// Record the inner size of the preview panel as drawn. A new size
+    /// rewraps the diff, which leaves a scroll offset counted in rows of the
+    /// old one pointing somewhere else, so the preview re-follows the cursor.
+    pub fn set_preview_viewport(&mut self, viewport: (u16, u16)) {
+        if viewport != self.preview_viewport {
+            self.preview_viewport = viewport;
+            self.follow_cursor();
         }
     }
 
@@ -528,8 +591,7 @@ impl EditorState {
     fn toggle_rule(&mut self, rule: &RuleRow) {
         let new_enabled = !rule.enabled;
         let override_value = (new_enabled != rule.detected).then_some(new_enabled);
-        self.config
-            .set_enabled_override(rule.id, override_value);
+        self.config.set_enabled_override(rule.id, override_value);
         self.refresh();
         self.auto_save_ron();
     }
@@ -872,9 +934,21 @@ mod tests {
         let dir = docker_dir();
         let state = state_for(dir.path());
         // GitHub splits the jobs over ci.yml and release.yml
-        assert!(generated(&state).contains("cargo test"), "{}", generated(&state));
-        assert!(generated(&state).contains("docker build"), "{}", generated(&state));
-        assert!(generated(&state).contains("release.yml"), "{}", generated(&state));
+        assert!(
+            generated(&state).contains("cargo test"),
+            "{}",
+            generated(&state)
+        );
+        assert!(
+            generated(&state).contains("docker build"),
+            "{}",
+            generated(&state)
+        );
+        assert!(
+            generated(&state).contains("release.yml"),
+            "{}",
+            generated(&state)
+        );
     }
 
     #[test]
@@ -911,7 +985,10 @@ mod tests {
             }
         ));
         // image_name + sync_readme + one row per DockerPlatform
-        assert_eq!(state.rows.len(), collapsed_len + 2 + DockerPlatform::ALL.len());
+        assert_eq!(
+            state.rows.len(),
+            collapsed_len + 2 + DockerPlatform::ALL.len()
+        );
 
         // Collapsing from a child row jumps back to the parent
         state.cursor = idx + 2;
@@ -948,7 +1025,11 @@ mod tests {
         ));
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         assert!(ron_str.contains("sync_readme"), "{ron_str}");
-        assert!(generated(&state).contains("docker-pushrm"), "{}", generated(&state));
+        assert!(
+            generated(&state).contains("docker-pushrm"),
+            "{}",
+            generated(&state)
+        );
 
         // Toggling back off matches the default, so the override disappears
         state.activate_current();
@@ -964,7 +1045,10 @@ mod tests {
         state.cursor = rule_index(&state, "rust-test");
         state.expand_current();
         let idx = rule_index(&state, "rust-test");
-        assert!(matches!(state.rows[idx + 1], Row::Version { index: None, .. }));
+        assert!(matches!(
+            state.rows[idx + 1],
+            Row::Version { index: None, .. }
+        ));
 
         // Adding a version through the add row
         state.cursor = idx + 1;
@@ -991,7 +1075,11 @@ mod tests {
             state.input_push(c);
         }
         state.commit_input();
-        assert!(generated(&state).contains("matrix"), "{}", generated(&state));
+        assert!(
+            generated(&state).contains("matrix"),
+            "{}",
+            generated(&state)
+        );
 
         // cibox.ron stays delta-only
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
@@ -1076,7 +1164,11 @@ mod tests {
         );
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         assert!(ron_str.contains("LinuxArm64"), "{ron_str}");
-        assert!(generated(&state).contains("buildx"), "{}", generated(&state));
+        assert!(
+            generated(&state).contains("buildx"),
+            "{}",
+            generated(&state)
+        );
 
         // Unselecting everything removes the key entirely
         toggle(&mut state, DockerPlatform::LinuxArm64);
@@ -1162,7 +1254,11 @@ mod tests {
         );
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         crate::config::parse_config(&ron_str).unwrap();
-        assert!(generated(&state).contains("aur-release-foo"), "{}", generated(&state));
+        assert!(
+            generated(&state).contains("aur-release-foo"),
+            "{}",
+            generated(&state)
+        );
 
         // Committing the facts default (or nothing) clears the override
         let default = state.default_aur_packages().join(", ");
@@ -1257,7 +1353,11 @@ mod tests {
         // What the editor saves has to be something it can read back
         let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
         crate::config::parse_config(&ron_str).unwrap();
-        assert!(generated(&state).contains("android-build"), "{}", generated(&state));
+        assert!(
+            generated(&state).contains("android-build"),
+            "{}",
+            generated(&state)
+        );
     }
 
     /// Committing the value a knob row already shows has to leave the config

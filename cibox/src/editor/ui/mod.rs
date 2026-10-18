@@ -56,18 +56,34 @@ impl DiffType {
 #[derive(Debug, Default)]
 pub struct PreviewDiff {
     lines: Vec<(String, DiffType)>,
+    /// Parallel to `lines`: the id of the rule whose job each line belongs
+    /// to, `None` for headers and for lines outside any cibox job. This is
+    /// what lets the selected rule find, and mark, its job in the diff.
+    rules: Vec<Option<&'static str>>,
 }
+
+/// Maps a job key in a pipeline file to the id of the rule that owns it
+pub type JobOwner<'a> = dyn Fn(&str) -> Option<&'static str> + 'a;
+
+/// The gutter drawn before every preview line: a bar beside the lines of the
+/// selected rule's job, blank beside the rest. Every line gets one, marked or
+/// not, so moving the selection never changes how the preview wraps.
+const GUTTER_MARK: &str = "▎";
+const GUTTER_BLANK: &str = " ";
 
 impl PreviewDiff {
     /// The diff of everything `updates` would write against what is on disk.
     /// Files update would create are shown whole, as added lines — in a
     /// repository without CI config, that is the whole pipeline. Empty, so
     /// the panel is hidden, only when update would change nothing.
-    pub fn from_updates(updates: &[FileUpdate]) -> Self {
+    ///
+    /// `owner` names the rule each job key belongs to, so every line can
+    /// record the rule whose job it is part of.
+    pub fn from_updates(updates: &[FileUpdate], owner: &JobOwner) -> Self {
         let mut preview = Self::default();
         for update in updates {
             if let FileChange::Write { content, .. } = &update.change {
-                preview.push_file(update, content);
+                preview.push_file(update, content, owner);
             }
         }
         preview
@@ -75,15 +91,19 @@ impl PreviewDiff {
 
     /// A preview that only says why it can't show a diff
     pub fn error(message: &str) -> Self {
-        Self {
-            lines: message
-                .lines()
-                .map(|line| (line.to_string(), DiffType::Error))
-                .collect(),
+        let mut preview = Self::default();
+        for line in message.lines() {
+            preview.push(line.to_string(), DiffType::Error, None);
         }
+        preview
     }
 
-    fn push_file(&mut self, update: &FileUpdate, new: &str) {
+    fn push(&mut self, text: String, kind: DiffType, rule: Option<&'static str>) {
+        self.lines.push((text, kind));
+        self.rules.push(rule);
+    }
+
+    fn push_file(&mut self, update: &FileUpdate, new: &str, owner: &JobOwner) {
         let old = update.existing.as_deref().unwrap_or("");
         let diff = TextDiff::from_lines(old, new);
         let mut hunks = diff.unified_diff();
@@ -91,29 +111,44 @@ impl PreviewDiff {
         if hunks.peek().is_none() {
             return;
         }
+        // Ownership is read off the whole files rather than the hunks: a
+        // change deep inside a job has its key line far outside the context
+        let old_owners = job_owners(old, owner);
+        let new_owners = job_owners(new, owner);
+        let owner_at = |owners: &[Option<&'static str>], index: Option<usize>| {
+            index.and_then(|i| owners.get(i).copied().flatten())
+        };
 
         if !self.lines.is_empty() {
-            self.lines.push((String::new(), DiffType::Unchanged));
+            self.push(String::new(), DiffType::Unchanged, None);
         }
         let new_file = if update.existing.is_none() {
             " (new)"
         } else {
             ""
         };
-        self.lines.push((
+        self.push(
             format!("# ==> {}{new_file} <==", update.path.display()),
             DiffType::File,
-        ));
+            None,
+        );
         for hunk in hunks {
-            self.lines.push((hunk.header().to_string(), DiffType::Hunk));
+            self.push(hunk.header().to_string(), DiffType::Hunk, None);
             for change in hunk.iter_changes() {
-                let kind = match change.tag() {
-                    ChangeTag::Equal => DiffType::Unchanged,
-                    ChangeTag::Delete => DiffType::Removed,
-                    ChangeTag::Insert => DiffType::Added,
+                let (kind, rule) = match change.tag() {
+                    ChangeTag::Equal => (
+                        DiffType::Unchanged,
+                        owner_at(&new_owners, change.new_index()),
+                    ),
+                    ChangeTag::Delete => {
+                        (DiffType::Removed, owner_at(&old_owners, change.old_index()))
+                    }
+                    ChangeTag::Insert => {
+                        (DiffType::Added, owner_at(&new_owners, change.new_index()))
+                    }
                 };
                 let text = change.value().trim_end_matches(['\n', '\r']).to_string();
-                self.lines.push((text, kind));
+                self.push(text, kind, rule);
             }
         }
     }
@@ -122,47 +157,166 @@ impl PreviewDiff {
         self.lines.is_empty()
     }
 
+    /// The line the preview scrolls to for `rule`: where the first change to
+    /// its job begins, backed up over the job's own lines above it, the
+    /// context leading into those, and the hunk and file headers above
+    /// that, so the reader sees where it is. `None` when update doesn't
+    /// change the job — though some of it may show as another job's context.
+    pub fn anchor(&self, rule: &str) -> Option<usize> {
+        let owned = |line: usize| self.rules[line] == Some(rule);
+        let mut line = (0..self.lines.len()).find(|&line| {
+            owned(line) && matches!(self.lines[line].1, DiffType::Added | DiffType::Removed)
+        })?;
+        while line > 0 && owned(line - 1) {
+            line -= 1;
+        }
+        let kind_before = |line: usize| line.checked_sub(1).map(|i| self.lines[i].1);
+        while kind_before(line) == Some(DiffType::Unchanged) {
+            line -= 1;
+        }
+        if kind_before(line) == Some(DiffType::Hunk) {
+            line -= 1;
+        }
+        if kind_before(line) == Some(DiffType::File) {
+            line -= 1;
+        }
+        Some(line)
+    }
+
+    /// Wrapped rows the lines above `line` take in a panel `width` wide,
+    /// i.e. the scroll offset that puts `line` at the top
+    pub fn rows_before(&self, line: usize, width: u16) -> u16 {
+        let rows = Paragraph::new(self.styled(line, None))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        u16::try_from(rows).unwrap_or(u16::MAX)
+    }
+
     /// The furthest the preview can scroll in a panel of the given inner
     /// size: until its last wrapped row sits at the bottom
     pub fn max_scroll(&self, width: u16, height: u16) -> u16 {
         if width == 0 {
             return 0;
         }
-        let rows = Paragraph::new(self.visible(0, u16::MAX))
+        let rows = Paragraph::new(self.visible(0, u16::MAX, None))
             .wrap(Wrap { trim: false })
             .line_count(width);
         u16::try_from(rows.saturating_sub(usize::from(height))).unwrap_or(u16::MAX)
     }
 
     /// Styled lines for a panel `rows` rows tall scrolled down by `scroll`,
-    /// YAML highlighted over the background color of its diff status.
+    /// YAML highlighted over the background color of its diff status, with
+    /// the lines of `selected`'s job marked in the gutter.
     ///
     /// Wrapping gives every line at least one row, so the last visible row —
     /// `scroll + rows` — can only be fed by a line at that index or earlier;
     /// styling anything beyond it is work the panel throws away. The lines
     /// above `scroll` do have to be handed over: the offset counts wrapped
     /// rows, and only the paragraph knows how many rows each line takes.
-    fn visible(&self, scroll: u16, rows: u16) -> Vec<Line<'static>> {
+    fn visible(&self, scroll: u16, rows: u16, selected: Option<&str>) -> Vec<Line<'static>> {
         let end = usize::from(scroll).saturating_add(usize::from(rows));
-        self.lines[..self.lines.len().min(end)]
+        self.styled(end, selected)
+    }
+
+    /// The first `end` lines (or all of them, if there are fewer), styled
+    fn styled(&self, end: usize, selected: Option<&str>) -> Vec<Line<'static>> {
+        let end = self.lines.len().min(end);
+        self.lines[..end]
             .iter()
-            .map(|(line, diff)| match diff {
-                DiffType::File => Line::from(Span::styled(
-                    line.clone(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                DiffType::Hunk => {
-                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::Blue)))
-                }
-                DiffType::Error => {
-                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::Red)))
-                }
-                _ => highlight_line(line, diff.background()),
+            .zip(&self.rules)
+            .map(|((line, diff), rule)| {
+                let mut styled = match diff {
+                    DiffType::File => Line::from(Span::styled(
+                        line.clone(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    DiffType::Hunk => {
+                        Line::from(Span::styled(line.clone(), Style::default().fg(Color::Blue)))
+                    }
+                    DiffType::Error => {
+                        Line::from(Span::styled(line.clone(), Style::default().fg(Color::Red)))
+                    }
+                    _ => highlight_line(line, diff.background()),
+                };
+                // The bar takes the selected rule's own color in the rules
+                // panel, which is what ties the two together
+                let gutter = match (rule, selected) {
+                    (Some(rule), Some(selected)) if *rule == selected => {
+                        Span::styled(GUTTER_MARK, Style::default().fg(Color::Yellow))
+                    }
+                    _ => Span::raw(GUTTER_BLANK),
+                };
+                styled.spans.insert(0, gutter);
+                styled
             })
             .collect()
     }
+}
+
+/// The rule owning each line of a pipeline file, indexed like the lines
+/// [`TextDiff::from_lines`] splits it into.
+///
+/// A job starts at a `key:` line whose key `owner` recognizes and runs over
+/// every following line indented deeper than it; blank lines don't end it.
+/// That reads jobs out of a `jobs:` mapping (GitHub, Gitea, CircleCI) and
+/// off the document root (GitLab) alike. Comment lines are measured at their
+/// hash column plus the indent of what follows the hash — the way a
+/// commented-out job is recognized when merging — so a disabled job is
+/// found, and a comment nested inside a job stays part of it. List items
+/// never start a job, which keeps `needs:` entries and CircleCI's workflow
+/// job lists from being taken for one.
+fn job_owners(text: &str, owner: &JobOwner) -> Vec<Option<&'static str>> {
+    let mut current: Option<(usize, &'static str)> = None;
+    text.lines()
+        .map(|line| {
+            let Some((indent, body)) = measure_line(line) else {
+                return current.map(|(_, rule)| rule);
+            };
+            if current.is_some_and(|(job_indent, _)| indent <= job_indent) {
+                current = None;
+            }
+            if current.is_none() {
+                current = header_key(body).and_then(owner).map(|rule| (indent, rule));
+            }
+            current.map(|(_, rule)| rule)
+        })
+        .collect()
+}
+
+/// A line's effective indent and its content, comment marker stripped;
+/// `None` for a line with no content, comment or otherwise
+fn measure_line(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    let (indent, body) = match trimmed.strip_prefix('#') {
+        Some(comment) => {
+            let comment = comment.strip_prefix(' ').unwrap_or(comment);
+            let body = comment.trim_start();
+            (indent + comment.len() - body.len(), body)
+        }
+        None => (indent, trimmed),
+    };
+    (!body.is_empty()).then_some((indent, body))
+}
+
+/// The key a `key:` line opens, quotes removed; `None` for anything else
+fn header_key(body: &str) -> Option<&str> {
+    if body.starts_with('-') {
+        return None;
+    }
+    let (key, rest) = body.split_once(':')?;
+    if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    let key = key.trim();
+    let key = key
+        .strip_prefix('"')
+        .and_then(|k| k.strip_suffix('"'))
+        .or_else(|| key.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
+        .unwrap_or(key);
+    (!key.is_empty()).then_some(key)
 }
 
 /// Draw the editor. `help_image` is the emblem shown in the help dialog,
@@ -266,14 +420,25 @@ fn render_rules_panel(f: &mut Frame, area: Rect, state: &EditorState) {
             (Row::Checkbox { knob, value }, _) => Line::from(vec![
                 Span::styled(
                     format!("       {} ", if *value { "[✓]" } else { "[ ]" }),
-                    Style::default().fg(if *value { Color::Green } else { Color::DarkGray }),
+                    Style::default().fg(if *value {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
                 Span::styled(
                     knob.label(),
                     Style::default().fg(knob_value_color(is_selected, *value)),
                 ),
             ]),
-            (Row::Version { index: Some(_), value, .. }, _) => Line::from(vec![
+            (
+                Row::Version {
+                    index: Some(_),
+                    value,
+                    ..
+                },
+                _,
+            ) => Line::from(vec![
                 dim(knob_prefix(row)),
                 Span::styled(
                     value.clone(),
@@ -396,7 +561,10 @@ fn render_preview_panel(f: &mut Frame, area: Rect, state: &EditorState) -> Rect 
         .border_style(panel_border(state.focus == Focus::Preview, Color::Cyan));
     let inner = block.inner(area);
 
-    let preview = Paragraph::new(state.preview.visible(state.preview_scroll, inner.height))
+    let lines = state
+        .preview
+        .visible(state.preview_scroll, inner.height, state.selected_rule());
+    let preview = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((state.preview_scroll, 0))
         .block(block);
@@ -965,8 +1133,18 @@ mod tests {
             },
         };
         let mut preview = PreviewDiff::default();
-        preview.push_file(&update, new);
+        preview.push_file(&update, new, &owned_by_prefix);
         preview
+    }
+
+    /// Test ownership: `rule-a` owns `a` and `a-*`, `rule-b` owns `b`
+    fn owned_by_prefix(key: &str) -> Option<&'static str> {
+        match key {
+            "a" => Some("rule-a"),
+            key if key.starts_with("a-") => Some("rule-a"),
+            "b" => Some("rule-b"),
+            _ => None,
+        }
     }
 
     /// (text, foreground, background) of every span on a line
@@ -1045,7 +1223,16 @@ mod tests {
                 ("@@ -1,2 +1,2 @@".to_string(), DiffType::Hunk),
             ]
         );
-        let lines = preview.visible(0, u16::MAX).split_off(2);
+        // Past the gutter, which no rule is selected to mark
+        let lines: Vec<Line> = preview
+            .visible(0, u16::MAX, None)
+            .split_off(2)
+            .into_iter()
+            .map(|mut line| {
+                assert_eq!(line.spans.remove(0).content, GUTTER_BLANK);
+                line
+            })
+            .collect();
         let backgrounds: Vec<(String, Option<Color>)> = lines
             .iter()
             .map(|l| {
@@ -1096,8 +1283,8 @@ mod tests {
 
         for scroll in [0, 1, 9, 40, 300, 700] {
             assert_eq!(
-                draw(preview.visible(scroll, height), scroll),
-                draw(preview.visible(0, u16::MAX), scroll),
+                draw(preview.visible(scroll, height, None), scroll),
+                draw(preview.visible(0, u16::MAX, None), scroll),
                 "scrolled to {scroll}"
             );
         }
@@ -1137,5 +1324,232 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Each line of `text` next to the rule `job_owners` gives it
+    fn owners_of(text: &str) -> Vec<(&str, Option<&'static str>)> {
+        text.lines()
+            .zip(job_owners(text, &owned_by_prefix))
+            .collect()
+    }
+
+    /// Jobs under `jobs:` run over everything indented below their key,
+    /// blank lines and nested comments included, and stop at the next line
+    /// that isn't; list items naming a job are not the job
+    #[test]
+    fn test_job_owners_under_a_jobs_key() {
+        let text = "on: push\njobs:\n  a:\n    runs-on: x\n      # nested\n    steps:\n\n      \
+                    - run: echo\n  # a note\n  custom:\n    needs:\n      - a\n  b:\n    \
+                    run: 1\ntop: 1\n";
+        let rule_a = Some("rule-a");
+        assert_eq!(
+            owners_of(text),
+            [
+                ("on: push", None),
+                ("jobs:", None),
+                ("  a:", rule_a),
+                ("    runs-on: x", rule_a),
+                ("      # nested", rule_a),
+                ("    steps:", rule_a),
+                ("", rule_a),
+                ("      - run: echo", rule_a),
+                ("  # a note", None),
+                ("  custom:", None),
+                ("    needs:", None),
+                ("      - a", None),
+                ("  b:", Some("rule-b")),
+                ("    run: 1", Some("rule-b")),
+                ("top: 1", None),
+            ]
+        );
+    }
+
+    /// GitLab keeps its jobs at the root, among configuration keys
+    #[test]
+    fn test_job_owners_at_the_root() {
+        let text = "stages:\n  - test\n\"a-x\":\n  script:\n    - echo\nvariables:\n  A: 1\n";
+        let owners: Vec<_> = owners_of(text).into_iter().map(|(_, rule)| rule).collect();
+        assert_eq!(
+            owners,
+            [
+                None,
+                None,
+                Some("rule-a"),
+                Some("rule-a"),
+                Some("rule-a"),
+                None,
+                None
+            ]
+        );
+    }
+
+    /// A commented-out job is still that rule's job
+    #[test]
+    fn test_job_owners_of_a_disabled_job() {
+        let text = "jobs:\n  # a:\n  #   runs-on: x\n  #\n  b:\n    run: 1\n";
+        let owners: Vec<_> = owners_of(text).into_iter().map(|(_, rule)| rule).collect();
+        assert_eq!(
+            owners,
+            [
+                None,
+                Some("rule-a"),
+                Some("rule-a"),
+                Some("rule-a"),
+                Some("rule-b"),
+                Some("rule-b")
+            ]
+        );
+    }
+
+    /// A change deep inside a job, with its key line far outside the hunk's
+    /// context, still belongs to the job; the anchor backs up over the
+    /// headers above it, and a job the diff doesn't reach has none
+    #[test]
+    fn test_anchor_finds_a_change_deep_inside_a_job() {
+        let body = |changed: &str| -> String {
+            (0..20)
+                .map(|i| match i {
+                    15 => format!("    k{i}: {changed}\n"),
+                    _ => format!("    k{i}: v\n"),
+                })
+                .collect()
+        };
+        let old = format!("jobs:\n  a:\n{}  b:\n    x: 1\n", body("old"));
+        let new = format!("jobs:\n  a:\n{}  b:\n    x: 1\n", body("new"));
+        let preview = diff_of(Some(&old), &new);
+
+        assert!(!preview.lines.iter().any(|(line, _)| line == "  a:"));
+        for ((line, kind), rule) in preview.lines.iter().zip(&preview.rules) {
+            if matches!(kind, DiffType::Added | DiffType::Removed) {
+                assert_eq!(*rule, Some("rule-a"), "{line}");
+            }
+        }
+        // The file banner and the @@ line sit directly above the job's lines
+        assert_eq!(preview.anchor("rule-a"), Some(0));
+        assert_eq!(preview.anchor("rule-b"), None);
+        assert_eq!(preview.anchor("rule-c"), None);
+    }
+
+    /// The selected rule's job is marked in the gutter, and nothing else is
+    #[test]
+    fn test_gutter_marks_only_the_selected_job() {
+        let preview = diff_of(None, "jobs:\n  a:\n    run: 1\n  b:\n    run: 2\n");
+        let gutters = |selected| -> Vec<String> {
+            preview
+                .visible(0, u16::MAX, selected)
+                .iter()
+                .map(|line| line.spans[0].content.to_string())
+                .collect()
+        };
+        let (mark, blank) = (GUTTER_MARK.to_string(), GUTTER_BLANK.to_string());
+        // banner, @@, jobs:, a:, run, b:, run
+        assert_eq!(
+            gutters(Some("rule-b")),
+            [&blank, &blank, &blank, &blank, &blank, &mark, &mark].map(String::clone)
+        );
+        assert!(gutters(None).iter().all(|gutter| *gutter == blank));
+    }
+
+    /// Index of the rule row `id`
+    fn rule_row_index(state: &EditorState, id: &str) -> usize {
+        state
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Rule(rule) if rule.id == id))
+            .unwrap()
+    }
+
+    /// Put the cursor on `index` the way the arrow keys would
+    fn move_to(state: &mut EditorState, index: usize) {
+        let delta = index as isize - state.cursor as isize;
+        state.move_cursor(delta);
+    }
+
+    /// Put the cursor on the rule row `id` the way the arrow keys would
+    fn select(state: &mut EditorState, id: &str) {
+        let index = rule_row_index(state, id);
+        move_to(state, index);
+    }
+
+    /// Selecting a rule scrolls its job to the top of the preview, which is
+    /// where the rows of every line before it end; a rule whose job update
+    /// leaves alone leaves the preview where it was
+    #[test]
+    fn test_selecting_a_rule_scrolls_to_its_job() {
+        let (_dir, mut state) = expanded_state();
+        write_pipeline(&mut state);
+        toggle_rule(&mut state, "rust-fmt");
+        toggle_rule(&mut state, "docker-build");
+        // Short enough that both removals can't be on screen at once
+        state.set_preview_viewport((60, 4));
+        let (width, height) = state.preview_viewport;
+        let max = state.preview.max_scroll(width, height);
+
+        let mut scrolls = Vec::new();
+        for id in ["rust-fmt", "docker-build"] {
+            select(&mut state, id);
+            let anchor = state.preview.anchor(id).expect("job is in the diff");
+            assert_eq!(
+                state.preview_scroll,
+                state.preview.rows_before(anchor, width).min(max),
+                "{id}\n{}",
+                preview_text(&state)
+            );
+            scrolls.push(state.preview_scroll);
+        }
+        assert_ne!(scrolls[0], scrolls[1], "{}", preview_text(&state));
+
+        // rust-test's job is unchanged, so there is nothing to scroll to
+        let before = state.preview_scroll;
+        select(&mut state, "rust-test");
+        assert_eq!(state.selected_rule(), Some("rust-test"));
+        assert_eq!(state.preview_scroll, before);
+    }
+
+    /// A config-option row stands for the rule it sits under
+    #[test]
+    fn test_knob_rows_follow_their_rule() {
+        let (_dir, mut state) = expanded_state();
+        write_pipeline(&mut state);
+        toggle_rule(&mut state, "docker-release");
+        let knob = rule_row_index(&state, "docker-release") + 1;
+        assert!(matches!(state.rows[knob], Row::TextKnob { .. }));
+
+        // Scrolled somewhere else entirely, so landing on the anchor is the
+        // knob row's doing
+        state.preview_scroll = u16::MAX;
+        move_to(&mut state, knob);
+        assert_eq!(state.selected_rule(), Some("docker-release"));
+        let anchor = state.preview.anchor("docker-release").unwrap();
+        assert_eq!(usize::from(state.preview_scroll), anchor);
+    }
+
+    /// The marked lines on screen are the selected rule's job: they hold
+    /// its removed commands, and go away when a rule without a change in the
+    /// diff is selected
+    #[test]
+    fn test_selected_job_is_marked_on_screen() {
+        let (_dir, mut state) = expanded_state();
+        write_pipeline(&mut state);
+        toggle_rule(&mut state, "docker-build");
+
+        // The preview's part of each marked screen line, past the gutter
+        let marked = |state: &EditorState| -> Vec<String> {
+            let edge = format!("│{GUTTER_MARK}");
+            rendered_screen(state, 140, 60)
+                .into_iter()
+                .filter_map(|line| Some(line.split_once(&edge)?.1.to_string()))
+                .collect()
+        };
+        let lines = marked(&state);
+        assert!(
+            lines.iter().any(|line| line.contains("docker build")),
+            "{}",
+            lines.join("\n")
+        );
+        assert!(lines.iter().all(|line| !line.contains("rust-test")));
+
+        select(&mut state, "rust-test");
+        assert!(marked(&state).is_empty());
     }
 }

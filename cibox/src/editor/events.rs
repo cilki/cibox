@@ -82,10 +82,9 @@ pub fn handle_key_event(state: &mut EditorState, key: KeyEvent) {
             // Remove the toolchain version under the cursor
             KeyCode::Char('d') | KeyCode::Delete => state.delete_current_version(),
 
-            KeyCode::Up => state.cursor = state.cursor.saturating_sub(1),
-            KeyCode::Down => {
-                state.cursor = (state.cursor + 1).min(state.rows.len().saturating_sub(1));
-            }
+            // The preview follows the cursor to its rule's job
+            KeyCode::Up => state.move_cursor(-1),
+            KeyCode::Down => state.move_cursor(1),
             _ => {}
         },
         Focus::Preview => match key.code {
@@ -217,13 +216,14 @@ mod tests {
         let mut state = state_for(dir.path());
         state.cursor = 1;
         let rows = state.rows.len();
+        let scroll = state.preview_scroll;
 
         for c in ['h', 'j', 'k', 'l', 'J', 'K'] {
             press(&mut state, KeyCode::Char(c));
         }
         assert_eq!(state.cursor, 1);
         assert_eq!(state.rows.len(), rows, "nothing was expanded");
-        assert_eq!(state.preview_scroll, 0);
+        assert_eq!(state.preview_scroll, scroll);
     }
 
     #[test]
@@ -280,6 +280,8 @@ mod tests {
         let dir = project_with_pipeline();
         let mut state = state_for(dir.path());
         state.preview_viewport = (80, 5);
+        // From the top, rather than wherever the cursor's rule put it
+        state.preview_scroll = 0;
         let cursor = state.cursor;
         press(&mut state, KeyCode::Tab);
 
@@ -308,6 +310,37 @@ mod tests {
         assert!(max > 5);
         press(&mut state, KeyCode::Down);
         assert_eq!(state.preview_scroll, max);
+    }
+
+    #[test]
+    fn test_arrows_in_the_rules_take_the_preview_to_the_rule_job() {
+        let dir = project_with_pipeline();
+        let mut state = state_for(dir.path());
+        state.preview_viewport = (80, 5);
+        let target = rule_index(&state, "docker-build");
+        state.cursor = target - 1;
+        state.preview_scroll = 0;
+
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.cursor, target);
+        let (width, height) = state.preview_viewport;
+        let anchor = state.preview.anchor("docker-build").expect("job is added");
+        let expected = state
+            .preview
+            .rows_before(anchor, width)
+            .min(state.preview.max_scroll(width, height));
+        assert!(expected > 0, "docker-build's job starts below the top");
+        assert_eq!(state.preview_scroll, expected);
+
+        // Scrolling the focused preview by hand is not undone...
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::Up);
+        assert_eq!(state.preview_scroll, expected - 1);
+        // ...until the rules cursor moves again
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::Up);
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.preview_scroll, expected);
     }
 
     #[test]

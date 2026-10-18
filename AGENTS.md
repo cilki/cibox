@@ -45,7 +45,10 @@ auto-enabled by detection and individually overridable in `cibox.ron`.
   preview pane diffs `generator::pending_update` against the files on disk.
   That is the same decision `cibox update` makes, so the preview can't
   drift from the command. Files update would create show as all-added; the
-  pane is hidden only when nothing would change.
+  pane is hidden only when nothing would change. Every preview line records
+  the rule whose job it belongs to (via `Rule::owns_job_id`), so the pane
+  scrolls to the selected rule's changed job and marks its lines in the
+  gutter.
 
 To add a rule:
 

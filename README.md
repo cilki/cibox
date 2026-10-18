@@ -49,8 +49,8 @@ working pipeline: detection picks the rules and the target platform is inferred
 from existing CI configuration, then from your git remote's host, falling back
 to GitHub Actions. After that, a plain `cibox update` refreshes every platform
 that has a cibox-managed file (listed below) on disk, and creates nothing for
-the others. Pass `--github`, `--gitea`, `--gitlab` or `--circleci` to choose
-the platforms explicitly, in any combination.
+the others. Pass `--github`, `--gitea`, `--gitlab` or `--circleci` to choose the
+platforms explicitly, in any combination.
 
 ```
 $ cibox                             # interactive TUI to toggle rules
@@ -246,40 +246,3 @@ name = "ron"
 file-types = ["ron", { glob = "cibox.ron" }]
 language-servers = ["cibox-lsp"]
 ```
-
-## Interactive editor
-
-`cibox` with no arguments opens the TUI — `cibox editor --dir <path>` for a
-project somewhere else. Rules are on the left. On the right is a preview of
-what the next `cibox update` would change in the pipeline files on disk, as
-diff hunks per file. Files `update` would create are shown whole, so in a
-repository without CI config yet the preview is the entire pipeline. The preview
-is hidden when `update` would change nothing.
-
-| Key               | Action                                                            |
-| ----------------- | ----------------------------------------------------------------- |
-| `↑`/`↓`           | move through the rules, or scroll the preview when it has focus   |
-| `PgUp`/`PgDn`     | scroll the preview a page                                         |
-| `Space`/`Enter`   | toggle the rule under the cursor, or edit the knob                |
-| `→`/`←`           | show or hide a rule's knobs (the docker and test rules have them) |
-| `d`/`Del`         | drop the toolchain version under the cursor                       |
-| `Tab`             | move focus between the rules and the preview                      |
-| `?`               | show the keybindings                                              |
-| `q`/`Esc`         | quit (`Esc` in the preview returns to the rules)                  |
-| `Ctrl+C`          | quit from anywhere, including mid-edit                            |
-
-Expanding `docker-build`/`docker-release` shows the image name and the target
-platforms, `aur-release` its comma-separated package list, and `android-build`
-its project directory, apt packages, and rust toolchain; expanding a test rule
-shows its `versions` list, where `Enter` on the trailing add row appends a
-toolchain version and `d` removes the one under the cursor.
-
-Toggling a rule or changing a knob saves `cibox.ron` right away — there is no
-separate save key for it, and the file stays delta-only, so flipping a rule back
-to what detection says drops it from the file again.
-
-The editor never writes the pipeline files themselves; run `cibox update` to
-apply what the preview shows. The preview targets the platforms a plain
-`cibox update` would (every one with a cibox pipeline on disk, or the inferred
-one) and merges the same way, so jobs you added by hand never show up as
-removed.
