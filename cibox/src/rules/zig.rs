@@ -3,7 +3,7 @@ use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
 
 fn is_zig(facts: &ProjectFacts) -> bool {
-    facts.zig.is_some()
+    facts.zig
 }
 
 /// Compiling jobs share a project-relative cache; the global (package) cache
