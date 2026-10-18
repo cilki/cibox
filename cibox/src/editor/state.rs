@@ -3,7 +3,7 @@ use crate::detection::ProjectFacts;
 use crate::editor::ui::PreviewDiff;
 use crate::error::Result;
 use crate::generator::JobFilter;
-use crate::rules::{clean_versions, resolve};
+use crate::rules::{clean_versions, resolve, ResolvedRule};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -424,10 +424,13 @@ impl EditorState {
         }
     }
 
-    /// Re-resolve rules against the current config and recompute what
-    /// `cibox update` would change. The pipeline files are re-read every time,
-    /// so an update run from another terminal shows up on the next edit.
-    pub fn refresh(&mut self) {
+    /// Re-resolve rules against the current config and rebuild the checklist
+    /// rows, returning the resolution they were built from.
+    ///
+    /// Only the rows. Which rules have their config options showing is not
+    /// part of what `cibox update` would write, so expanding one needs
+    /// nothing else (see [`Self::expand_current`]).
+    fn rebuild_rows(&mut self) -> Vec<ResolvedRule> {
         let resolved = resolve(&self.facts, &self.config);
         self.rows = Vec::new();
         for r in &resolved {
@@ -450,6 +453,21 @@ impl EditorState {
         if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
         }
+        resolved
+    }
+
+    /// Rebuild the checklist and recompute what `cibox update` would change.
+    /// The pipeline files are re-read every time, so an update run from
+    /// another terminal shows up on the next edit.
+    ///
+    /// Recomputing the preview means merging cibox's output into every
+    /// pipeline file on disk, which is nearly the whole cost of an edit —
+    /// 0.96 ms on this repository's own pipeline, 4.5 ms on one carrying a
+    /// couple of hundred hand-written jobs — so only the things that change
+    /// what update would write come through here. Moving the cursor and
+    /// expanding a rule go to [`Self::rebuild_rows`] instead.
+    pub fn refresh(&mut self) {
+        let resolved = self.rebuild_rows();
 
         // Exactly what a plain `cibox update` would decide: the platforms it
         // would pick, every rule selected, merging rather than forcing
@@ -712,11 +730,18 @@ impl EditorState {
         }
     }
 
-    /// Show the config options of the rule under the cursor
+    /// Show the config options of the rule under the cursor.
+    ///
+    /// Expanding a rule adds rows to the checklist and changes nothing a
+    /// `cibox update` would write, so the preview is kept as it stands
+    /// rather than recomputed from the files on disk — all of which
+    /// [`Self::refresh`] would re-read and re-parse for an answer identical
+    /// to the one already in hand.
     pub fn expand_current(&mut self) {
         if let Some(Row::Rule(rule)) = self.rows.get(self.cursor) {
             if rule.expandable && self.expanded.insert(rule.id) {
-                self.refresh();
+                self.rebuild_rows();
+                self.follow_cursor();
             }
         }
     }
@@ -732,7 +757,8 @@ impl EditorState {
     }
 
     /// Hide the config options of the rule under the cursor (jumping to the
-    /// parent rule first when on a child row)
+    /// parent rule first when on a child row). Rows only, for the reason
+    /// [`Self::expand_current`] gives.
     pub fn collapse_current(&mut self) {
         let Some(parent) = self.parent_rule_index(self.cursor) else {
             return;
@@ -742,7 +768,8 @@ impl EditorState {
         };
         if self.expanded.remove(rule.id) {
             self.cursor = parent;
-            self.refresh();
+            self.rebuild_rows();
+            self.follow_cursor();
         }
     }
 
@@ -995,6 +1022,45 @@ mod tests {
         state.collapse_current();
         assert_eq!(state.cursor, rule_index(&state, "docker-release"));
         assert_eq!(state.rows.len(), collapsed_len);
+    }
+
+    /// Expanding a rule shows more of what is already resolved, so it must
+    /// not go back to the pipeline files: merging cibox's output into them is
+    /// nearly the whole cost of an edit, and the answer cannot have changed.
+    /// A pipeline written behind the editor's back is the only way to see
+    /// which one happened — it is picked up by a refresh and not by an
+    /// expand.
+    #[test]
+    fn test_expanding_a_rule_does_not_re_read_the_pipeline() {
+        let dir = docker_dir();
+        let mut state = state_for(dir.path());
+        assert!(state.preview_shown(), "update would create the pipeline");
+
+        // What update would write, written for it
+        let resolved = resolve(&state.facts, &state.config);
+        for (path, content) in
+            crate::generator::generate(&state.facts, &resolved, state.platforms[0]).unwrap()
+        {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+
+        state.cursor = rule_index(&state, "docker-release");
+        let collapsed_len = state.rows.len();
+        state.expand_current();
+        assert!(state.rows.len() > collapsed_len, "the knob rows are shown");
+        assert!(
+            state.preview_shown(),
+            "expanding re-read the files it had no reason to"
+        );
+        state.collapse_current();
+        assert_eq!(state.rows.len(), collapsed_len);
+        assert!(state.preview_shown(), "collapsing re-read them too");
+
+        // An edit does look again, and finds nothing left to do
+        state.refresh();
+        assert!(!state.preview_shown());
     }
 
     #[test]
