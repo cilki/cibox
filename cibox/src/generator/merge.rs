@@ -18,6 +18,7 @@ use crate::error::Result;
 use crate::generator::disabled::{self, DisabledBlock, Scan};
 use crate::generator::{JobFilter, PlannedFile};
 use crate::ir::Job;
+use crate::platforms::github::lower::{tag_gate as gate_of_triggers, TagGate};
 use anyhow::{anyhow, bail, Context};
 use serde_yaml::Value;
 use std::borrow::Cow;
@@ -735,6 +736,25 @@ fn header_jobs(
         .collect()
 }
 
+/// What gates the tags-only jobs of the workflow being merged into.
+///
+/// Rendering a release workflow whole, `on: push: tags: [v*]` is the gate and
+/// the jobs carry no `if:`. A merge inherits the triggers of the file on disk
+/// instead — they are the user's, and `update` keeps them — so a release
+/// workflow that was hand-written, adopted from another tool, or edited since
+/// may well run on branch pushes or pull requests. The jobs in it hold the
+/// publish credentials (`cargo publish`, `docker push`, the AUR key), so when
+/// the file's own triggers don't gate them, each one gets the same `if:` it
+/// would get inside `ci.yml`.
+///
+/// A file with no triggers at all is about to be given cibox's own, below.
+fn tag_gate(file: &PlannedFile, current: &serde_yaml::Mapping) -> TagGate {
+    match (TagGate::of(file.kind), get(current, "on")) {
+        (TagGate::Workflow, Some(on)) => gate_of_triggers(on),
+        (gate, _) => gate,
+    }
+}
+
 fn merge_github(
     file: &PlannedFile,
     filter: &JobFilter,
@@ -748,9 +768,10 @@ fn merge_github(
     let region = JobsAt::JobsKey.resolve(parse, &file.path)?;
     let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
 
-    let canonical = serde_yaml::to_value(crate::platforms::github::lower::lower_github(
+    let canonical = serde_yaml::to_value(crate::platforms::github::lower::lower_github_gated(
         &split.kept(),
         file.kind,
+        tag_gate(file, parse.values()?),
     ))?;
     let canonical_jobs = canonical_job_mapping(&canonical);
     let plan = JobsPlan {
@@ -1444,6 +1465,126 @@ jobs:
         let (content, counts) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
         assert!(!content.contains("rust-fmt"), "{}", content);
         assert_eq!(counts.removed, 1);
+    }
+
+    /// Whether a merge's output gates `id` on a version tag, either on the
+    /// job or through the workflow's own triggers
+    fn gated_on_tags(content: &str, id: &str) -> (bool, bool) {
+        let doc: Value = serde_yaml::from_str(content).unwrap();
+        let job = doc["jobs"][id]
+            .as_mapping()
+            .unwrap_or_else(|| panic!("{id} missing from {content}"))
+            .clone();
+        let by_job = get(&job, "if").and_then(Value::as_str)
+            == Some("startsWith(github.ref, 'refs/tags/v')");
+        (by_job, gate_of_triggers(&doc["on"]) == TagGate::Workflow)
+    }
+
+    /// A release workflow's triggers are what keeps `cargo publish` and
+    /// `docker push` off branch pushes, and a merge keeps the triggers the
+    /// file came with — so a file whose triggers don't gate them has to have
+    /// the jobs gated instead.
+    #[test]
+    fn test_github_release_merge_gates_jobs_the_triggers_do_not() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitHub, &resolved, 1);
+        assert!(file.jobs.iter().all(|j| j.tags_only), "fixture rot");
+        let filter = no_selection(&resolved);
+
+        // A release.yml that was not cibox's: it builds on pull requests and
+        // pushes to main, and holds a stale copy of a managed job
+        let existing = r#"name: Release
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  rust-release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+"#;
+
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        // The user's triggers survive, so every managed job carries the gate
+        assert!(content.contains("pull_request"), "{content}");
+        for job in &file.jobs {
+            assert_eq!(
+                gated_on_tags(&content, &job.id),
+                (true, false),
+                "{} is not gated in {content}",
+                job.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_release_merge_leaves_a_tag_gated_file_alone() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitHub, &resolved, 1);
+        let filter = no_selection(&resolved);
+
+        // cibox's own output: the workflow is the gate, so adding an `if:`
+        // to every job would be noise — and would rewrite the file on an
+        // `update` that has nothing to do
+        let canonical = render_file(Platform::GitHub, &file).unwrap();
+        assert!(matches!(
+            merge_file(Platform::GitHub, &file, &filter, &canonical).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+        for job in &file.jobs {
+            assert_eq!(
+                gated_on_tags(&canonical, &job.id),
+                (false, true),
+                "{}",
+                job.id
+            );
+        }
+
+        // A hand-written file that gates just as well keeps the same treatment
+        let existing = r#"name: Publish
+on:
+  push:
+    tags: [v*]
+jobs:
+  rust-release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+"#;
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert_eq!(
+            gated_on_tags(&content, "rust-release"),
+            (false, true),
+            "{content}"
+        );
+    }
+
+    /// A release workflow with no triggers at all is given cibox's own, which
+    /// gate it — the jobs need nothing
+    #[test]
+    fn test_github_release_merge_without_triggers_scaffolds_the_tag_trigger() {
+        let facts = cargo_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = plan(&facts, &resolved, Platform::GitHub)
+            .unwrap()
+            .swap_remove(1);
+        let filter = no_selection(&resolved);
+
+        let existing = r#"jobs:
+  rust-release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo stale
+"#;
+        let (content, _) = merged(merge_file(Platform::GitHub, &file, &filter, existing).unwrap());
+        assert_eq!(
+            gated_on_tags(&content, "rust-release"),
+            (false, true),
+            "{content}"
+        );
     }
 
     #[test]

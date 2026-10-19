@@ -13,10 +13,108 @@ pub enum WorkflowKind {
     Release,
 }
 
+/// What keeps a tags-only job — the ones holding the publish credentials —
+/// from running on a branch push: the workflow's own triggers, or an `if:`
+/// on each such job.
+///
+/// Rendering a file from scratch, the two are the same question: the release
+/// workflow is written with `on: push: tags: [v*]` and nothing else. A merge
+/// into a file that already exists is not, because `update` leaves the user's
+/// triggers alone — see [`tag_gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagGate {
+    /// The workflow only runs on `v*` tag pushes, so its jobs need nothing
+    Workflow,
+    /// The workflow can run otherwise, so every tags-only job carries the gate
+    Job,
+}
+
+impl TagGate {
+    /// The gate implied by a file cibox writes whole
+    pub fn of(kind: WorkflowKind) -> Self {
+        match kind {
+            WorkflowKind::Ci => TagGate::Job,
+            WorkflowKind::Release => TagGate::Workflow,
+        }
+    }
+}
+
+/// Whether the triggers `on` restrict a workflow to `v*` tag pushes, which
+/// is the only thing standing between a tags-only job and a branch push in a
+/// release workflow: the jobs in that file carry no `if:` of their own.
+///
+/// `update` merges into an existing workflow and keeps whatever triggers it
+/// finds there, so the file's `on:` is not cibox's to assume. The shape that
+/// gates is the one cibox writes itself:
+///
+/// ```yaml
+/// on:
+///   push:
+///     tags:
+///     - v*
+/// ```
+///
+/// Any other trigger beside it (`pull_request`, `workflow_dispatch`,
+/// `schedule`), a `branches` filter sharing the push — GitHub ORs the two, so
+/// branch pushes fire it — or a tag pattern that admits more than `v*` all
+/// mean the workflow can run on something that is not a version tag, and the
+/// gate has to move onto the jobs.
+///
+/// Narrow on purpose. A wrong [`TagGate::Job`] costs an `if:` that is true on
+/// a `v*` tag push anyway; a wrong [`TagGate::Workflow`] takes the gate off a
+/// job that publishes releases.
+pub fn tag_gate(on: &serde_yaml::Value) -> TagGate {
+    // `on: [push]` and `on: push` name triggers without configuring them,
+    // so neither can carry a tag filter
+    let Some(triggers) = on.as_mapping() else {
+        return TagGate::Job;
+    };
+    let mut triggers = triggers.iter();
+    let (Some((event, push)), None) = (triggers.next(), triggers.next()) else {
+        return TagGate::Job;
+    };
+    if event.as_str() != Some("push") {
+        return TagGate::Job;
+    }
+    let Some(push) = push.as_mapping() else {
+        return TagGate::Job;
+    };
+    let mut tags = None;
+    for (key, value) in push {
+        match key.as_str() {
+            Some("tags") => tags = Some(value),
+            // `branches`, `paths`, `tags-ignore`, anything unrecognized
+            _ => return TagGate::Job,
+        }
+    }
+    let gated = match tags {
+        // A lone pattern may be written as a string
+        Some(serde_yaml::Value::String(pattern)) => pattern.starts_with('v'),
+        Some(serde_yaml::Value::Sequence(patterns)) => {
+            !patterns.is_empty()
+                && patterns
+                    .iter()
+                    .all(|p| p.as_str().is_some_and(|p| p.starts_with('v')))
+        }
+        _ => false,
+    };
+    if gated {
+        TagGate::Workflow
+    } else {
+        TagGate::Job
+    }
+}
+
 pub fn lower_github(jobs: &[Job], kind: WorkflowKind) -> GitHubWorkflow {
+    lower_github_gated(jobs, kind, TagGate::of(kind))
+}
+
+/// Lower into a file whose triggers are already decided, which is what a
+/// merge has: `gate` says whether they gate the tags-only jobs.
+pub fn lower_github_gated(jobs: &[Job], kind: WorkflowKind, gate: TagGate) -> GitHubWorkflow {
     let lowered = jobs
         .iter()
-        .map(|job| (job.id.clone(), lower_job(job, kind)))
+        .map(|job| (job.id.clone(), lower_job(job, gate)))
         .collect();
 
     let on = match kind {
@@ -69,7 +167,7 @@ fn base_permissions() -> BTreeMap<String, String> {
     BTreeMap::from([("contents".to_string(), "read".to_string())])
 }
 
-fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
+fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
     let mut steps = Vec::new();
 
     for step in &job.steps {
@@ -221,9 +319,9 @@ fn lower_job(job: &Job, kind: WorkflowKind) -> GitHubJob {
         needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
         timeout_minutes: job.timeout_minutes,
         continue_on_error: None,
-        // A tags-only job inside a mixed CI workflow must not run on
-        // branch pushes or PRs; the release workflow is already tag-gated
-        if_expr: (job.tags_only && kind == WorkflowKind::Ci)
+        // A tags-only job must not run on branch pushes or PRs, so unless
+        // the workflow's own triggers already see to that, it says so itself
+        if_expr: (job.tags_only && gate == TagGate::Job)
             .then(|| "startsWith(github.ref, 'refs/tags/v')".to_string()),
     }
 }
@@ -377,6 +475,70 @@ mod tests {
             workflow.jobs["rust-release"].if_expr.as_deref(),
             Some("startsWith(github.ref, 'refs/tags/v')")
         );
+    }
+
+    /// The canonical release triggers, as `tag_gate` sees them coming back
+    /// off disk
+    fn triggers(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn test_only_a_v_tag_push_gates_the_workflow() {
+        // What cibox writes for a release workflow, in both tag spellings
+        for gated in [
+            "push:\n  tags:\n  - v*\n",
+            "push:\n  tags: [v*]\n",
+            "push:\n  tags: [v*, v?.?.?]\n",
+            "push:\n  tags: v*\n",
+        ] {
+            assert_eq!(tag_gate(&triggers(gated)), TagGate::Workflow, "{gated}");
+        }
+
+        for open in [
+            // Any trigger that is not a tag push can fire on a branch
+            "pull_request:\n",
+            "push: null\n",
+            "[push]\n",
+            "push\n",
+            "workflow_dispatch:\n",
+            "push:\n  branches: [main]\n",
+            "schedule:\n- cron: 0 0 * * *\n",
+            // ...including one sitting next to the tag push
+            "push:\n  tags: [v*]\npull_request:\n",
+            "workflow_dispatch:\npush:\n  tags: [v*]\n",
+            // GitHub ORs the two filters, so branch pushes fire this too
+            "push:\n  branches: [main]\n  tags: [v*]\n",
+            // Tags that are not version tags
+            "push:\n  tags: ['*']\n",
+            "push:\n  tags: [v*, nightly]\n",
+            "push:\n  tags: []\n",
+            "push:\n  tags-ignore: [draft*]\n",
+        ] {
+            assert_eq!(tag_gate(&triggers(open)), TagGate::Job, "{open}");
+        }
+    }
+
+    #[test]
+    fn test_tags_only_job_gated_by_the_job_when_the_workflow_does_not() {
+        // A release workflow whose triggers were changed: the file no longer
+        // gates the job, so the job has to
+        let workflow = lower_github_gated(
+            &[Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only()],
+            WorkflowKind::Release,
+            TagGate::Job,
+        );
+        assert_eq!(
+            workflow.jobs["rust-release"].if_expr.as_deref(),
+            Some("startsWith(github.ref, 'refs/tags/v')")
+        );
+        // Jobs that run on every push are not gated either way
+        let workflow = lower_github_gated(
+            &[Job::new("rust-test", "Cargo test", Stage::Test)],
+            WorkflowKind::Ci,
+            TagGate::Job,
+        );
+        assert_eq!(workflow.jobs["rust-test"].if_expr, None);
     }
 
     #[test]
