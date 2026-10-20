@@ -96,12 +96,27 @@ fn has_dependency(manifest: &serde_json::Value, name: &str) -> bool {
     })
 }
 
+/// The package manager to drive, and whether a lockfile was found.
+///
+/// The second half is not cosmetic: it is what decides between a lockfile
+/// install (`npm ci`) and a resolving one (`npm install`). Missing a lockfile
+/// that is there means CI resolves the dependency ranges in `package.json`
+/// afresh against the registry instead of installing the tree the project
+/// committed — and runs the install scripts of whatever that resolution
+/// picked.
+///
+/// npm has *two* lockfile names, not one. `npm-shrinkwrap.json` is the same
+/// format as `package-lock.json`, is equally honoured by `npm ci`, and takes
+/// precedence over it when both exist; it is what a project publishing to the
+/// registry commits, since npm strips `package-lock.json` from published
+/// tarballs but ships a shrinkwrap.
 fn package_manager(path: &Path) -> (NodePackageManager, bool) {
     let lockfiles = [
         ("bun.lockb", NodePackageManager::Bun),
         ("bun.lock", NodePackageManager::Bun),
         ("pnpm-lock.yaml", NodePackageManager::Pnpm),
         ("yarn.lock", NodePackageManager::Yarn),
+        ("npm-shrinkwrap.json", NodePackageManager::Npm),
         ("package-lock.json", NodePackageManager::Npm),
     ];
     for (file, pm) in lockfiles {
@@ -220,6 +235,8 @@ mod tests {
     fn test_package_manager_from_lockfile() {
         let cases = [
             ("package-lock.json", NodePackageManager::Npm),
+            // npm's other lockfile name, honoured by `npm ci` just the same
+            ("npm-shrinkwrap.json", NodePackageManager::Npm),
             ("yarn.lock", NodePackageManager::Yarn),
             ("pnpm-lock.yaml", NodePackageManager::Pnpm),
             ("bun.lockb", NodePackageManager::Bun),

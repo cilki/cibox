@@ -406,6 +406,31 @@ mod tests {
         )));
     }
 
+    /// `npm-shrinkwrap.json` is a lockfile too, and `npm ci` installs from it.
+    /// Taking `npm install` instead would discard the pinned tree and resolve
+    /// `package.json`'s ranges against the registry on every run.
+    #[test]
+    fn test_npm_shrinkwrap_is_a_lockfile_too() {
+        let facts = facts_with(&[
+            ("package.json", r#"{"scripts": {"test": "vitest"}}"#),
+            ("npm-shrinkwrap.json", "{}"),
+        ]);
+        let jobs = NodeTest::default().jobs(&facts);
+        let commands: Vec<&String> = jobs[0]
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Run { command, .. } => Some(command),
+                _ => None,
+            })
+            .collect();
+        assert!(commands.iter().any(|c| *c == "npm ci"), "{commands:?}");
+        assert!(
+            !commands.iter().any(|c| *c == "npm install"),
+            "{commands:?}"
+        );
+    }
+
     #[test]
     fn test_bun_switches_image() {
         let facts = facts_with(&[
