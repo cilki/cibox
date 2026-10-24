@@ -897,14 +897,21 @@ fn merge_gitlab(
     // Conform `stages` to what the final jobs reference. Canonical stages
     // cover the disabled jobs too, so a commented job's stage stays and
     // uncommenting it works without another update.
+    //
+    // Every root entry that isn't configuration counts, hidden
+    // `.`-prefixed templates included: a job reaches a template's `stage`
+    // through `extends` or a merge key without naming it itself, and GitLab
+    // rejects the whole pipeline ("chosen stage does not exist") when a job
+    // lands in a stage the final `stages:` doesn't declare.
     let mut final_jobs: Vec<&Value> = Vec::new();
-    for key in &region.keys {
-        if filter.managed(key) {
-            if let Some(canonical) = get(canonical_map, key) {
-                final_jobs.push(canonical);
-            }
-        } else if let Some(value) = get(current_map, key) {
-            final_jobs.push(value);
+    for (key, value) in current_map {
+        let Some(key) = key.as_str() else { continue };
+        if GITLAB_RESERVED.contains(&key) {
+            continue;
+        }
+        match filter.managed(key) {
+            true => final_jobs.extend(get(canonical_map, key)),
+            false => final_jobs.push(value),
         }
     }
     for id in &split.adds {
@@ -920,9 +927,13 @@ fn merge_gitlab(
         .and_then(Value::as_sequence)
         .cloned()
         .unwrap_or_default();
+    // An `include:`d file contributes jobs this document never shows, so
+    // there is no telling which of the declared stages they land in. Keep
+    // the list as it is and only append what cibox's own jobs need.
+    let prune = get(current_map, "include").is_none();
     let mut stages: Vec<Value> = existing_stages
         .iter()
-        .filter(|s| s.as_str().is_some_and(|s| referenced.contains(&s)))
+        .filter(|s| !prune || s.as_str().is_some_and(|s| referenced.contains(&s)))
         .cloned()
         .collect();
     for stage in get(canonical_map, "stages")
@@ -2590,6 +2601,71 @@ workflows:
 
         let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, &existing).unwrap());
         assert!(!content.contains("- gone"), "{content}");
+        assert!(matches!(
+            merge_file(Platform::GitLab, &file, &filter, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    /// A `stage` a job inherits instead of naming: GitLab's own idiom for
+    /// sharing job configuration is a hidden `.`-prefixed template plus
+    /// `extends`, and pruning the stage it declares leaves `deploy-prod`
+    /// in an undeclared stage — a pipeline GitLab refuses to run at all
+    /// ("chosen stage does not exist").
+    #[test]
+    fn test_gitlab_stage_of_an_extended_template_is_kept() {
+        let facts = cargo_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_release.enabled = Some(false);
+        let resolved = resolve(&facts, &config);
+        let file = plan(&facts, &resolved, Platform::GitLab)
+            .unwrap()
+            .swap_remove(0);
+        let filter = no_selection(&resolved);
+
+        let existing = "stages:\n- test\n- deploy\n\
+                        .deploy_template:\n  stage: deploy\n  image: alpine:latest\n\
+                        deploy-prod:\n  extends: .deploy_template\n  script: [echo deploying]\n";
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        let stages: Vec<&str> = doc["stages"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(stages.contains(&"deploy"), "{content}");
+        assert!(matches!(
+            merge_file(Platform::GitLab, &file, &filter, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    /// The jobs an `include:` brings in are invisible here, so which stages
+    /// are still referenced is unknowable and nothing may be pruned
+    #[test]
+    fn test_gitlab_stages_are_not_pruned_beside_an_include() {
+        let facts = cargo_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = plan(&facts, &resolved, Platform::GitLab)
+            .unwrap()
+            .swap_remove(0);
+        let filter = no_selection(&resolved);
+
+        let existing = "include:\n- local: /ci/common.yml\nstages:\n- test\n- integration\n";
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        let stages: Vec<&str> = doc["stages"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(stages.contains(&"integration"), "{content}");
+        // cibox's own jobs still get the stages they need appended
+        assert!(stages.contains(&"lint"), "{content}");
         assert!(matches!(
             merge_file(Platform::GitLab, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
