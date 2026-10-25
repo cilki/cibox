@@ -135,24 +135,36 @@ fn unquote_value(value: &str) -> String {
 }
 
 /// Split a remote URL into (host kind, "owner/repo").
-/// Handles `git@host:owner/repo.git` and `scheme://host/owner/repo.git`.
+///
+/// Git takes two shapes, and `:` means something different in each: in
+/// `scheme://[user[:password]@]host[:port]/owner/repo[.git]` it introduces a
+/// *port*, while in the scp-like `[user@]host:owner/repo[.git]` it introduces
+/// the *path*. Only the scheme tells them apart, so it has to be read first —
+/// taking `ssh://git@host:2222/owner/repo.git` for the scp shape makes
+/// `2222/owner/repo` the path, which is no slug at all, and the default image
+/// and AUR package names derived from it fall back to the local directory
+/// name without a word. A self-hosted forge reachable on a non-default SSH
+/// port is exactly the URL that happens to.
 fn parse_remote_url(url: &str) -> (Option<RemoteHost>, Option<String>) {
-    let (host, path) = if let Some(rest) = url.split_once('@').map(|(_, r)| r) {
-        // git@host:owner/repo.git or user@host/path
-        match rest.split_once(':') {
-            Some((host, path)) => (host, path),
-            None => match rest.split_once('/') {
-                Some((host, path)) => (host, path),
-                None => return (None, None),
-            },
-        }
-    } else if let Some(rest) = url.split_once("://").map(|(_, r)| r) {
-        match rest.split_once('/') {
-            Some((host, path)) => (host, path),
-            None => return (None, None),
-        }
-    } else {
+    let split = match url.split_once("://") {
+        // With a scheme the authority runs up to the first `/`
+        Some((_, rest)) => rest.split_once('/'),
+        // Without one this is scp-like, but only while the `:` comes before
+        // any `/`; otherwise the url is a plain local path
+        None => url
+            .split_once(':')
+            .filter(|(authority, _)| !authority.contains('/')),
+    };
+    let Some((authority, path)) = split else {
         return (None, None);
+    };
+
+    // `user[:password]@` is credentials rather than part of the host name...
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // ...and nor is a trailing `:port`
+    let host = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
     };
 
     let host_kind = if host.contains("github") {
@@ -203,6 +215,50 @@ mod tests {
     fn test_codeberg_maps_to_gitea() {
         let (host, _) = parse_remote_url("https://codeberg.org/owner/repo.git");
         assert_eq!(host, Some(RemoteHost::Gitea));
+    }
+
+    /// A port is part of the authority, not of the path: a self-hosted forge
+    /// on a non-default SSH port still has a slug. Gitea's own compose file
+    /// publishes 2222, so this is the url a self-hosted Gitea hands out.
+    #[test]
+    fn test_ssh_url_with_an_explicit_port() {
+        let (host, slug) = parse_remote_url("ssh://git@gitea.example.com:2222/acme/widget.git");
+        assert_eq!(host, Some(RemoteHost::Gitea));
+        assert_eq!(slug.as_deref(), Some("acme/widget"));
+
+        let (host, slug) = parse_remote_url("https://gitlab.example.com:8443/acme/widget");
+        assert_eq!(host, Some(RemoteHost::GitLab));
+        assert_eq!(slug.as_deref(), Some("acme/widget"));
+    }
+
+    /// Credentials in the authority are not part of the host name either
+    #[test]
+    fn test_url_with_credentials() {
+        let (host, slug) = parse_remote_url("https://oauth2:t0ken@gitlab.com/owner/repo.git");
+        assert_eq!(host, Some(RemoteHost::GitLab));
+        assert_eq!(slug.as_deref(), Some("owner/repo"));
+
+        let (host, slug) = parse_remote_url("ssh://git@github.com/owner/repo.git");
+        assert_eq!(host, Some(RemoteHost::GitHub));
+        assert_eq!(slug.as_deref(), Some("owner/repo"));
+    }
+
+    /// The scp-like shape carries no user when the remote is configured for
+    /// one in `~/.ssh/config`
+    #[test]
+    fn test_scp_like_url_without_a_user() {
+        let (host, slug) = parse_remote_url("github.com:fossable/cibox.git");
+        assert_eq!(host, Some(RemoteHost::GitHub));
+        assert_eq!(slug.as_deref(), Some("fossable/cibox"));
+    }
+
+    /// A url with no host and path to split — a local clone, or a forge url
+    /// missing the repository — leaves both facts absent rather than guessing
+    #[test]
+    fn test_remote_without_a_host_and_a_path() {
+        assert_eq!(parse_remote_url("/srv/git/repo.git"), (None, None));
+        assert_eq!(parse_remote_url("../sibling/repo.git"), (None, None));
+        assert_eq!(parse_remote_url("https://gitlab.com"), (None, None));
     }
 
     #[test]
