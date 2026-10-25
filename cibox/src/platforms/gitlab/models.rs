@@ -5,8 +5,6 @@ use std::collections::BTreeMap;
 pub struct GitLabCI {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stages: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache: Option<GitLabCache>,
     #[serde(flatten)]
     pub jobs: BTreeMap<String, GitLabJob>,
 }
@@ -22,10 +20,6 @@ pub struct GitLabJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variables: Option<BTreeMap<String, String>>,
     pub script: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub before_script: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after_script: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,8 +58,6 @@ pub struct GitLabCache {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitLabArtifacts {
     pub paths: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
 }
 
 /// One `rules:` entry. `only:refs` can express "tags" or a ref regex but not

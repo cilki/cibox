@@ -67,7 +67,6 @@ pub fn lower_circleci(jobs: &[Job]) -> CircleCIConfig {
 
     CircleCIConfig {
         version: "2.1".to_string(),
-        orbs: None,
         jobs: lowered,
         workflows: BTreeMap::from([(
             "main".to_string(),
@@ -113,7 +112,7 @@ fn lower_job(job: &Job) -> CircleCIJob {
             }
             Step::Run { name, command } => {
                 steps.push(CircleCIStep::Command {
-                    run: CircleCIRun::Detailed {
+                    run: CircleCIRun {
                         name: name.clone(),
                         command: command.clone(),
                     },

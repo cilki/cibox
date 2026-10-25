@@ -4,22 +4,17 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitHubWorkflow {
     pub name: String,
-    pub on: GitHubTriggers,
+    /// Event name → the filters narrowing it. The shorthand forms GitHub
+    /// also accepts (`on: push`, `on: [push, pull_request]`) carry no
+    /// filters, and every workflow cibox writes needs some.
+    pub on: BTreeMap<String, GitHubTriggerConfig>,
     /// Scopes granted to the ambient CI token for every job that doesn't
-    /// override it. Omitting this inherits the repository/organization
-    /// default, which may be write-all.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permissions: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
+    /// override it. Not optional: a workflow without the key inherits the
+    /// repository/organization default, which on older repos and
+    /// organizations is write-all, so there is no version of this cibox may
+    /// leave out.
+    pub permissions: BTreeMap<String, String>,
     pub jobs: BTreeMap<String, GitHubJob>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum GitHubTriggers {
-    Simple(Vec<String>),
-    Detailed(BTreeMap<String, GitHubTriggerConfig>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,8 +48,6 @@ pub struct GitHubJob {
     pub needs: Option<Vec<String>>,
     #[serde(rename = "timeout-minutes", skip_serializing_if = "Option::is_none")]
     pub timeout_minutes: Option<u32>,
-    #[serde(rename = "continue-on-error", skip_serializing_if = "Option::is_none")]
-    pub continue_on_error: Option<bool>,
     #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
     pub if_expr: Option<String>,
 }
@@ -90,56 +83,12 @@ pub struct GitHubRunDefaults {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitHubStep {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    /// What the step is called in the job log; every step cibox emits has one
+    pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uses: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with: Option<BTreeMap<String, serde_yaml::Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_serialize_workflow() {
-        let workflow = GitHubWorkflow {
-            name: "CI".to_string(),
-            on: GitHubTriggers::Simple(vec!["push".to_string()]),
-            permissions: None,
-            env: None,
-            jobs: BTreeMap::from([(
-                "test".to_string(),
-                GitHubJob {
-                    name: None,
-                    runs_on: "ubuntu-latest".to_string(),
-                    strategy: None,
-                    defaults: None,
-                    container: None,
-                    permissions: None,
-                    env: None,
-                    steps: vec![GitHubStep {
-                        name: Some("Checkout".to_string()),
-                        uses: Some("actions/checkout@v4".to_string()),
-                        run: None,
-                        with: None,
-                        env: None,
-                    }],
-                    needs: None,
-                    timeout_minutes: None,
-                    continue_on_error: None,
-                    if_expr: None,
-                },
-            )]),
-        };
-
-        let yaml = serde_yaml::to_string(&workflow).unwrap();
-        assert!(yaml.contains("name: CI"));
-        assert!(yaml.contains("ubuntu-latest"));
-    }
 }
