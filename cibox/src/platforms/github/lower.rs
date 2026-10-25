@@ -1,7 +1,7 @@
 use crate::ir::{Job, RunnerOs, Step};
 use crate::platforms::github::models::{
     GitHubDefaults, GitHubJob, GitHubMatrix, GitHubMatrixInclude, GitHubRunDefaults, GitHubStep,
-    GitHubStrategy, GitHubTriggerConfig, GitHubTriggers, GitHubWorkflow,
+    GitHubStrategy, GitHubTriggerConfig, GitHubWorkflow,
 };
 use std::collections::BTreeMap;
 
@@ -120,7 +120,7 @@ pub fn lower_github_gated(jobs: &[Job], kind: WorkflowKind, gate: TagGate) -> Gi
     let on = match kind {
         WorkflowKind::Ci => {
             let branches = Some(vec!["main".to_string(), "master".to_string()]);
-            GitHubTriggers::Detailed(BTreeMap::from([
+            BTreeMap::from([
                 (
                     "push".to_string(),
                     GitHubTriggerConfig {
@@ -135,15 +135,15 @@ pub fn lower_github_gated(jobs: &[Job], kind: WorkflowKind, gate: TagGate) -> Gi
                         tags: None,
                     },
                 ),
-            ]))
+            ])
         }
-        WorkflowKind::Release => GitHubTriggers::Detailed(BTreeMap::from([(
+        WorkflowKind::Release => BTreeMap::from([(
             "push".to_string(),
             GitHubTriggerConfig {
                 branches: None,
                 tags: Some(vec!["v*".to_string()]),
             },
-        )])),
+        )]),
     };
 
     GitHubWorkflow {
@@ -156,8 +156,7 @@ pub fn lower_github_gated(jobs: &[Job], kind: WorkflowKind, gate: TagGate) -> Gi
         // it asks for more. Without this key the token inherits the
         // repository default, which on older repos and organizations is
         // write-all — handing every `run:` step push access.
-        permissions: Some(base_permissions()),
-        env: None,
+        permissions: base_permissions(),
         jobs: lowered,
     }
 }
@@ -192,11 +191,10 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                     );
                 }
                 steps.push(GitHubStep {
-                    name: Some("Checkout code".to_string()),
+                    name: "Checkout code".to_string(),
                     uses: Some("actions/checkout@v4".to_string()),
                     run: None,
                     with: Some(with),
-                    env: None,
                 });
                 if let Some(cache) = &job.cache {
                     // Matrix legs run different toolchains; sharing one cache
@@ -206,7 +204,7 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                         None => cache.key.clone(),
                     };
                     steps.push(GitHubStep {
-                        name: Some("Cache".to_string()),
+                        name: "Cache".to_string(),
                         uses: Some("actions/cache@v4".to_string()),
                         run: None,
                         with: Some(BTreeMap::from([
@@ -216,17 +214,15 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                             ),
                             ("key".to_string(), serde_yaml::Value::String(key)),
                         ])),
-                        env: None,
                     });
                 }
             }
             Step::Run { name, command } => {
                 steps.push(GitHubStep {
-                    name: Some(name.clone()),
+                    name: name.clone(),
                     uses: None,
                     run: Some(command.clone()),
                     with: None,
-                    env: None,
                 });
             }
         }
@@ -234,7 +230,7 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
 
     for path in &job.artifacts {
         steps.push(GitHubStep {
-            name: Some("Upload artifacts".to_string()),
+            name: "Upload artifacts".to_string(),
             uses: Some("actions/upload-artifact@v4".to_string()),
             run: None,
             with: Some(BTreeMap::from([
@@ -244,7 +240,6 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                 ),
                 ("path".to_string(), serde_yaml::Value::String(path.clone())),
             ])),
-            env: None,
         });
     }
 
@@ -318,7 +313,6 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
         steps,
         needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
         timeout_minutes: job.timeout_minutes,
-        continue_on_error: None,
         // A tags-only job must not run on branch pushes or PRs, so unless
         // the workflow's own triggers already see to that, it says so itself
         if_expr: (job.tags_only && gate == TagGate::Job)
@@ -454,9 +448,7 @@ mod tests {
             &[Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only()],
             WorkflowKind::Release,
         );
-        let GitHubTriggers::Detailed(triggers) = &workflow.on else {
-            panic!("expected detailed triggers");
-        };
+        let triggers = &workflow.on;
         assert_eq!(workflow.name, "Release");
         assert_eq!(triggers["push"].tags, Some(vec!["v*".to_string()]));
         assert_eq!(triggers["push"].branches, None);
@@ -563,11 +555,7 @@ mod tests {
     fn test_workflow_token_is_read_only_by_default() {
         for kind in [WorkflowKind::Ci, WorkflowKind::Release] {
             let workflow = lower_github(&[Job::new("rust-test", "Cargo test", Stage::Test)], kind);
-            assert_eq!(
-                workflow.permissions.as_ref().unwrap()["contents"],
-                "read",
-                "{kind:?}"
-            );
+            assert_eq!(workflow.permissions["contents"], "read", "{kind:?}");
             // Nothing declared, so the job inherits the workflow scopes
             assert_eq!(workflow.jobs["rust-test"].permissions, None, "{kind:?}");
         }
