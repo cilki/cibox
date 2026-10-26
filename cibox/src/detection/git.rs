@@ -134,7 +134,8 @@ fn unquote_value(value: &str) -> String {
     out
 }
 
-/// Split a remote URL into (host kind, "owner/repo").
+/// Split a remote URL into (host kind, the project's path — `owner/repo`, or
+/// `group/subgroup/project` on a forge that nests namespaces).
 ///
 /// Git takes two shapes, and `:` means something different in each: in
 /// `scheme://[user[:password]@]host[:port]/owner/repo[.git]` it introduces a
@@ -177,8 +178,13 @@ fn parse_remote_url(url: &str) -> (Option<RemoteHost>, Option<String>) {
         RemoteHost::Other
     };
 
+    // A repository needs a namespace above it, but not exactly one: GitLab
+    // nests groups arbitrarily, so `group/subgroup/project` is the whole
+    // path of a project there, not a url to give up on.
     let slug = path.trim_matches('/').trim_end_matches(".git");
-    let slug = (slug.split('/').count() == 2).then(|| slug.to_string());
+    let components: Vec<&str> = slug.split('/').collect();
+    let slug = (components.len() >= 2 && components.iter().all(|c| !c.is_empty()))
+        .then(|| slug.to_string());
 
     (Some(host_kind), slug)
 }
@@ -229,6 +235,33 @@ mod tests {
         let (host, slug) = parse_remote_url("https://gitlab.example.com:8443/acme/widget");
         assert_eq!(host, Some(RemoteHost::GitLab));
         assert_eq!(slug.as_deref(), Some("acme/widget"));
+    }
+
+    /// GitLab nests groups, so a project's path is not always two
+    /// components. Taking only `owner/repo` left every subgroup project
+    /// without a slug at all, and the default image and AUR package names
+    /// derived from it fell back to whatever the local directory is called.
+    #[test]
+    fn test_nested_namespaces_stay_in_the_slug() {
+        let (host, slug) = parse_remote_url("git@gitlab.com:group/subgroup/project.git");
+        assert_eq!(host, Some(RemoteHost::GitLab));
+        assert_eq!(slug.as_deref(), Some("group/subgroup/project"));
+
+        let (_, slug) = parse_remote_url("https://gitlab.example.com/a/b/c/d.git");
+        assert_eq!(slug.as_deref(), Some("a/b/c/d"));
+
+        let (_, slug) = parse_remote_url("ssh://git@gitlab.example.com:2222/group/sub/proj.git");
+        assert_eq!(slug.as_deref(), Some("group/sub/proj"));
+    }
+
+    /// A path that names no repository under a namespace is no slug: one
+    /// component is a user or group page, and an empty one is a malformed
+    /// url rather than a component called ""
+    #[test]
+    fn test_path_without_a_namespaced_repository() {
+        assert_eq!(parse_remote_url("https://gitlab.com/owner").1, None);
+        assert_eq!(parse_remote_url("https://gitlab.com/owner/").1, None);
+        assert_eq!(parse_remote_url("https://gitlab.com/owner//repo").1, None);
     }
 
     /// Credentials in the authority are not part of the host name either

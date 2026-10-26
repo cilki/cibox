@@ -571,6 +571,29 @@ mod tests {
         );
     }
 
+    /// A GitLab subgroup project's path is its whole namespace chain, and
+    /// that is also the image path its registry serves. The AUR has no
+    /// namespaces, so only the last component names the package.
+    #[test]
+    fn test_nested_remote_path_drives_the_derived_names() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@gitlab.com:acme/platform/api.git\n",
+        )
+        .unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+
+        let config = CiboxConfig::default();
+        assert_eq!(docker_image(&facts, &config), "acme/platform/api");
+        assert!(docker_commands(&facts, &config)
+            .iter()
+            .any(|c| c == "docker build -t acme/platform/api ."));
+        assert_eq!(aur_packages(&facts, &config), vec!["api"]);
+    }
+
     #[test]
     fn test_aur_packages_falls_back_to_the_directory_name() {
         let dir = tempdir().unwrap();
