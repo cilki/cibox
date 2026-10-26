@@ -85,8 +85,8 @@ pub struct PlannedFile {
 /// jobs within the document.
 ///
 /// Planning succeeds with no enabled rules: the resulting job-less files are
-/// what lets `update` prune cibox's jobs out of an existing pipeline. Callers
-/// that need something to write (see [`generate`]) reject that themselves.
+/// what lets `update` prune cibox's jobs out of an existing pipeline. The
+/// command rejects a resolution that leaves nothing to write or prune itself.
 pub fn plan(
     facts: &ProjectFacts,
     resolved: &[ResolvedRule],
@@ -143,7 +143,7 @@ pub fn render_file(platform: Platform, file: &PlannedFile) -> Result<String> {
         Platform::GitLab => serde_yaml::to_string(&lower_gitlab(&file.jobs))?,
         Platform::CircleCI => serde_yaml::to_string(&lower_circleci(&file.jobs))?,
     };
-    prepend_required_variables(platform, &file.jobs, &mut content);
+    reconcile_required_variables(platform, &file.jobs, &mut content);
     Ok(content)
 }
 
@@ -173,20 +173,17 @@ pub(crate) fn required_variables_line(platform: Platform, jobs: &[Job]) -> Optio
     Some(format!("{REQUIRED_VARIABLES_PREFIX}{names}\n"))
 }
 
+/// Bring the leading secrets header of `content` in line with what the jobs
+/// require: replace a stale one, drop an obsolete one, add a missing one.
+///
 /// GitLab and CircleCI read secrets from ambient CI variables rather than
-/// naming them in the pipeline, so list what the jobs expect at the top of
-/// the file to make setup discoverable. A no-op on the other platforms,
+/// naming them in the pipeline, so what the jobs expect is listed at the top
+/// of the file to make setup discoverable. A no-op on the other platforms,
 /// whose lowered jobs reference their secrets inline.
-pub(crate) fn prepend_required_variables(platform: Platform, jobs: &[Job], content: &mut String) {
-    if let Some(line) = required_variables_line(platform, jobs) {
-        content.insert_str(0, &line);
-    }
-}
-
-/// Bring the leading secrets header in line with what the jobs require:
-/// replace a stale one, drop an obsolete one, add a missing one. Merged
-/// documents keep their existing text, so unlike [`prepend_required_variables`]
-/// this has to reconcile rather than blindly prepend.
+///
+/// Freshly rendered output carries no header yet, so for [`render_file`] this
+/// is a plain prepend; a merged document keeps its existing text, header
+/// included, and is the case that needs reconciling.
 pub(crate) fn reconcile_required_variables(platform: Platform, jobs: &[Job], content: &mut String) {
     let desired = required_variables_line(platform, jobs);
     if content.starts_with(REQUIRED_VARIABLES_PREFIX) {
@@ -324,24 +321,49 @@ pub fn pending_updates(
     Ok(updates)
 }
 
-/// Generate all output files for one platform, skipping empty ones.
+/// What `cibox update` would write into `working_dir` for one platform with
+/// every rule selected: the files it would change, and their new content.
 ///
-/// Unlike [`plan`], this is for callers that write whole files and so have
-/// nothing to say when no rule is enabled.
-pub fn generate(
+/// A test fixture. It goes through [`pending_update`], so a pipeline a test
+/// stands up is the one the command writes rather than one rendered a second
+/// way — and a file update would leave alone is absent here too.
+#[cfg(test)]
+pub(crate) fn update_files(
+    working_dir: &Path,
     facts: &ProjectFacts,
     resolved: &[ResolvedRule],
     platform: Platform,
 ) -> Result<Vec<(PathBuf, String)>> {
     let planned = plan(facts, resolved, platform)?;
-    if planned.iter().all(|file| file.jobs.is_empty()) {
-        bail!("{NOTHING_ENABLED}");
+    let filter = JobFilter {
+        resolved,
+        selection: None,
+    };
+    Ok(
+        pending_update(working_dir, platform, &planned, &filter, false)?
+            .into_iter()
+            .filter_map(|update| match update.change {
+                FileChange::Write { content, .. } => Some((update.path, content)),
+                FileChange::Unchanged | FileChange::WouldEmpty => None,
+            })
+            .collect(),
+    )
+}
+
+/// Put [`update_files`] on disk, where `cibox update` would have put them
+#[cfg(test)]
+pub(crate) fn write_update(
+    working_dir: &Path,
+    facts: &ProjectFacts,
+    resolved: &[ResolvedRule],
+    platform: Platform,
+) -> Result<()> {
+    for (path, content) in update_files(working_dir, facts, resolved, platform)? {
+        let path = working_dir.join(path);
+        std::fs::create_dir_all(path.parent().expect("a pipeline file has a directory"))?;
+        std::fs::write(path, content)?;
     }
-    planned
-        .into_iter()
-        .filter(|file| !file.jobs.is_empty())
-        .map(|file| Ok((file.path.clone(), render_file(platform, &file)?)))
-        .collect()
+    Ok(())
 }
 
 #[cfg(test)]
@@ -365,6 +387,18 @@ mod tests {
         crate::detection::gather_facts(dir.path())
     }
 
+    /// What `cibox update` would write for `platform` into a repository that
+    /// has no pipeline on disk yet, so the only thing that can fail is
+    /// planning
+    fn outputs(
+        facts: &ProjectFacts,
+        resolved: &[ResolvedRule],
+        platform: Platform,
+    ) -> Result<Vec<(PathBuf, String)>> {
+        let dir = tempdir().unwrap();
+        update_files(dir.path(), facts, resolved, platform)
+    }
+
     #[test]
     fn test_plan_always_includes_release_file_for_github() {
         // Even with every release rule disabled, the release.yml entry is
@@ -383,16 +417,16 @@ mod tests {
         assert!(release.jobs.is_empty());
         assert_eq!(release.kind, WorkflowKind::Release);
 
-        // generate() skips the empty file, as before
-        let outputs = generate(&facts, &resolved, Platform::GitHub).unwrap();
-        assert!(outputs.iter().all(|(p, _)| !p.ends_with("release.yml")));
+        // ...and update creates nothing for it
+        let written = outputs(&facts, &resolved, Platform::GitHub).unwrap();
+        assert!(written.iter().all(|(p, _)| !p.ends_with("release.yml")));
     }
 
     #[test]
     fn test_github_splits_ci_and_release() {
         let facts = full_facts();
         let resolved = resolve(&facts, &CiboxConfig::default());
-        let outputs = generate(&facts, &resolved, Platform::GitHub).unwrap();
+        let outputs = outputs(&facts, &resolved, Platform::GitHub).unwrap();
 
         let paths: Vec<_> = outputs.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(
@@ -418,7 +452,7 @@ mod tests {
         let resolved = resolve(&facts, &CiboxConfig::default());
 
         for platform in [Platform::GitLab, Platform::CircleCI] {
-            let outputs = generate(&facts, &resolved, platform).unwrap();
+            let outputs = outputs(&facts, &resolved, platform).unwrap();
             assert_eq!(outputs.len(), 1, "{platform:?}");
             assert_eq!(outputs[0].0, platform.output_path());
             assert!(
@@ -432,7 +466,7 @@ mod tests {
     fn test_gitlab_single_document_with_merged_stages() {
         let facts = full_facts();
         let resolved = resolve(&facts, &CiboxConfig::default());
-        let outputs = generate(&facts, &resolved, Platform::GitLab).unwrap();
+        let outputs = outputs(&facts, &resolved, Platform::GitLab).unwrap();
         let yaml = &outputs[0].1;
         assert!(yaml.contains("rust-test"), "{yaml}");
         assert!(yaml.contains("docker-build"), "{yaml}");
@@ -441,11 +475,19 @@ mod tests {
         serde_yaml::from_str::<crate::platforms::gitlab::models::GitLabCI>(yaml).unwrap();
     }
 
+    /// Nothing enabled and nothing on disk leaves update with no file to
+    /// write — which is the state the command reports as an error (covered
+    /// end to end in `tests/update.rs`)
     #[test]
-    fn test_no_rules_enabled_is_an_error() {
+    fn test_no_rules_enabled_writes_nothing() {
         let facts = ProjectFacts::default();
         let resolved = resolve(&facts, &CiboxConfig::default());
-        assert!(generate(&facts, &resolved, Platform::GitHub).is_err());
+        for platform in Platform::all() {
+            assert!(
+                outputs(&facts, &resolved, platform).unwrap().is_empty(),
+                "{platform:?}"
+            );
+        }
     }
 
     #[test]
@@ -484,7 +526,7 @@ mod tests {
         let resolved = resolve(&facts, &CiboxConfig::default());
 
         for platform in Platform::all() {
-            let outputs = generate(&facts, &resolved, platform).unwrap();
+            let outputs = outputs(&facts, &resolved, platform).unwrap();
             assert!(!outputs.is_empty(), "{platform:?} produced no output");
             for (path, content) in outputs {
                 serde_yaml::from_str::<serde_yaml::Value>(&content)
@@ -506,7 +548,7 @@ mod tests {
                 Platform::GitLab => "parallel:",
                 Platform::CircleCI => "<< parameters.image >>",
             };
-            let outputs = generate(&facts, &resolved, platform).unwrap();
+            let outputs = outputs(&facts, &resolved, platform).unwrap();
             let ci = outputs
                 .iter()
                 .find(|(_, content)| content.contains("rust-test"))
@@ -529,7 +571,7 @@ mod tests {
         ]);
         let resolved = resolve(&facts, &config);
 
-        let outputs = generate(&facts, &resolved, Platform::GitHub).unwrap();
+        let outputs = outputs(&facts, &resolved, Platform::GitHub).unwrap();
         let release = &outputs
             .iter()
             .find(|(p, _)| p.ends_with("release.yml"))
@@ -551,15 +593,15 @@ mod tests {
         let resolved = resolve(&facts, &config);
 
         for platform in [Platform::GitLab, Platform::CircleCI] {
-            let err = generate(&facts, &resolved, platform).unwrap_err();
+            let err = outputs(&facts, &resolved, platform).unwrap_err();
             assert!(
                 err.to_string().contains("Windows runner"),
                 "{platform:?}: {err}"
             );
         }
         // GitHub and Gitea are fine
-        generate(&facts, &resolved, Platform::GitHub).unwrap();
-        generate(&facts, &resolved, Platform::Gitea).unwrap();
+        outputs(&facts, &resolved, Platform::GitHub).unwrap();
+        outputs(&facts, &resolved, Platform::Gitea).unwrap();
     }
 
     #[test]
@@ -570,7 +612,7 @@ mod tests {
         let resolved = resolve(&facts, &config);
 
         for platform in Platform::all() {
-            let outputs = generate(&facts, &resolved, platform).unwrap();
+            let outputs = outputs(&facts, &resolved, platform).unwrap();
             let (path, content) = outputs
                 .iter()
                 .find(|(_, content)| content.contains("aur-release"))
@@ -606,7 +648,7 @@ mod tests {
         let facts = full_facts();
         let resolved = resolve(&facts, &config);
         for platform in Platform::all() {
-            let outputs = generate(&facts, &resolved, platform).unwrap();
+            let outputs = outputs(&facts, &resolved, platform).unwrap();
             assert!(!outputs.is_empty(), "{platform:?} produced no output");
         }
     }

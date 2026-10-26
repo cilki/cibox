@@ -246,13 +246,8 @@ mod tests {
         let dir = project_dir();
         let mut state = state_for(dir.path());
         let resolved = crate::rules::resolve(&state.facts, &state.config);
-        for (path, content) in
-            crate::generator::generate(&state.facts, &resolved, state.platforms[0]).unwrap()
-        {
-            let path = dir.path().join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, content).unwrap();
-        }
+        crate::generator::write_update(dir.path(), &state.facts, &resolved, state.platforms[0])
+            .unwrap();
         state.refresh();
         assert!(!state.preview_shown());
 

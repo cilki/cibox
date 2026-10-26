@@ -425,26 +425,25 @@ fn canonical_job_mapping(canonical: &Value) -> serde_yaml::Mapping {
         .unwrap_or_default()
 }
 
-/// Render `{key: value}` canonically and return the parsed value node, ready
-/// to splice into the user's tree. The document is returned alongside only
-/// to keep its tree alive while the node is used.
-fn fragment(key: &str, value: &Value) -> Result<(Document, YamlNode)> {
+/// Canonical YAML text for one `key: value` mapping entry at column 0 — a
+/// job under its id, or a top-level key under its own.
+fn render_entry(key: &str, value: &Value) -> Result<String> {
     let mut map = serde_yaml::Mapping::new();
     map.insert(Value::from(key), value.clone());
-    let text = serde_yaml::to_string(&Value::Mapping(map))?;
-    let doc = Document::from_str(&text)
+    Ok(serde_yaml::to_string(&Value::Mapping(map))?)
+}
+
+/// [`render_entry`] parsed back as a value node, ready to splice into the
+/// user's tree. The document is returned alongside only to keep its tree
+/// alive while the node is used.
+fn fragment(key: &str, value: &Value) -> Result<(Document, YamlNode)> {
+    let doc = Document::from_str(&render_entry(key, value)?)
         .map_err(|e| anyhow!("canonical output for `{key}` did not reparse: {e}"))?;
     let node = doc
         .as_mapping()
         .and_then(|m| m.get(key))
         .with_context(|| format!("canonical output for `{key}` did not round-trip"))?;
     Ok((doc, node))
-}
-
-fn render_job(id: &str, value: &Value) -> Result<String> {
-    let mut map = serde_yaml::Mapping::new();
-    map.insert(Value::from(id), value.clone());
-    Ok(serde_yaml::to_string(&Value::Mapping(map))?)
 }
 
 /// What `conform_jobs` measures each job against: the canonical output, the
@@ -546,7 +545,7 @@ fn block_edits(
         for id in kept {
             let canonical = get(canonical_jobs, id).expect("filtered above");
             replacement.push_str(&disabled::comment_out(
-                &render_job(id, canonical)?,
+                &render_entry(id, canonical)?,
                 block.indent,
             ));
         }
@@ -719,7 +718,7 @@ fn add_jobs_textually(
     let mut rendered = String::new();
     for id in plan.adds {
         if let Some(canonical) = get(plan.canonical, id) {
-            rendered.push_str(&indent_by(&render_job(id, canonical)?, indent));
+            rendered.push_str(&indent_by(&render_entry(id, canonical)?, indent));
             counts.added += 1;
         }
     }

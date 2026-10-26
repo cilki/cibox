@@ -858,13 +858,18 @@ mod tests {
         EditorState::new(facts, dir.to_path_buf()).unwrap()
     }
 
-    /// Every file the state's rules generate, with path banners — what the
-    /// rules emit, independent of whether a pipeline exists on disk to diff
+    /// Every file `cibox update` would write for the state's rules, with path
+    /// banners
     fn generated(state: &EditorState) -> String {
         let resolved = resolve(&state.facts, &state.config);
         let mut out = String::new();
         for &platform in &state.platforms {
-            match crate::generator::generate(&state.facts, &resolved, platform) {
+            match crate::generator::update_files(
+                &state.working_dir,
+                &state.facts,
+                &resolved,
+                platform,
+            ) {
                 Ok(outputs) => {
                     for (path, content) in outputs {
                         out.push_str(&format!("# ==> {} <==\n{content}", path.display()));
@@ -1038,13 +1043,8 @@ mod tests {
 
         // What update would write, written for it
         let resolved = resolve(&state.facts, &state.config);
-        for (path, content) in
-            crate::generator::generate(&state.facts, &resolved, state.platforms[0]).unwrap()
-        {
-            let path = dir.path().join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, content).unwrap();
-        }
+        crate::generator::write_update(dir.path(), &state.facts, &resolved, state.platforms[0])
+            .unwrap();
 
         state.cursor = rule_index(&state, "docker-release");
         let collapsed_len = state.rows.len();
