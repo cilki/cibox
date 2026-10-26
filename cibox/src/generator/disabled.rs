@@ -220,12 +220,15 @@ fn uncomment_span(text: &str, span: &Range<usize>) -> Option<(String, usize)> {
 
 /// Try to read a comment run as a block of disabled jobs. The run qualifies
 /// when its uncommented text parses to a mapping whose keys are all managed
-/// job ids with mapping bodies. A run that fails (e.g. a prose note above
-/// the commented job) is retried from its first line that uncomments to a
-/// bare managed `key:`, so the prose stays an ordinary comment.
+/// job ids with mapping bodies — and when [`opens_managed_key`] can already
+/// tell it doesn't, without parsing. A run that fails (e.g. a prose note
+/// above the commented job) is retried from its first line that uncomments
+/// to a bare managed `key:`, so the prose stays an ordinary comment.
 fn parse_block(text: &str, span: Range<usize>, filter: &JobFilter) -> Option<DisabledBlock> {
-    if let Some(block) = parse_block_exact(text, span.clone(), filter) {
-        return Some(block);
+    if opens_managed_key(text, &span, filter) {
+        if let Some(block) = parse_block_exact(text, span.clone(), filter) {
+            return Some(block);
+        }
     }
     // Retry from the first managed `key:` line
     let mut offset = span.start;
@@ -242,6 +245,41 @@ fn parse_block(text: &str, span: Range<usize>, filter: &JobFilter) -> Option<Dis
         offset += line.len();
     }
     None
+}
+
+/// Whether [`parse_block_exact`] has any chance on this run, decided without
+/// parsing it.
+///
+/// Almost every comment in a pipeline is prose, and in a big one there are
+/// hundreds of them; handing each to `serde_yaml` to be told so is the bulk
+/// of what scanning for disabled jobs costs. A run can only read as a block
+/// of disabled jobs if its first content line opens a mapping whose first key
+/// is a managed job id, and when that key is a plain scalar — which is how
+/// cibox writes job keys, and so how a commented-out cibox job reads — the
+/// line says which id it is without being parsed.
+///
+/// `true` whenever the answer isn't certain: a key that is quoted, anchored,
+/// tagged, or inside a flow mapping still goes to the parser, as does a run
+/// with a non-comment line in it (which `uncomment_span` rejects anyway).
+fn opens_managed_key(text: &str, span: &Range<usize>, filter: &JobFilter) -> bool {
+    let first = text[span.clone()]
+        .lines()
+        .filter_map(uncomment_line)
+        .map(|(_, content)| content.trim())
+        .find(|content| !content.is_empty());
+    let Some(content) = first else {
+        return false; // nothing to parse
+    };
+    // A plain key ends at the first `:`; `a:b` with no space after the colon
+    // is one scalar and no mapping at all, but it is still not a managed key
+    let key = content
+        .split_once(':')
+        .map_or(content, |(key, _)| key)
+        .trim_end();
+    if !key.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+        return true;
+    }
+    filter.managed(key)
 }
 
 fn parse_block_exact(text: &str, span: Range<usize>, filter: &JobFilter) -> Option<DisabledBlock> {
@@ -428,6 +466,34 @@ mod tests {
         let text = "name: CI\njobs:\n  # rust-test:\n  real:\n    runs-on: x\n";
         let scan = scan_text(Platform::GitHub, text);
         assert!(scan.blocks.is_empty());
+    }
+
+    /// A run whose key cibox can't read off the line — quoted here — is the
+    /// case [`opens_managed_key`] has to give up on rather than rule out, so
+    /// the parser still gets to say it is a disabled job.
+    #[test]
+    fn test_scan_finds_commented_job_behind_an_unreadable_key() {
+        let text = "name: CI\njobs:\n  # \"rust-test\":\n  #   runs-on: x\n  other:\n    runs-on: x\n";
+        let scan = scan_text(Platform::GitHub, text);
+        assert_eq!(scan.blocks.len(), 1);
+        assert_eq!(scan.blocks[0].ids, vec!["rust-test"]);
+    }
+
+    /// Prose that is shaped like a mapping is still prose. `rust-test` is a
+    /// managed id, so the first of these only gets ruled out by parsing it;
+    /// the others never reach the parser.
+    #[test]
+    fn test_scan_ignores_mapping_shaped_prose() {
+        for prose in [
+            "  # rust-test: flaky since friday\n",
+            "  # note: rust-test is flaky\n",
+            "  # rust-test.yml is where this came from\n",
+            "  # see https://example.com/rust-test\n",
+        ] {
+            let text = format!("name: CI\njobs:\n{prose}  other:\n    runs-on: x\n");
+            let scan = scan_text(Platform::GitHub, &text);
+            assert!(scan.blocks.is_empty(), "{prose:?}");
+        }
     }
 
     #[test]

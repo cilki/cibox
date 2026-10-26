@@ -117,14 +117,17 @@ pub fn merge_file(
     filter: &JobFilter,
     existing: &str,
 ) -> Result<MergeOutcome> {
-    let parse = Parse::of(existing, &file.path)?;
+    // The scan reads the syntax tree and the text, and nothing of the value
+    // tree, so it rides along with the value parse rather than waiting for it
+    let (parse, scan) = Parse::of_with(existing, &file.path, |tree| {
+        disabled::scan(platform, existing, tree, filter)
+    })?;
     if !parse.value.is_mapping() {
         bail!(
             "{} is not a YAML mapping cibox can merge into; use --force to overwrite it",
             file.path.display()
         );
     }
-    let scan = disabled::scan(platform, existing, &parse.tree, filter);
 
     match platform {
         Platform::GitHub | Platform::Gitea => merge_github(file, filter, existing, &parse, scan),
@@ -154,27 +157,57 @@ const PARALLEL_PARSE_FROM: usize = 8 * 1024;
 
 impl Parse {
     fn of(text: &str, path: &Path) -> Result<Self> {
+        Ok(Self::of_with(text, path, |_| ())?.0)
+    }
+
+    /// Parse `text` into both views, running `alongside` on the syntax tree
+    /// as soon as there is one — while the value tree is still being built.
+    fn of_with<T>(
+        text: &str,
+        path: &Path,
+        alongside: impl FnOnce(&YamlFile) -> T,
+    ) -> Result<(Self, T)> {
         // The two parses read the same text and share nothing, and together
         // they are nearly the whole cost of a merge: of the 56 ms a 230 KB
         // GitLab pipeline took, 26 ms was serde_yaml and 29 ms was yaml-edit,
         // against 7 ms for everything the merge then did with them. So for a
-        // pipeline big enough to pay for a thread they run side by side.
+        // pipeline big enough to pay for a thread they run side by side, and
+        // the work that needs only the syntax tree — scanning for the
+        // commented-out jobs — goes on this side of the pair too.
         //
         // The value tree is the one that travels, because a `YamlFile` holds
         // rowan's mutable red tree and is not `Send`.
         if text.len() < PARALLEL_PARSE_FROM {
-            return Self::check(serde_yaml::from_str(text), YamlFile::from_str(text), path);
+            let value = serde_yaml::from_str(text);
+            return Self::finish(value, YamlFile::from_str(text), path, alongside);
         }
         std::thread::scope(|scope| {
             let value = scope.spawn(|| serde_yaml::from_str(text));
             let tree = YamlFile::from_str(text);
+            let extra = tree.as_ref().ok().map(alongside);
             // A parser panic is cibox's bug to report, not a YAML error, so
             // it keeps its own backtrace instead of becoming a message
             let value = value
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            Self::check(value, tree, path)
+            let parse = Self::check(value, tree, path)?;
+            Ok((
+                parse,
+                extra.expect("the tree parsed, or `check` would have failed"),
+            ))
         })
+    }
+
+    /// [`Self::check`] with `alongside` run on the tree it accepted
+    fn finish<T>(
+        value: std::result::Result<Value, serde_yaml::Error>,
+        tree: std::result::Result<YamlFile, yaml_edit::YamlError>,
+        path: &Path,
+        alongside: impl FnOnce(&YamlFile) -> T,
+    ) -> Result<(Self, T)> {
+        let parse = Self::check(value, tree, path)?;
+        let extra = alongside(&parse.tree);
+        Ok((parse, extra))
     }
 
     /// Report whichever parse rejected the text, preferring serde_yaml's
