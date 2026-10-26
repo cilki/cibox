@@ -27,6 +27,10 @@ use std::path::Path;
 use std::str::FromStr;
 use yaml_edit::{AsYaml, Document, Mapping, YamlFile, YamlNode};
 
+/// One replacement the text phase makes: the byte span it covers in the
+/// pipeline's text, and what goes there instead
+type Edit = (Range<usize>, String);
+
 /// Result of merging canonical output into an existing file
 #[derive(Debug)]
 pub enum MergeOutcome {
@@ -38,15 +42,15 @@ pub enum MergeOutcome {
     Merged { content: String, counts: Counts },
 }
 
-/// Whether a merge has edited anything, and the only way it edits the
-/// syntax tree.
+/// Whether a merge has edited the syntax tree, and the only way it edits it.
 ///
-/// Re-running `update` on an up-to-date pipeline is the common case, and
-/// rendering the syntax tree back to text costs about as much as parsing it
-/// did — all of it wasted on a document nothing was done to. A merge that
-/// edited neither the text nor the tree can finish from the original text
-/// instead of rendering, because the tree it would render is still the
-/// lossless parse of that very text.
+/// Rendering the syntax tree back to text costs about as much as parsing it
+/// did, and the tree is only ever a lossless parse of some text the merge
+/// already holds — the original, or the text phase's output. So a merge that
+/// never edited the tree finishes from that text instead of rendering, which
+/// is the common case twice over: an up-to-date pipeline has nothing done to
+/// it at all, and a stale one usually has every stale job rewritten in the
+/// text, where the blank lines and comments around it survive.
 ///
 /// Every tree edit goes through here rather than straight at the node, so
 /// that "nothing was edited" cannot be a stale answer: a merge that grows a
@@ -55,11 +59,6 @@ pub enum MergeOutcome {
 struct Changes(bool);
 
 impl Changes {
-    /// Record that the text phase rewrote something
-    fn text(&mut self) {
-        self.0 = true;
-    }
-
     fn set(&mut self, map: &Mapping, key: impl AsYaml, value: impl AsYaml) {
         map.set(key, value);
         self.0 = true;
@@ -84,13 +83,13 @@ impl Changes {
         }
     }
 
-    /// The text to finish the merge with: the rendered tree when something
-    /// was edited, the original otherwise
-    fn render(self, tree: &YamlFile, existing: &str) -> String {
+    /// The text to finish the merge with: the rendered tree when the tree
+    /// was edited, otherwise `text` — the text that tree is the parse of.
+    fn render(self, tree: &YamlFile, text: &str) -> String {
         if self.0 {
             tree.to_string()
         } else {
-            existing.to_string()
+            text.to_string()
         }
     }
 }
@@ -235,18 +234,19 @@ impl Parse {
 
     /// The parse the tree phase has to work on once the text phase has run:
     /// `None` to keep using the parse of the original text, which came
-    /// through untouched (the common case — only a stale disabled block
-    /// rewrites it), or a fresh parse of the rewritten text.
-    fn after_edits(text: Cow<'_, str>, path: &Path) -> Result<Option<Self>> {
-        match text {
-            Cow::Borrowed(_) => Ok(None),
-            Cow::Owned(text) => Ok(Some(
-                // Failing here is cibox's fault, not the file's: the only
-                // thing the text phase rewrote is comment blocks it
-                // generated itself
-                Parse::of(&text, path).context("regenerated comment blocks reparse")?,
-            )),
-        }
+    /// through untouched, or a fresh parse of the rewritten text.
+    ///
+    /// Only asked for when the tree phase has work (see [`JobOps`]); a
+    /// reparse costs as much as the original parse did, and rendering its
+    /// tree back costs about as much again.
+    fn after_edits(edited: Option<&str>, path: &Path) -> Result<Option<Self>> {
+        edited
+            .map(|text| {
+                // Failing here is cibox's fault, not the file's: everything
+                // the text phase wrote is canonical output it rendered itself
+                Parse::of(text, path).context("the text phase's own output reparses")
+            })
+            .transpose()
     }
 
     /// The document's top-level mapping, as plain values
@@ -446,7 +446,7 @@ fn fragment(key: &str, value: &Value) -> Result<(Document, YamlNode)> {
     Ok((doc, node))
 }
 
-/// What `conform_jobs` measures each job against: the canonical output, the
+/// What the phases measure each job against: the canonical output, the
 /// ids to add, and the filter deciding what cibox may touch at all
 struct JobsPlan<'a> {
     canonical: &'a serde_yaml::Mapping,
@@ -455,64 +455,60 @@ struct JobsPlan<'a> {
     path: &'a Path,
 }
 
-/// The tree phase every merge ends with: on the lossless syntax tree,
-/// replace the stale managed jobs the text phase couldn't address, drop the
-/// managed jobs that are no longer generated, and append the missing ones.
-/// The caller may keep editing the tree before rendering it.
+/// The work on the job region the text phase left for the tree: the stale
+/// managed jobs whose body the text can't address, the managed jobs that are
+/// no longer generated, and the missing ones the text had nowhere to append.
 ///
-/// Its tree edits go through `changes`, so a merge that changed nothing
-/// anywhere can skip rendering the tree (see [`Changes`]).
-fn conform_jobs(
+/// It is decided by the text phase, against the parse of the original text,
+/// rather than read off a parse of that phase's output — the two agree,
+/// because the text phase only ever rewrites a job's own body lines or a
+/// comment block, and every job it rewrites it brings to canonical output.
+/// Deciding it up front is what lets a merge the tree has no work in skip
+/// both reparsing the new text and rendering a tree back to it.
+#[derive(Debug, Default)]
+struct JobOps {
+    /// Stale managed jobs to replace with canonical output
+    conform: Vec<String>,
+    /// Managed jobs no rule generates any more
+    remove: Vec<String>,
+    /// Managed jobs to splice in
+    add: Vec<String>,
+}
+
+impl JobOps {
+    fn is_empty(&self) -> bool {
+        self.conform.is_empty() && self.remove.is_empty() && self.add.is_empty()
+    }
+}
+
+/// Carry out [`JobOps`] on the lossless syntax tree of the text phase's
+/// output. The caller may keep editing the tree before rendering it.
+///
+/// Its tree edits go through `changes`, so a merge that only ever edited the
+/// text can skip rendering the tree (see [`Changes`]).
+fn apply_job_ops(
     region: &JobsRegion,
+    ops: &JobOps,
     plan: &JobsPlan,
-    counts: &mut Counts,
     changes: &mut Changes,
 ) -> Result<()> {
     let Some(jobs) = &region.node else {
         return Ok(());
     };
-    let guard = || -> Result<()> {
-        if jobs.is_flow_style() {
-            bail!(
-                "{} keeps its jobs in flow-style YAML, which cibox cannot edit in place; \
-                 use --force to overwrite it",
-                plan.path.display()
-            );
-        }
-        Ok(())
-    };
-    for key in &region.keys {
-        if !plan.filter.managed(key) {
-            counts.preserved += 1;
-            continue;
-        }
-        match get(plan.canonical, key) {
-            Some(canonical) if get(&region.values, key) == Some(canonical) => {}
-            Some(canonical) => {
-                guard()?;
-                let (_doc, node) = fragment(key, canonical)?;
-                changes.set(jobs, key.as_str(), node);
-                counts.conformed += 1;
-            }
-            None => {
-                guard()?;
-                changes.remove(jobs, key.as_str());
-                counts.removed += 1;
-            }
-        }
+    if jobs.is_flow_style() {
+        bail!(
+            "{} keeps its jobs in flow-style YAML, which cibox cannot edit in place; \
+             use --force to overwrite it",
+            plan.path.display()
+        );
     }
-    for id in plan.adds {
-        // Already present: e.g. inserted textually when `jobs:` held only
-        // comments, in which case it was counted there
-        if get(&region.values, id).is_some() {
-            continue;
-        }
-        if let Some(canonical) = get(plan.canonical, id) {
-            guard()?;
-            let (_doc, node) = fragment(id, canonical)?;
-            changes.set(jobs, id.as_str(), node);
-            counts.added += 1;
-        }
+    for id in ops.conform.iter().chain(&ops.add) {
+        let canonical = get(plan.canonical, id).context("canonical output for a planned job")?;
+        let (_doc, node) = fragment(id, canonical)?;
+        changes.set(jobs, id.as_str(), node);
+    }
+    for id in &ops.remove {
+        changes.remove(jobs, id.as_str());
     }
     Ok(())
 }
@@ -524,7 +520,7 @@ fn block_edits(
     blocks: &[DisabledBlock],
     canonical_jobs: &serde_yaml::Mapping,
     counts: &mut Counts,
-) -> Result<Vec<(Range<usize>, String)>> {
+) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
     for block in blocks {
         let kept: Vec<&String> = block
@@ -581,68 +577,67 @@ fn body_span(jobs: &Mapping, text: &str, key: &str) -> Option<(Range<usize>, usi
     Some((line_start..body_end, start - line_start))
 }
 
-/// Text replacements that conform the stale managed jobs of `jobs` to
-/// canonical output, where the job's body is a block the text can address.
+/// Decide the fate of every job in the region: a text replacement where the
+/// job's body is a block the text can address, an entry in [`JobOps`] for
+/// the tree phase otherwise. Also counts the jobs cibox leaves alone.
 ///
 /// Conforming a job by replacing its value on the syntax tree loses the
 /// trivia the parser folded into that value: a job followed by a blank line
 /// and a comment comes back with the blank line gone and the comment
 /// un-indented (yaml-edit 0.3). Rewriting the body's own lines instead
 /// leaves everything around it — the blank lines, the comments, and the key
-/// line with whatever the user put on it — byte for byte.
-///
-/// Jobs this can't address are left to [`conform_jobs`], which also removes
-/// the ones no longer generated.
-fn conform_jobs_textually(
+/// line with whatever the user put on it — byte for byte. Removing a job,
+/// and conforming one whose body is not a block of its own (a `job: {…}`
+/// one-liner, say), is the tree's work; so is the whole region when the user
+/// wrote it in flow style, which the tree phase then refuses outright.
+fn conform_jobs(
     region: &JobsRegion,
     text: &str,
     plan: &JobsPlan,
     counts: &mut Counts,
-    edits: &mut Vec<(Range<usize>, String)>,
+    edits: &mut Vec<Edit>,
+    ops: &mut JobOps,
 ) -> Result<()> {
-    let Some(jobs) = &region.node else {
-        return Ok(());
-    };
-    if jobs.is_flow_style() {
-        return Ok(());
-    }
+    // A flow-style region has no body lines to rewrite, so all of it falls
+    // to the tree phase
+    let addressable = region.node.as_ref().filter(|jobs| !jobs.is_flow_style());
     for key in &region.keys {
         if !plan.filter.managed(key) {
+            counts.preserved += 1;
             continue;
         }
         let Some(canonical) = get(plan.canonical, key) else {
+            ops.remove.push(key.clone());
+            counts.removed += 1;
             continue;
         };
         if get(&region.values, key) == Some(canonical) {
             continue;
         }
-        let Some((span, indent)) = body_span(jobs, text, key) else {
-            continue;
-        };
-        edits.push((span, indent_by(&serde_yaml::to_string(canonical)?, indent)));
+        match addressable.and_then(|jobs| body_span(jobs, text, key)) {
+            Some((span, indent)) => {
+                edits.push((span, indent_by(&serde_yaml::to_string(canonical)?, indent)))
+            }
+            None => ops.conform.push(key.clone()),
+        }
         counts.conformed += 1;
     }
     Ok(())
 }
 
-/// Apply the text phase's replacements, borrowing `text` unchanged when
-/// there are none — which is what tells the tree phase its parse is still
-/// good (see [`Parse::after_edits`]).
-fn apply_edits<'a>(
-    text: &'a str,
-    mut edits: Vec<(Range<usize>, String)>,
-    changes: &mut Changes,
-) -> Cow<'a, str> {
+/// Apply the text phase's replacements. `None` when there were none, which
+/// is what tells the tree phase its parse of the original text is still good
+/// (see [`Parse::after_edits`]).
+fn apply_edits(text: &str, mut edits: Vec<Edit>) -> Option<String> {
     if edits.is_empty() {
-        return Cow::Borrowed(text);
+        return None;
     }
-    changes.text();
     edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     let mut out = text.to_string();
     for (range, replacement) in edits {
         out.replace_range(range, &replacement);
     }
-    Cow::Owned(out)
+    Some(out)
 }
 
 /// Byte offset just past the top-level `jobs:` line, where new jobs can be
@@ -700,29 +695,37 @@ fn jobs_append_at(text: &str, jobs: Option<&Mapping>) -> Option<(usize, usize)> 
     Some((at, start - text[..start].rfind('\n').map_or(0, |i| i + 1)))
 }
 
-/// Queue the lines of the jobs that have to be re-added.
+/// Queue the lines of the jobs that have to be re-added, or leave them to
+/// the tree phase when the region has nowhere to append to.
 ///
 /// Splicing them into the syntax tree instead would, when the region ends in
 /// a blank line and a comment, pull the comment's indentation out from under
-/// it (yaml-edit 0.3) — the same reason [`conform_jobs_textually`] exists.
-fn add_jobs_textually(
+/// it (yaml-edit 0.3) — the same reason [`conform_jobs`] rewrites a body's
+/// own lines.
+fn add_jobs(
     existing: &str,
     jobs: Option<&Mapping>,
     plan: &JobsPlan,
     counts: &mut Counts,
-    edits: &mut Vec<(Range<usize>, String)>,
+    edits: &mut Vec<Edit>,
+    ops: &mut JobOps,
 ) -> Result<()> {
-    let Some((offset, indent)) = jobs_append_at(existing, jobs) else {
-        return Ok(());
-    };
+    let append_at = jobs_append_at(existing, jobs);
     let mut rendered = String::new();
     for id in plan.adds {
-        if let Some(canonical) = get(plan.canonical, id) {
-            rendered.push_str(&indent_by(&render_entry(id, canonical)?, indent));
-            counts.added += 1;
+        let Some(canonical) = get(plan.canonical, id) else {
+            continue;
+        };
+        match append_at {
+            Some((_, indent)) => {
+                let entry = render_entry(id, canonical)?;
+                rendered.push_str(&indent_by(&entry, indent));
+            }
+            None => ops.add.push(id.clone()),
         }
+        counts.added += 1;
     }
-    if !rendered.is_empty() {
+    if let (Some((offset, _)), false) = (append_at, rendered.is_empty()) {
         edits.push((offset..offset, rendered));
     }
     Ok(())
@@ -731,19 +734,27 @@ fn add_jobs_textually(
 /// The text phase of a merge, which is the same on every platform: the
 /// commented blocks live outside the YAML value tree, and conforming or
 /// adding a live job through the text is what keeps the blank lines and
-/// comments around it intact. Returns the replacements to apply; what the
-/// text can't address is left to [`conform_jobs`] on the tree afterwards.
+/// comments around it intact. Returns the replacements to apply, and the
+/// work the text can't do for [`apply_job_ops`] to do on the tree.
 fn text_phase(
     region: &JobsRegion,
     existing: &str,
     blocks: &[DisabledBlock],
     plan: &JobsPlan,
     counts: &mut Counts,
-) -> Result<Vec<(Range<usize>, String)>> {
+) -> Result<(Vec<Edit>, JobOps)> {
     let mut edits = block_edits(blocks, plan.canonical, counts)?;
-    conform_jobs_textually(region, existing, plan, counts, &mut edits)?;
-    add_jobs_textually(existing, region.node.as_ref(), plan, counts, &mut edits)?;
-    Ok(edits)
+    let mut ops = JobOps::default();
+    conform_jobs(region, existing, plan, counts, &mut edits, &mut ops)?;
+    add_jobs(
+        existing,
+        region.node.as_ref(),
+        plan,
+        counts,
+        &mut edits,
+        &mut ops,
+    )?;
+    Ok((edits, ops))
 }
 
 /// The planned jobs whose secrets the file's live pipeline will need: the
@@ -813,33 +824,42 @@ fn merge_github(
         path: &file.path,
     };
 
-    let edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
-    // Tree phase: whatever the text phase couldn't address, plus the
-    // document's own scaffolding
-    let edited = Parse::after_edits(apply_edits(existing, edits, &mut changes), &file.path)?;
-    let parse = edited.as_ref().unwrap_or(parse);
-    conform_jobs(
-        &JobsAt::JobsKey.resolve(parse, &file.path)?,
-        &plan,
-        &mut counts,
-        &mut changes,
-    )?;
-    let current_map = parse.values()?;
-    let root = parse.root()?;
+    let (edits, ops) = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
 
     // Only `jobs` is managed; user-tuned triggers/env/permissions are kept.
     // Scaffold `name`/`on`/`permissions` solely when the workflow lacks them.
-    for key in ["name", "on", "permissions"] {
-        if get(current_map, key).is_some() {
-            continue;
-        }
-        if let Some(value) = canonical.get(key) {
+    // The text phase never writes a document key, so what is missing from
+    // this parse is missing from its output too.
+    let current_map = parse.values()?;
+    let scaffold: Vec<(&str, &Value)> = ["name", "on", "permissions"]
+        .into_iter()
+        .filter(|key| get(current_map, key).is_none())
+        .filter_map(|key| canonical.get(key).map(|value| (key, value)))
+        .collect();
+
+    let edited = apply_edits(existing, edits);
+    let text = edited.as_deref().unwrap_or(existing);
+    // Tree phase: whatever the text phase couldn't address, plus the
+    // document's own scaffolding. With nothing for it to do, the text the
+    // text phase produced is the answer already.
+    let content = if ops.is_empty() && scaffold.is_empty() {
+        text.to_string()
+    } else {
+        let reparsed = Parse::after_edits(edited.as_deref(), &file.path)?;
+        let parse = reparsed.as_ref().unwrap_or(parse);
+        apply_job_ops(
+            &JobsAt::JobsKey.resolve(parse, &file.path)?,
+            &ops,
+            &plan,
+            &mut changes,
+        )?;
+        let root = parse.root()?;
+        for (key, value) in scaffold {
             let (_doc, node) = fragment(key, value)?;
             changes.insert_before(&root, "jobs", key, node);
         }
-    }
-
-    let content = changes.render(&parse.tree, existing);
+        changes.render(&parse.tree, text)
+    };
     if content == existing {
         return Ok(MergeOutcome::Unchanged);
     }
@@ -889,6 +909,14 @@ fn gitlab_job_keys(map: &serde_yaml::Mapping) -> Vec<String> {
         .collect()
 }
 
+/// What a GitLab merge does to the pipeline's `stages:` list
+enum StagesEdit {
+    /// Leave it as the user wrote it
+    Leave,
+    Remove,
+    Set(Vec<Value>),
+}
+
 fn merge_gitlab(
     file: &PlannedFile,
     filter: &JobFilter,
@@ -913,18 +941,13 @@ fn merge_gitlab(
         filter,
         path: &file.path,
     };
-    let edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
+    let (edits, ops) = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
 
-    let edited = Parse::after_edits(apply_edits(existing, edits, &mut changes), &file.path)?;
-    let parse = edited.as_ref().unwrap_or(parse);
-    conform_jobs(
-        &JobsAt::Root.resolve(parse, &file.path)?,
-        &plan,
-        &mut counts,
-        &mut changes,
-    )?;
+    // The text phase rewrites job bodies and comment blocks and nothing
+    // else, so the document keys below read the same off this parse as off a
+    // parse of its output — and deciding them here is what lets a merge with
+    // no tree edits to make skip parsing that output at all.
     let current_map = parse.values()?;
-    let root = parse.root()?;
 
     // Conform `stages` to what the final jobs reference. Canonical stages
     // cover the disabled jobs too, so a commented job's stage stays and
@@ -977,12 +1000,15 @@ fn merge_gitlab(
             stages.push(stage.clone());
         }
     }
-    if stages.is_empty() {
-        changes.remove(&root, "stages");
-    } else if stages != existing_stages {
-        let (_doc, node) = fragment("stages", &Value::Sequence(stages))?;
-        changes.set(&root, "stages", node);
-    }
+    let stages = match &stages[..] {
+        // An empty list is no list: GitLab rejects `stages: []`
+        [] => match get(current_map, "stages").is_some() {
+            true => StagesEdit::Remove,
+            false => StagesEdit::Leave,
+        },
+        _ if stages == existing_stages => StagesEdit::Leave,
+        _ => StagesEdit::Set(stages),
+    };
 
     // cibox used to hoist every job's environment into the top-level
     // `variables:`, from where it applied to all the other jobs too. Those
@@ -990,25 +1016,59 @@ fn merge_gitlab(
     // left behind they would keep leaking. Variables cibox never sets are the
     // user's (they may feed custom jobs) and stay.
     let hoisted = gitlab_job_variable_names(&file.jobs);
-    if let Some(Value::Mapping(vars)) = get(current_map, "variables") {
-        if let Some(vars_node) = root.get_mapping("variables") {
-            let mut remaining = 0;
-            for key in vars.keys() {
-                if hoisted.contains(key) {
-                    if let Some(key) = key.as_str() {
-                        changes.remove(&vars_node, key);
-                    }
-                } else {
-                    remaining += 1;
-                }
+    let global_vars: Option<Vec<&Value>> = match get(current_map, "variables") {
+        Some(Value::Mapping(vars)) => Some(vars.keys().collect()),
+        _ => None,
+    };
+    let drop_vars: Vec<&str> = global_vars
+        .iter()
+        .flatten()
+        .filter(|key| hoisted.contains(key))
+        .filter_map(|key| key.as_str())
+        .collect();
+    // Nothing of the user's is left in there, so the mapping goes too
+    let drop_vars_key = global_vars
+        .as_ref()
+        .is_some_and(|keys| keys.iter().all(|key| hoisted.contains(key)));
+
+    let edited = apply_edits(existing, edits);
+    let text = edited.as_deref().unwrap_or(existing);
+    // With no tree edits to make, the text the text phase produced is the
+    // answer already
+    let tree_edits = !ops.is_empty()
+        || !matches!(stages, StagesEdit::Leave)
+        || !drop_vars.is_empty()
+        || drop_vars_key;
+    let mut content = if !tree_edits {
+        text.to_string()
+    } else {
+        let reparsed = Parse::after_edits(edited.as_deref(), &file.path)?;
+        let parse = reparsed.as_ref().unwrap_or(parse);
+        apply_job_ops(
+            &JobsAt::Root.resolve(parse, &file.path)?,
+            &ops,
+            &plan,
+            &mut changes,
+        )?;
+        let root = parse.root()?;
+        match stages {
+            StagesEdit::Leave => {}
+            StagesEdit::Remove => changes.remove(&root, "stages"),
+            StagesEdit::Set(stages) => {
+                let (_doc, node) = fragment("stages", &Value::Sequence(stages))?;
+                changes.set(&root, "stages", node);
             }
-            if remaining == 0 {
+        }
+        if let Some(vars_node) = root.get_mapping("variables") {
+            for key in drop_vars {
+                changes.remove(&vars_node, key);
+            }
+            if drop_vars_key {
                 changes.remove(&root, "variables");
             }
         }
-    }
-
-    let mut content = changes.render(&parse.tree, existing);
+        changes.render(&parse.tree, text)
+    };
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::GitLab, &header, &mut content);
 
@@ -1203,7 +1263,7 @@ fn merge_circleci(
         filter,
         path: &file.path,
     };
-    let mut edits = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
+    let (mut edits, job_ops) = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
 
     // Commented workflow entries are text-only too: kept in sync with the
     // job's canonical invocations while it stays disabled, dropped when the
@@ -1239,6 +1299,8 @@ fn merge_circleci(
     let mut drop_workflows: Vec<String> = Vec::new();
     let mut wholesale: Vec<(String, Vec<Value>)> = Vec::new();
     let mut main_append_at: Option<(usize, usize)> = None;
+    // What `main` should end up invoking, when it has a list at all
+    let mut main_desired: Option<Vec<Value>> = None;
     if let Some(Value::Mapping(workflows)) = get(original, "workflows") {
         for (name, workflow) in workflows {
             let Some(name) = name.as_str() else { continue };
@@ -1255,11 +1317,24 @@ fn merge_circleci(
                 conform_entries(entries, &canonical_entries, &split.disabled_ids, filter);
             invoked.extend(seen);
             let spans = workflow_spans(existing, &parse.tree, name);
+            // Editing the list item by item needs the parse's items to line
+            // up with the entries, and a flow-style list has no lines of its
+            // own to edit
+            let addressable = !spans.flow && spans.items.len() == entries.len();
             if name == "main" {
-                main_append_at = spans
-                    .items
-                    .last()
-                    .map(|span| (span.end, line_indent(existing, span.start)));
+                // A block entry appended below a flow-style list would not be
+                // YAML at all, so a list the text can't address item by item
+                // can't be appended to either — the whole list is rewritten
+                // on the tree instead, below
+                main_append_at = addressable
+                    .then(|| {
+                        spans
+                            .items
+                            .last()
+                            .map(|span| (span.end, line_indent(existing, span.start)))
+                    })
+                    .flatten();
+                main_desired = Some(desired.clone());
             }
             if desired == *entries {
                 continue;
@@ -1273,7 +1348,7 @@ fn merge_circleci(
                 drop_workflows.push(name.to_string());
                 continue;
             }
-            if spans.flow || spans.items.len() != entries.len() {
+            if !addressable {
                 wholesale.push((name.to_string(), desired));
                 continue;
             }
@@ -1308,50 +1383,64 @@ fn merge_circleci(
         } else if let Some((at, indent)) = main_append_at {
             let rendered = serde_yaml::to_string(&Value::Sequence(missing_entries.clone()))?;
             edits.push((at..at, indent_by(&rendered, indent)));
+        } else if let Some(mut desired) = main_desired {
+            // `main` has a list, but not one the text can append to: rewrite
+            // it whole, with the missing invocations in it
+            desired.extend(missing_entries.iter().cloned());
+            wholesale.push(("main".to_string(), desired));
         } else {
             build_main = true;
         }
     }
 
-    let edited = Parse::after_edits(apply_edits(existing, edits, &mut changes), &file.path)?;
-    let parse = edited.as_ref().unwrap_or(parse);
-    conform_jobs(
-        &JobsAt::JobsKey.resolve(parse, &file.path)?,
-        &plan,
-        &mut counts,
-        &mut changes,
-    )?;
-    let root = parse.root()?;
+    let edited = apply_edits(existing, edits);
+    let text = edited.as_deref().unwrap_or(existing);
+    // With no tree edits to make, the text the text phase produced is the
+    // answer already
+    let tree_edits =
+        !job_ops.is_empty() || !drop_workflows.is_empty() || !wholesale.is_empty() || build_main;
+    let mut content = if !tree_edits {
+        text.to_string()
+    } else {
+        let reparsed = Parse::after_edits(edited.as_deref(), &file.path)?;
+        let parse = reparsed.as_ref().unwrap_or(parse);
+        apply_job_ops(
+            &JobsAt::JobsKey.resolve(parse, &file.path)?,
+            &job_ops,
+            &plan,
+            &mut changes,
+        )?;
+        let root = parse.root()?;
 
-    if let Some(workflows_node) = root.get_mapping("workflows") {
-        for name in &drop_workflows {
-            changes.remove(&workflows_node, name.as_str());
-        }
-        for (name, desired) in &wholesale {
-            if let Some(workflow) = workflows_node.get_mapping(name) {
-                let (_doc, seq) = sequence_fragment(desired)?;
-                changes.set(&workflow, "jobs", seq);
+        if let Some(workflows_node) = root.get_mapping("workflows") {
+            for name in &drop_workflows {
+                changes.remove(&workflows_node, name.as_str());
+            }
+            for (name, desired) in &wholesale {
+                if let Some(workflow) = workflows_node.get_mapping(name) {
+                    let (_doc, seq) = sequence_fragment(desired)?;
+                    changes.set(&workflow, "jobs", seq);
+                }
             }
         }
-    }
-    if build_main {
-        let mut main = serde_yaml::Mapping::new();
-        main.insert(Value::from("jobs"), Value::Sequence(missing_entries));
-        match root.get_mapping("workflows") {
-            Some(workflows_node) => {
-                let (_doc, node) = fragment("main", &Value::Mapping(main))?;
-                changes.set(&workflows_node, "main", node);
-            }
-            None => {
-                let mut workflows = serde_yaml::Mapping::new();
-                workflows.insert(Value::from("main"), Value::Mapping(main));
-                let (_doc, node) = fragment("workflows", &Value::Mapping(workflows))?;
-                changes.set(&root, "workflows", node);
+        if build_main {
+            let mut main = serde_yaml::Mapping::new();
+            main.insert(Value::from("jobs"), Value::Sequence(missing_entries));
+            match root.get_mapping("workflows") {
+                Some(workflows_node) => {
+                    let (_doc, node) = fragment("main", &Value::Mapping(main))?;
+                    changes.set(&workflows_node, "main", node);
+                }
+                None => {
+                    let mut workflows = serde_yaml::Mapping::new();
+                    workflows.insert(Value::from("main"), Value::Mapping(main));
+                    let (_doc, node) = fragment("workflows", &Value::Mapping(workflows))?;
+                    changes.set(&root, "workflows", node);
+                }
             }
         }
-    }
-
-    let mut content = changes.render(&parse.tree, existing);
+        changes.render(&parse.tree, text)
+    };
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::CircleCI, &header, &mut content);
 
@@ -2765,6 +2854,48 @@ workflows:
         let (content, _) = merged(merge_file(Platform::CircleCI, &file, &filter, &existing).unwrap());
         assert!(!content.contains("stale-only"), "{content}");
         assert!(!content.contains("rust-msrv"), "{content}");
+        assert!(matches!(
+            merge_file(Platform::CircleCI, &file, &filter, &content).unwrap(),
+            MergeOutcome::Unchanged
+        ));
+    }
+
+    /// A flow-style invocation list has no lines of its own to edit, so the
+    /// missing invocations can't be appended to it textually — block entries
+    /// written below `jobs: [a, b]` are not YAML at all. The list is
+    /// rewritten whole instead, keeping the entries it already held.
+    #[test]
+    fn test_circleci_flow_workflow_list_gains_the_missing_invocations() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::CircleCI, &resolved, 0);
+        let filter = no_selection(&resolved);
+
+        let existing = r#"version: "2.1"
+jobs:
+  rust-test:
+    docker: [{image: old}]
+    steps: [checkout, run: echo stale]
+  my-job:
+    docker: [{image: mine}]
+    steps: [checkout]
+workflows:
+  main:
+    jobs: [rust-test, my-job]
+"#;
+
+        let (content, _) = merged(merge_file(Platform::CircleCI, &file, &filter, existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content)
+            .unwrap_or_else(|e| panic!("merged output is not YAML: {e}\n{content}"));
+        let entries = doc["workflows"]["main"]["jobs"]
+            .as_sequence()
+            .unwrap_or_else(|| panic!("no main workflow list: {content}"));
+        let invoked: Vec<String> = entries.iter().filter_map(entry_id).collect();
+        // The user's own entry survives, and every generated job is invoked
+        assert!(invoked.contains(&"my-job".to_string()), "{content}");
+        for job in &file.jobs {
+            assert!(invoked.contains(&job.id), "{} not invoked: {content}", job.id);
+        }
         assert!(matches!(
             merge_file(Platform::CircleCI, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
