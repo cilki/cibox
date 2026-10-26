@@ -872,13 +872,13 @@ mod tests {
     /// an empty repository, and refresh so the preview sees it
     fn write_pipeline(state: &mut EditorState) {
         let resolved = crate::rules::resolve(&state.facts, &state.config);
-        for (path, content) in
-            crate::generator::generate(&state.facts, &resolved, state.platforms[0]).unwrap()
-        {
-            let path = state.working_dir.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, content).unwrap();
-        }
+        crate::generator::write_update(
+            &state.working_dir,
+            &state.facts,
+            &resolved,
+            state.platforms[0],
+        )
+        .unwrap();
         state.refresh();
     }
 
@@ -1073,12 +1073,13 @@ mod tests {
         let (dir, mut state) = expanded_state();
         write_pipeline(&mut state);
         let resolved = crate::rules::resolve(&state.facts, &state.config);
-        for (path, content) in
-            crate::generator::generate(&state.facts, &resolved, crate::config::Platform::GitLab)
-                .unwrap()
-        {
-            std::fs::write(dir.path().join(path), content).unwrap();
-        }
+        crate::generator::write_update(
+            dir.path(),
+            &state.facts,
+            &resolved,
+            crate::config::Platform::GitLab,
+        )
+        .unwrap();
         state.refresh();
         assert_eq!(
             state.platforms,
