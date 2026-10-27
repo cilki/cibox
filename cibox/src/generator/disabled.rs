@@ -72,9 +72,15 @@ pub(crate) fn scan(platform: Platform, text: &str, file: &YamlFile, filter: &Job
     // attaches to the root in the syntax tree, and the managed-job parse
     // below weeds out everything that isn't a commented job anyway.
     let mut regions = Vec::new();
-    if let Some(node) = root.as_node() {
+    let root_node = root.as_node().cloned();
+    if let Some(node) = &root_node {
         regions.push((node.clone(), Region::Jobs));
     }
+    // Where each CircleCI workflow's `jobs:` sequence ends. Comments trailing
+    // a nested sequence attach to the root too, so a root comment that only
+    // whitespace and other comments separate from the end of one of these
+    // belongs to that workflow, not to the job region.
+    let mut sequence_ends: Vec<(usize, Region)> = Vec::new();
     if !matches!(platform, Platform::GitLab) {
         if let Some(node) = root.get("jobs").and_then(|v| v.as_node().cloned()) {
             if let Some(value) = node.parent() {
@@ -102,6 +108,10 @@ pub(crate) fn scan(platform: Platform, text: &str, file: &YamlFile, filter: &Job
                 if let Some(value) = seq.parent() {
                     regions.push((value, Region::Workflow(name.clone())));
                 }
+                sequence_ends.push((
+                    usize::from(seq.text_range().end()),
+                    Region::Workflow(name.clone()),
+                ));
                 regions.push((seq, Region::Workflow(name)));
             }
         }
@@ -115,6 +125,7 @@ pub(crate) fn scan(platform: Platform, text: &str, file: &YamlFile, filter: &Job
     // adjacent comments are one run no matter which region found them.
     let mut comments: Vec<(Range<usize>, &Region)> = Vec::new();
     for (node, region) in &regions {
+        let at_root = root_node.as_ref() == Some(node);
         for child in node.children_with_tokens() {
             let Some(token) = child
                 .into_token()
@@ -123,7 +134,16 @@ pub(crate) fn scan(platform: Platform, text: &str, file: &YamlFile, filter: &Job
                 continue;
             };
             let range = token.text_range();
-            comments.push((usize::from(range.start())..usize::from(range.end()), region));
+            let range = usize::from(range.start())..usize::from(range.end());
+            let region = if at_root {
+                sequence_ends
+                    .iter()
+                    .find(|(end, _)| *end <= range.start && only_comments(&text[*end..range.start]))
+                    .map_or(region, |(_, workflow)| workflow)
+            } else {
+                region
+            };
+            comments.push((range, region));
         }
     }
     comments.sort_by_key(|(range, _)| range.start);
@@ -160,6 +180,14 @@ pub(crate) fn scan(platform: Platform, text: &str, file: &YamlFile, filter: &Job
         }
     }
     scan
+}
+
+/// Whether `text` holds nothing but blank lines and comment lines
+fn only_comments(text: &str) -> bool {
+    text.lines().all(|line| {
+        let line = line.trim_start();
+        line.is_empty() || line.starts_with('#')
+    })
 }
 
 /// Expand a byte range to cover its whole lines, trailing newline included
@@ -457,6 +485,17 @@ mod tests {
         let scan = scan_text(Platform::CircleCI, text);
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].workflow, "main");
+        assert_eq!(scan.entries[0].ids, vec!["rust-test"]);
+    }
+
+    /// Comments trailing a workflow's `jobs:` sequence attach to the root of
+    /// the syntax tree, so they are matched to their workflow by position.
+    #[test]
+    fn test_scan_assigns_trailing_entries_to_their_workflow() {
+        let text = "version: \"2.1\"\nworkflows:\n  main:\n    jobs:\n      - real\n  nightly:\n    jobs:\n      - real\n\n      # - rust-test:\n      #     requires: [real]\n";
+        let scan = scan_text(Platform::CircleCI, text);
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].workflow, "nightly");
         assert_eq!(scan.entries[0].ids, vec!["rust-test"]);
     }
 
