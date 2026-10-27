@@ -224,15 +224,99 @@ pub enum FileChange {
     },
 }
 
-/// Decide what `cibox update` does to each planned file, without writing
+/// Decide what `cibox update` does to one planned file, without writing
 /// anything — the one place that decision is made, shared by the command and
 /// the editor's preview so the two can't drift apart.
 ///
 /// A missing or empty file gets the full canonical content (as does
 /// `force`), narrowed to the jobs `filter` manages; a file with content is
 /// merged, so cibox-managed jobs are conformed, re-added, or pruned and
-/// everything the user did to it is kept. Files there is nothing to create
-/// for are left out of the result.
+/// everything the user did to it is kept. `None` when there is nothing to
+/// create the file for.
+fn pending_file(
+    working_dir: &Path,
+    platform: Platform,
+    file: &PlannedFile,
+    filter: &JobFilter,
+    force: bool,
+) -> Result<Option<FileUpdate>> {
+    let existing = std::fs::read_to_string(working_dir.join(&file.path)).ok();
+    let change = match existing.as_deref() {
+        Some(text) if !force && !text.trim().is_empty() => {
+            match merge_file(platform, file, filter, text)? {
+                MergeOutcome::Unchanged => FileChange::Unchanged,
+                MergeOutcome::WouldEmpty => FileChange::WouldEmpty,
+                MergeOutcome::Merged { content, counts } => FileChange::Write {
+                    content,
+                    counts: Some(counts),
+                },
+            }
+        }
+        _ => {
+            let fresh = PlannedFile {
+                jobs: managed_jobs(file, filter),
+                ..file.clone()
+            };
+            if fresh.jobs.is_empty() {
+                return Ok(None);
+            }
+            FileChange::Write {
+                content: render_file(platform, &fresh)?,
+                counts: None,
+            }
+        }
+    };
+    Ok(Some(FileUpdate {
+        path: file.path.clone(),
+        existing,
+        change,
+    }))
+}
+
+/// [`pending_file`] for each of `files`, in their order, each on a thread of
+/// its own.
+///
+/// The files share nothing — each is read, merged against its own plan, and
+/// rendered on its own — and merging one is nearly all of what an update
+/// costs: even a few hundred bytes of pipeline take a few times what a
+/// thread does to start, and a pipeline of a few hundred lines runs to
+/// milliseconds. So every file but the last goes to a thread, and the last
+/// is merged here while they run, which leaves a single-file update spawning
+/// nothing. The result reads as if the files had been taken one after
+/// another: same order, and when several fail, the first one's error.
+fn pending_files(
+    working_dir: &Path,
+    files: &[(Platform, &PlannedFile)],
+    filter: &JobFilter,
+    force: bool,
+) -> Result<Vec<FileUpdate>> {
+    let Some((&(last_platform, last_file), rest)) = files.split_last() else {
+        return Ok(Vec::new());
+    };
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = rest
+            .iter()
+            .map(|&(platform, file)| {
+                scope.spawn(move || pending_file(working_dir, platform, file, filter, force))
+            })
+            .collect();
+        let last = pending_file(working_dir, last_platform, last_file, filter, force);
+        let mut updates = Vec::with_capacity(files.len());
+        for handle in handles {
+            // A panic in a merge is cibox's bug to report, not the file's,
+            // so it keeps its own backtrace instead of becoming a message
+            let update = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            updates.extend(update);
+        }
+        updates.extend(last?);
+        Ok(updates)
+    })
+}
+
+/// [`pending_file`] for each of one platform's planned files, in order.
+/// Files there is nothing to create for are left out of the result.
 pub fn pending_update(
     working_dir: &Path,
     platform: Platform,
@@ -240,41 +324,9 @@ pub fn pending_update(
     filter: &JobFilter,
     force: bool,
 ) -> Result<Vec<FileUpdate>> {
-    let mut updates = Vec::new();
-    for file in planned {
-        let existing = std::fs::read_to_string(working_dir.join(&file.path)).ok();
-        let change = match existing.as_deref() {
-            Some(text) if !force && !text.trim().is_empty() => {
-                match merge_file(platform, file, filter, text)? {
-                    MergeOutcome::Unchanged => FileChange::Unchanged,
-                    MergeOutcome::WouldEmpty => FileChange::WouldEmpty,
-                    MergeOutcome::Merged { content, counts } => FileChange::Write {
-                        content,
-                        counts: Some(counts),
-                    },
-                }
-            }
-            _ => {
-                let fresh = PlannedFile {
-                    jobs: managed_jobs(file, filter),
-                    ..file.clone()
-                };
-                if fresh.jobs.is_empty() {
-                    continue;
-                }
-                FileChange::Write {
-                    content: render_file(platform, &fresh)?,
-                    counts: None,
-                }
-            }
-        };
-        updates.push(FileUpdate {
-            path: file.path.clone(),
-            existing,
-            change,
-        });
-    }
-    Ok(updates)
+    let files: Vec<(Platform, &PlannedFile)> =
+        planned.iter().map(|file| (platform, file)).collect();
+    pending_files(working_dir, &files, filter, force)
 }
 
 /// The planned files of every target platform, in order.
@@ -301,24 +353,20 @@ pub fn plan_all(
         .collect()
 }
 
-/// [`pending_update`] for every platform in `plans`, concatenated in order
+/// [`pending_update`] for every platform in `plans`, concatenated in order.
+/// The files of every platform are merged side by side, not just those of
+/// one platform at a time (see [`pending_files`]).
 pub fn pending_updates(
     working_dir: &Path,
     plans: &Plans,
     filter: &JobFilter,
     force: bool,
 ) -> Result<Vec<FileUpdate>> {
-    let mut updates = Vec::new();
-    for (platform, files) in plans {
-        updates.extend(pending_update(
-            working_dir,
-            *platform,
-            files,
-            filter,
-            force,
-        )?);
-    }
-    Ok(updates)
+    let files: Vec<(Platform, &PlannedFile)> = plans
+        .iter()
+        .flat_map(|(platform, files)| files.iter().map(move |file| (*platform, file)))
+        .collect();
+    pending_files(working_dir, &files, filter, force)
 }
 
 /// What `cibox update` would write into `working_dir` for one platform with
@@ -638,6 +686,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The files are merged side by side, but what comes back has to read
+    /// as if they had been taken one after another: every platform's files
+    /// in plan order, and the first file's error when more than one fails —
+    /// the command stops at one error, and which one it shows must not
+    /// depend on which thread finished first.
+    #[test]
+    fn test_pending_updates_keep_plan_order_and_the_first_error() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let filter = JobFilter {
+            resolved: &resolved,
+            selection: None,
+        };
+        let platforms = Platform::all();
+        let plans = plan_all(&facts, &resolved, &platforms).unwrap();
+        let planned: Vec<&PathBuf> = plans
+            .iter()
+            .flat_map(|(_, files)| files.iter().map(|f| &f.path))
+            .collect();
+
+        // Nothing on disk: every file is created, in plan order
+        let dir = tempdir().unwrap();
+        let updates = pending_updates(dir.path(), &plans, &filter, false).unwrap();
+        let paths: Vec<&PathBuf> = updates.iter().map(|u| &u.path).collect();
+        assert_eq!(paths, planned);
+
+        // One pipeline per platform on disk, in varying states: GitHub's is
+        // stale, Gitea's is unparseable, GitLab's is current, CircleCI's is
+        // unparseable too. The error is Gitea's, the earlier of the two.
+        let gitlab = pending_updates(dir.path(), &plans[2..3].to_vec(), &filter, false).unwrap();
+        for (path, content) in [
+            (
+                Platform::GitHub.output_path(),
+                "name: CI\non: push\njobs:\n  rust-test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo stale\n".to_string(),
+            ),
+            (Platform::Gitea.output_path(), "jobs: [\n".to_string()),
+            (Platform::GitLab.output_path(), match &gitlab[0].change {
+                FileChange::Write { content, .. } => content.clone(),
+                other => panic!("{other:?}"),
+            }),
+            (Platform::CircleCI.output_path(), "version: [\n".to_string()),
+        ] {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let err = pending_updates(dir.path(), &plans, &filter, false).unwrap_err();
+        assert!(err.to_string().contains(".gitea/"), "{err:#}");
+
+        // With Gitea's pipeline gone, CircleCI's is the error
+        fs::remove_file(dir.path().join(Platform::Gitea.output_path())).unwrap();
+        let err = pending_updates(dir.path(), &plans, &filter, false).unwrap_err();
+        assert!(err.to_string().contains(".circleci/"), "{err:#}");
+
+        // And with that one gone too, every file is decided, in plan order,
+        // each as its own state says
+        fs::remove_file(dir.path().join(Platform::CircleCI.output_path())).unwrap();
+        let updates = pending_updates(dir.path(), &plans, &filter, false).unwrap();
+        let paths: Vec<&PathBuf> = updates.iter().map(|u| &u.path).collect();
+        assert_eq!(paths, planned);
+        let changes: Vec<&str> = updates
+            .iter()
+            .map(|u| match (&u.change, &u.existing) {
+                (FileChange::Unchanged, _) => "unchanged",
+                (
+                    FileChange::Write {
+                        counts: Some(_), ..
+                    },
+                    _,
+                ) => "merged",
+                (FileChange::Write { counts: None, .. }, _) => "created",
+                (FileChange::WouldEmpty, _) => "would-empty",
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                "merged",
+                "created", // GitHub: stale ci.yml, no release.yml
+                "created",
+                "created",   // Gitea
+                "unchanged", // GitLab
+                "created",   // CircleCI
+            ]
+        );
     }
 
     #[test]

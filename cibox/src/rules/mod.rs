@@ -39,7 +39,13 @@ pub use zig::{ZigBuild, ZigFmt, ZigTest};
 pub(crate) const CIBOX_IMAGE: &str = "fossable/cibox:latest";
 
 /// One opinionated unit of CI configuration
-pub trait Rule {
+///
+/// `Send + Sync` so a resolution can be read from several threads at once:
+/// an update merges each pipeline file on its own thread, and every merge
+/// asks the rules which jobs are theirs (see
+/// [`crate::generator::pending_updates`]). Rules are plain data, so the
+/// bound costs an implementation nothing.
+pub trait Rule: Send + Sync {
     /// Stable kebab-case identifier; also the job key in generated configs
     /// and (in snake_case) the field name in cibox.ron
     fn id(&self) -> &'static str;

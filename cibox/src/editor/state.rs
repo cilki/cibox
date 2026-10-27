@@ -461,11 +461,12 @@ impl EditorState {
     /// another terminal shows up on the next edit.
     ///
     /// Recomputing the preview means merging cibox's output into every
-    /// pipeline file on disk, which is nearly the whole cost of an edit —
-    /// 0.96 ms on this repository's own pipeline, 4.5 ms on one carrying a
-    /// couple of hundred hand-written jobs — so only the things that change
-    /// what update would write come through here. Moving the cursor and
-    /// expanding a rule go to [`Self::rebuild_rows`] instead.
+    /// pipeline file on disk (side by side, one thread per file), which is
+    /// nearly the whole cost of an edit — 0.96 ms on this repository's own
+    /// pipeline, 4.5 ms on one carrying a couple of hundred hand-written
+    /// jobs — so only the things that change what update would write come
+    /// through here. Moving the cursor and expanding a rule go to
+    /// [`Self::rebuild_rows`] instead.
     pub fn refresh(&mut self) {
         let resolved = self.rebuild_rows();
 
