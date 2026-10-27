@@ -1,3 +1,4 @@
+use crate::config::android::is_toolchain_version;
 use cargo_toml::Manifest;
 use std::fs;
 use std::path::Path;
@@ -19,23 +20,6 @@ pub struct RustFacts {
     pub is_library: bool,
 }
 
-/// Is this a bare `major[.minor[.patch]]` version, the only shape cargo
-/// accepts for `rust-version`?
-///
-/// The rust-msrv rule bakes this fact into `rustup toolchain install {msrv}`
-/// and `cargo +{msrv} check`, so a manifest from a repository we did not write
-/// gets to put text in a generated `run:` step. Anything but digits and dots
-/// is either a version no toolchain could resolve or shell being smuggled in,
-/// and in both cases the fact is better off absent — the rule falls back to
-/// reading the version in shell, where it stays quoted.
-fn is_toolchain_version(version: &str) -> bool {
-    let components: Vec<&str> = version.split('.').collect();
-    components.len() <= 3
-        && components
-            .iter()
-            .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
-}
-
 pub(super) fn gather(path: &Path) -> Option<RustFacts> {
     let contents = fs::read_to_string(path.join("Cargo.toml")).ok()?;
     let manifest = Manifest::from_str(&contents).ok()?;
@@ -48,6 +32,12 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
         Err(_) => true,
     });
 
+    // The rust-msrv rule bakes this fact into `rustup toolchain install
+    // {msrv}` and `cargo +{msrv} check`, so a manifest from a repository we
+    // did not write gets to put text in a generated `run:` step. Anything but
+    // a bare version is either one no toolchain could resolve or shell being
+    // smuggled in, and in both cases the fact is better off absent — the
+    // rule falls back to reading the version in shell, where it stays quoted.
     let msrv = package
         .and_then(|p| p.rust_version.as_ref())
         .and_then(|v| v.get().ok())

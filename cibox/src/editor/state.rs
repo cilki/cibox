@@ -30,13 +30,6 @@ pub struct RuleRow {
     pub expanded: bool,
 }
 
-impl RuleRow {
-    /// Whether cibox.ron overrides detection for this rule
-    pub fn overridden(&self) -> bool {
-        self.enabled != self.detected
-    }
-}
-
 /// One row in the rules panel: a rule, or one config option of an expanded rule
 #[derive(Debug, Clone)]
 pub enum Row {
@@ -217,11 +210,9 @@ pub enum Focus {
 
 impl EditorState {
     pub fn new(facts: ProjectFacts, working_dir: PathBuf) -> Result<Self> {
-        let ron_path = working_dir.join("cibox.ron");
-        let (config, has_ron_file) = match std::fs::read_to_string(&ron_path) {
-            Ok(ron_str) => (crate::config::parse_config(&ron_str)?, true),
-            Err(_) => (CiboxConfig::default(), false),
-        };
+        let config = crate::config::load_config(&working_dir.join("cibox.ron"))?;
+        let has_ron_file = config.is_some();
+        let config = config.unwrap_or_default();
 
         let mut state = Self {
             facts,
@@ -636,11 +627,7 @@ impl EditorState {
                     selected.push(arch);
                 }
                 // Stored in ALL order, so the file doesn't record click order
-                let selected: Vec<DockerPlatform> = DockerPlatform::ALL
-                    .iter()
-                    .copied()
-                    .filter(|p| selected.contains(p))
-                    .collect();
+                let selected = DockerPlatform::normalize(&selected);
                 self.config.docker_release.platforms = (!selected.is_empty()).then_some(selected);
             }
         }
@@ -796,11 +783,6 @@ impl EditorState {
         }
     }
 
-    /// Export the override config as a RON string
-    pub fn export_to_ron(&self) -> Result<String> {
-        serialize_config(&self.config)
-    }
-
     /// Write cibox.ron when there is anything to say (or the file already
     /// exists and needs updating)
     pub fn auto_save_ron(&mut self) {
@@ -808,7 +790,7 @@ impl EditorState {
             return;
         }
         let path = self.working_dir.join("cibox.ron");
-        if let Ok(ron_str) = self.export_to_ron() {
+        if let Ok(ron_str) = serialize_config(&self.config) {
             if std::fs::write(&path, ron_str).is_ok() {
                 self.has_ron_file = true;
             }
@@ -958,7 +940,6 @@ mod tests {
         let row = rule_row(&state, "rust-test");
         assert!(row.detected);
         assert!(!row.enabled);
-        assert!(row.overridden());
     }
 
     #[test]

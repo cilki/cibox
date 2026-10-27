@@ -1,4 +1,4 @@
-use crate::config::{parse_config, platform_names, target_platforms, CiboxConfig, Platform};
+use crate::config::{load_config, platform_names, target_platforms, CiboxConfig, Platform};
 use crate::detection::gather_facts;
 use crate::error::Result;
 use crate::generator::FileChange;
@@ -6,24 +6,6 @@ use crate::rules::{resolve, ResolvedRule};
 use anyhow::Context;
 use colored::Colorize;
 use std::path::{Path, PathBuf};
-
-/// Load cibox.ron if present. A missing file at the default path is fine —
-/// detection supplies everything; an explicitly named missing file is an error.
-fn load_config(config_path: &str, explicit_required: bool) -> Result<CiboxConfig> {
-    match std::fs::read_to_string(config_path) {
-        Ok(ron_str) => parse_config(&ron_str)
-            .with_context(|| format!("Failed to parse {config_path}")),
-        Err(_) if !explicit_required => {
-            println!(
-                "{} no {} — using detected defaults",
-                "Note:".cyan().bold(),
-                config_path
-            );
-            Ok(CiboxConfig::default())
-        }
-        Err(e) => Err(e).with_context(|| format!("Failed to read config file: {config_path}")),
-    }
-}
 
 fn print_rule_table(resolved: &[ResolvedRule]) {
     for rule in resolved {
@@ -56,7 +38,20 @@ pub fn handle_update(
 ) -> Result<()> {
     let working_dir = PathBuf::from(".");
     let facts = gather_facts(&working_dir);
-    let config = load_config(config_path, config_path != "cibox.ron")?;
+    // A missing file at the default path is fine — detection supplies
+    // everything; an explicitly named missing file is an error
+    let config = match load_config(Path::new(config_path))? {
+        Some(config) => config,
+        None if config_path == "cibox.ron" => {
+            println!(
+                "{} no {} — using detected defaults",
+                "Note:".cyan().bold(),
+                config_path
+            );
+            CiboxConfig::default()
+        }
+        None => anyhow::bail!("Failed to read config file: {config_path}"),
+    };
     let (platforms, _) = target_platforms(&facts, requested);
     let resolved = resolve(&facts, &config);
 
@@ -164,14 +159,8 @@ pub fn handle_update(
 pub fn handle_validate(config_path: &str) -> Result<()> {
     println!("{} {}", "Validating".cyan().bold(), config_path);
 
-    let ron_str = std::fs::read_to_string(config_path)
+    let config = load_config(Path::new(config_path))?
         .with_context(|| format!("Failed to read config file: {config_path}"))?;
-    let config = parse_config(&ron_str).with_context(|| {
-        "Failed to parse RON config. Check syntax and structure:\n\
-         - Ensure all fields are properly formatted\n\
-         - Check for missing commas\n\
-         - Verify rule names match the documented set"
-    })?;
 
     println!("\n{}", "Configuration is valid!".green().bold());
 
@@ -266,15 +255,11 @@ pub fn handle_detect(dir: &str) -> Result<()> {
 
     println!();
     println!("{}", "Rules:".cyan().bold());
-    let config_path = working_dir.join("cibox.ron");
-    let config = match std::fs::read_to_string(&config_path) {
-        Ok(ron_str) => parse_config(&ron_str).unwrap_or_else(|e| {
-            eprintln!("Warning: ignoring unparseable cibox.ron: {e}");
-            CiboxConfig::default()
-        }),
-        Err(_) => CiboxConfig::default(),
-    };
-    print_rule_table(&resolve(&facts, &config));
+    let config = load_config(&working_dir.join("cibox.ron")).unwrap_or_else(|e| {
+        eprintln!("Warning: ignoring unparseable cibox.ron: {e:#}");
+        None
+    });
+    print_rule_table(&resolve(&facts, &config.unwrap_or_default()));
 
     println!();
     println!("{}", "Next steps:".cyan().bold());

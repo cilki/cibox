@@ -172,15 +172,6 @@ impl DockerRelease {
         })
     }
 
-    /// Selected platforms deduped and in `DockerPlatform::ALL` order
-    fn normalized_platforms(&self) -> Vec<DockerPlatform> {
-        DockerPlatform::ALL
-            .iter()
-            .copied()
-            .filter(|p| self.platforms.contains(p))
-            .collect()
-    }
-
     /// Steps for a buildx job that builds `linux` platforms and pushes a
     /// single staging `tag`, or the final release tags when `tag` is `None`
     fn buildx_steps(
@@ -287,9 +278,10 @@ impl Rule for DockerRelease {
     }
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
-        let platforms = self.normalized_platforms();
         let (windows, linux): (Vec<DockerPlatform>, Vec<DockerPlatform>) =
-            platforms.into_iter().partition(|p| p.is_windows());
+            DockerPlatform::normalize(&self.platforms)
+                .into_iter()
+                .partition(|p| p.is_windows());
 
         match (linux.is_empty(), windows.is_empty()) {
             // No linux targets: one plain build/push of the final tag, on a

@@ -281,6 +281,15 @@ impl DockerPlatform {
     pub fn is_windows(&self) -> bool {
         matches!(self, DockerPlatform::WindowsAmd64)
     }
+
+    /// `selected` deduplicated and in [`Self::ALL`] order — the one order a
+    /// platform list has, whichever order it was written or clicked in
+    pub fn normalize(selected: &[DockerPlatform]) -> Vec<DockerPlatform> {
+        Self::ALL
+            .into_iter()
+            .filter(|p| selected.contains(p))
+            .collect()
+    }
 }
 
 /// Whether a value still holds every one of its defaults. A rule entry that

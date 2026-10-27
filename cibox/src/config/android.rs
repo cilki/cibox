@@ -52,16 +52,22 @@ pub fn is_valid_apt_package(name: &str) -> bool {
 /// back to "unset".
 pub const DEFAULT_TOOLCHAIN: &str = "stable";
 
-/// Whether `version` is a valid rust toolchain selector for the cargo-ndk
-/// pre-build: "stable", "nightly", or a bare `major[.minor[.patch]]` — the
-/// shapes that map onto an official docker image tag.
-pub fn is_valid_toolchain(version: &str) -> bool {
-    if matches!(version, DEFAULT_TOOLCHAIN | "nightly") {
-        return true;
-    }
+/// Whether `version` is a bare `major[.minor[.patch]]` rust version: the only
+/// shape cargo accepts for `rust-version`, and the one that maps onto an
+/// official `rust:<version>` image tag. Digits and dots only, so a value
+/// from a manifest or cibox.ron can be put in a shell command or an image
+/// reference as it is.
+pub fn is_toolchain_version(version: &str) -> bool {
     let components: Vec<&str> = version.split('.').collect();
     components.len() <= 3
         && components
             .iter()
             .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `version` is a valid rust toolchain selector for the cargo-ndk
+/// pre-build: "stable", "nightly", or a bare version — the shapes that map
+/// onto an official docker image tag.
+pub fn is_valid_toolchain(version: &str) -> bool {
+    matches!(version, DEFAULT_TOOLCHAIN | "nightly") || is_toolchain_version(version)
 }
