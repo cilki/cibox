@@ -293,7 +293,8 @@ pub fn plan_all(
         .map(|&platform| {
             let files = plan(facts, resolved, platform).map_err(|e| {
                 e.context(format!(
-                    "Failed to generate CI configuration for {platform}"
+                    "Failed to generate CI configuration for {}",
+                    platform.name()
                 ))
             })?;
             Ok((platform, files))
