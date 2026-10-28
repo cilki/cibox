@@ -731,18 +731,24 @@ fn add_jobs(
     Ok(())
 }
 
+/// The replacements the text phase queued (a platform may add its own), and
+/// the work the text can't do for [`apply_job_ops`] to do on the tree
+struct TextPhase {
+    edits: Vec<Edit>,
+    ops: JobOps,
+}
+
 /// The text phase of a merge, which is the same on every platform: the
 /// commented blocks live outside the YAML value tree, and conforming or
 /// adding a live job through the text is what keeps the blank lines and
-/// comments around it intact. Returns the replacements to apply, and the
-/// work the text can't do for [`apply_job_ops`] to do on the tree.
+/// comments around it intact.
 fn text_phase(
     region: &JobsRegion,
     existing: &str,
     blocks: &[DisabledBlock],
     plan: &JobsPlan,
     counts: &mut Counts,
-) -> Result<(Vec<Edit>, JobOps)> {
+) -> Result<TextPhase> {
     let mut edits = block_edits(blocks, plan.canonical, counts)?;
     let mut ops = JobOps::default();
     conform_jobs(region, existing, plan, counts, &mut edits, &mut ops)?;
@@ -754,7 +760,40 @@ fn text_phase(
         &mut edits,
         &mut ops,
     )?;
-    Ok((edits, ops))
+    Ok(TextPhase { edits, ops })
+}
+
+impl TextPhase {
+    /// Apply the replacements, then run the tree phase: [`JobOps`] on the
+    /// job region `at` names, then the platform's own `edit_root`, which
+    /// `root_work` says has anything to do. With no tree work at all, the
+    /// text the text phase produced is the answer already.
+    fn finish(
+        self,
+        existing: &str,
+        parse: &Parse,
+        at: JobsAt,
+        plan: &JobsPlan,
+        root_work: bool,
+        edit_root: impl FnOnce(&Mapping, &mut Changes) -> Result<()>,
+    ) -> Result<String> {
+        let edited = apply_edits(existing, self.edits);
+        let text = edited.as_deref().unwrap_or(existing);
+        if self.ops.is_empty() && !root_work {
+            return Ok(text.to_string());
+        }
+        let reparsed = Parse::after_edits(edited.as_deref(), plan.path)?;
+        let parse = reparsed.as_ref().unwrap_or(parse);
+        let mut changes = Changes::default();
+        apply_job_ops(
+            &at.resolve(parse, plan.path)?,
+            &self.ops,
+            plan,
+            &mut changes,
+        )?;
+        edit_root(&parse.root()?, &mut changes)?;
+        Ok(changes.render(&parse.tree, text))
+    }
 }
 
 /// The planned jobs whose secrets the file's live pipeline will need: the
@@ -806,7 +845,6 @@ fn merge_github(
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
-    let mut changes = Changes::default();
 
     let region = JobsAt::JobsKey.resolve(parse, &file.path)?;
     let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
@@ -824,7 +862,7 @@ fn merge_github(
         path: &file.path,
     };
 
-    let (edits, ops) = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
+    let phase = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
 
     // Only `jobs` is managed; user-tuned triggers/env/permissions are kept.
     // Scaffold `name`/`on`/`permissions` solely when the workflow lacks them.
@@ -837,29 +875,20 @@ fn merge_github(
         .filter_map(|key| canonical.get(key).map(|value| (key, value)))
         .collect();
 
-    let edited = apply_edits(existing, edits);
-    let text = edited.as_deref().unwrap_or(existing);
-    // Tree phase: whatever the text phase couldn't address, plus the
-    // document's own scaffolding. With nothing for it to do, the text the
-    // text phase produced is the answer already.
-    let content = if ops.is_empty() && scaffold.is_empty() {
-        text.to_string()
-    } else {
-        let reparsed = Parse::after_edits(edited.as_deref(), &file.path)?;
-        let parse = reparsed.as_ref().unwrap_or(parse);
-        apply_job_ops(
-            &JobsAt::JobsKey.resolve(parse, &file.path)?,
-            &ops,
-            &plan,
-            &mut changes,
-        )?;
-        let root = parse.root()?;
-        for (key, value) in scaffold {
-            let (_doc, node) = fragment(key, value)?;
-            changes.insert_before(&root, "jobs", key, node);
-        }
-        changes.render(&parse.tree, text)
-    };
+    let content = phase.finish(
+        existing,
+        parse,
+        JobsAt::JobsKey,
+        &plan,
+        !scaffold.is_empty(),
+        |root, changes| {
+            for (key, value) in scaffold {
+                let (_doc, node) = fragment(key, value)?;
+                changes.insert_before(root, "jobs", key, node);
+            }
+            Ok(())
+        },
+    )?;
     if content == existing {
         return Ok(MergeOutcome::Unchanged);
     }
@@ -925,7 +954,6 @@ fn merge_gitlab(
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
-    let mut changes = Changes::default();
     let region = JobsAt::Root.resolve(parse, &file.path)?;
     let split = split_plan(&file.jobs, &region.keys, scan.blocks, filter);
 
@@ -941,7 +969,7 @@ fn merge_gitlab(
         filter,
         path: &file.path,
     };
-    let (edits, ops) = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
+    let phase = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
 
     // The text phase rewrites job bodies and comment blocks and nothing
     // else, so the document keys below read the same off this parse as off a
@@ -1031,44 +1059,33 @@ fn merge_gitlab(
         .as_ref()
         .is_some_and(|keys| keys.iter().all(|key| hoisted.contains(key)));
 
-    let edited = apply_edits(existing, edits);
-    let text = edited.as_deref().unwrap_or(existing);
-    // With no tree edits to make, the text the text phase produced is the
-    // answer already
-    let tree_edits = !ops.is_empty()
-        || !matches!(stages, StagesEdit::Leave)
-        || !drop_vars.is_empty()
-        || drop_vars_key;
-    let mut content = if !tree_edits {
-        text.to_string()
-    } else {
-        let reparsed = Parse::after_edits(edited.as_deref(), &file.path)?;
-        let parse = reparsed.as_ref().unwrap_or(parse);
-        apply_job_ops(
-            &JobsAt::Root.resolve(parse, &file.path)?,
-            &ops,
-            &plan,
-            &mut changes,
-        )?;
-        let root = parse.root()?;
-        match stages {
-            StagesEdit::Leave => {}
-            StagesEdit::Remove => changes.remove(&root, "stages"),
-            StagesEdit::Set(stages) => {
-                let (_doc, node) = fragment("stages", &Value::Sequence(stages))?;
-                changes.set(&root, "stages", node);
+    let root_work = !matches!(stages, StagesEdit::Leave) || !drop_vars.is_empty() || drop_vars_key;
+    let mut content = phase.finish(
+        existing,
+        parse,
+        JobsAt::Root,
+        &plan,
+        root_work,
+        |root, changes| {
+            match stages {
+                StagesEdit::Leave => {}
+                StagesEdit::Remove => changes.remove(root, "stages"),
+                StagesEdit::Set(stages) => {
+                    let (_doc, node) = fragment("stages", &Value::Sequence(stages))?;
+                    changes.set(root, "stages", node);
+                }
             }
-        }
-        if let Some(vars_node) = root.get_mapping("variables") {
-            for key in drop_vars {
-                changes.remove(&vars_node, key);
+            if let Some(vars_node) = root.get_mapping("variables") {
+                for key in drop_vars {
+                    changes.remove(&vars_node, key);
+                }
+                if drop_vars_key {
+                    changes.remove(root, "variables");
+                }
             }
-            if drop_vars_key {
-                changes.remove(&root, "variables");
-            }
-        }
-        changes.render(&parse.tree, text)
-    };
+            Ok(())
+        },
+    )?;
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::GitLab, &header, &mut content);
 
@@ -1239,7 +1256,6 @@ fn merge_circleci(
     scan: Scan,
 ) -> Result<MergeOutcome> {
     let mut counts = Counts::default();
-    let mut changes = Changes::default();
 
     let original = parse.values()?;
     let region = JobsAt::JobsKey.resolve(parse, &file.path)?;
@@ -1263,7 +1279,8 @@ fn merge_circleci(
         filter,
         path: &file.path,
     };
-    let (mut edits, job_ops) = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
+    let mut phase = text_phase(&region, existing, &split.blocks, &plan, &mut counts)?;
+    let edits = &mut phase.edits;
 
     // Commented workflow entries are text-only too: kept in sync with the
     // job's canonical invocations while it stays disabled, dropped when the
@@ -1393,54 +1410,44 @@ fn merge_circleci(
         }
     }
 
-    let edited = apply_edits(existing, edits);
-    let text = edited.as_deref().unwrap_or(existing);
-    // With no tree edits to make, the text the text phase produced is the
-    // answer already
-    let tree_edits =
-        !job_ops.is_empty() || !drop_workflows.is_empty() || !wholesale.is_empty() || build_main;
-    let mut content = if !tree_edits {
-        text.to_string()
-    } else {
-        let reparsed = Parse::after_edits(edited.as_deref(), &file.path)?;
-        let parse = reparsed.as_ref().unwrap_or(parse);
-        apply_job_ops(
-            &JobsAt::JobsKey.resolve(parse, &file.path)?,
-            &job_ops,
-            &plan,
-            &mut changes,
-        )?;
-        let root = parse.root()?;
-
-        if let Some(workflows_node) = root.get_mapping("workflows") {
-            for name in &drop_workflows {
-                changes.remove(&workflows_node, name.as_str());
-            }
-            for (name, desired) in &wholesale {
-                if let Some(workflow) = workflows_node.get_mapping(name) {
-                    let (_doc, seq) = sequence_fragment(desired)?;
-                    changes.set(&workflow, "jobs", seq);
+    let root_work = !drop_workflows.is_empty() || !wholesale.is_empty() || build_main;
+    let mut content = phase.finish(
+        existing,
+        parse,
+        JobsAt::JobsKey,
+        &plan,
+        root_work,
+        |root, changes| {
+            if let Some(workflows_node) = root.get_mapping("workflows") {
+                for name in &drop_workflows {
+                    changes.remove(&workflows_node, name.as_str());
+                }
+                for (name, desired) in &wholesale {
+                    if let Some(workflow) = workflows_node.get_mapping(name) {
+                        let (_doc, seq) = sequence_fragment(desired)?;
+                        changes.set(&workflow, "jobs", seq);
+                    }
                 }
             }
-        }
-        if build_main {
-            let mut main = serde_yaml::Mapping::new();
-            main.insert(Value::from("jobs"), Value::Sequence(missing_entries));
-            match root.get_mapping("workflows") {
-                Some(workflows_node) => {
-                    let (_doc, node) = fragment("main", &Value::Mapping(main))?;
-                    changes.set(&workflows_node, "main", node);
-                }
-                None => {
-                    let mut workflows = serde_yaml::Mapping::new();
-                    workflows.insert(Value::from("main"), Value::Mapping(main));
-                    let (_doc, node) = fragment("workflows", &Value::Mapping(workflows))?;
-                    changes.set(&root, "workflows", node);
+            if build_main {
+                let mut main = serde_yaml::Mapping::new();
+                main.insert(Value::from("jobs"), Value::Sequence(missing_entries));
+                match root.get_mapping("workflows") {
+                    Some(workflows_node) => {
+                        let (_doc, node) = fragment("main", &Value::Mapping(main))?;
+                        changes.set(&workflows_node, "main", node);
+                    }
+                    None => {
+                        let mut workflows = serde_yaml::Mapping::new();
+                        workflows.insert(Value::from("main"), Value::Mapping(main));
+                        let (_doc, node) = fragment("workflows", &Value::Mapping(workflows))?;
+                        changes.set(root, "workflows", node);
+                    }
                 }
             }
-        }
-        changes.render(&parse.tree, text)
-    };
+            Ok(())
+        },
+    )?;
     let header = header_jobs(&file.jobs, filter, &split.disabled_ids, &region.keys);
     crate::generator::reconcile_required_variables(Platform::CircleCI, &header, &mut content);
 
