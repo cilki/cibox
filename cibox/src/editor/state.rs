@@ -9,12 +9,16 @@ use std::path::PathBuf;
 
 pub use crate::config::Platform;
 
+/// The image a test rule runs on when no versions are configured, which can
+/// depend on the project (python-test follows `requires-python`)
+type DefaultImage = fn(&ProjectFacts) -> &'static str;
+
 /// Test rules with a versions knob, and the default image shown when unset
-const VERSIONED_RULES: [(&str, &str); 4] = [
-    ("rust-test", crate::rules::rust::IMAGE),
-    ("python-test", crate::rules::python::IMAGE),
-    ("go-test", crate::rules::go::IMAGE),
-    ("node-test", crate::rules::node::IMAGE),
+const VERSIONED_RULES: [(&str, DefaultImage); 4] = [
+    ("rust-test", |_| crate::rules::rust::IMAGE),
+    ("python-test", crate::rules::python::image),
+    ("go-test", |_| crate::rules::go::IMAGE),
+    ("node-test", |_| crate::rules::node::IMAGE),
 ];
 
 /// A rule line in the checklist
@@ -356,6 +360,7 @@ impl EditorState {
     /// second classification to keep in step with this one.
     fn knob_rows(&self, rule_id: &'static str) -> Vec<Row> {
         if let Some(&(_, default_image)) = VERSIONED_RULES.iter().find(|(id, _)| *id == rule_id) {
+            let default_image = default_image(&self.facts);
             let versions = self
                 .config
                 .versions_override(rule_id)

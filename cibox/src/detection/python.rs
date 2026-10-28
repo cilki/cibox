@@ -17,6 +17,9 @@ pub struct PythonFacts {
     /// pyproject.toml declares a `[project]` with a name, so the package can
     /// be built and uploaded to PyPI
     pub publishable: bool,
+    /// `[project] requires-python` from pyproject.toml, verbatim: the
+    /// interpreter versions pip will agree to install the project on
+    pub requires_python: Option<String>,
 }
 
 pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
@@ -48,6 +51,11 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
         })
         .unwrap_or(false);
 
+    let requires_python = pyproject
+        .as_ref()
+        .and_then(|table| table.get("project")?.get("requires-python")?.as_str())
+        .map(str::to_string);
+
     Some(PythonFacts {
         has_pyproject,
         has_setup_py,
@@ -57,6 +65,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
             || declares("project")
             || declares("build-system"),
         publishable,
+        requires_python,
     })
 }
 
@@ -152,5 +161,27 @@ mod tests {
         .unwrap();
         let facts = gather(dir.path()).unwrap();
         assert!(!facts.publishable);
+    }
+
+    #[test]
+    fn test_requires_python_is_read_from_project_table() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"p\"\nrequires-python = \">=3.13\"\n",
+        )
+        .unwrap();
+        let facts = gather(dir.path()).unwrap();
+        assert_eq!(facts.requires_python.as_deref(), Some(">=3.13"));
+
+        // Only `[project]` declares it; a tool table's key of the same name
+        // says nothing about what pip will accept
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.x]\nrequires-python = \">=3.13\"\n",
+        )
+        .unwrap();
+        assert_eq!(gather(dir.path()).unwrap().requires_python, None);
     }
 }
