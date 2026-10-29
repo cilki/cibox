@@ -47,7 +47,7 @@ impl JobFilter<'_> {
 /// The planned jobs the filter lets `update` touch, with `needs` pruned to
 /// jobs that are themselves included (a `--rule` selection may exclude a
 /// dependency).
-pub fn managed_jobs(file: &PlannedFile, filter: &JobFilter) -> Vec<Job> {
+fn managed_jobs(file: &PlannedFile, filter: &JobFilter) -> Vec<Job> {
     let mut jobs: Vec<Job> = file
         .jobs
         .iter()

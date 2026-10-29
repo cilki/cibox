@@ -76,24 +76,18 @@ pub fn handle_update(
     print_rule_table(&resolved);
 
     let plans = crate::generator::plan_all(&facts, &resolved, &platforms)?;
-    let planned = || plans.iter().flat_map(|(_, files)| files);
-
-    // With nothing enabled there is still work to do as long as a managed file
-    // exists: its cibox jobs are stale and get pruned below. Only when there is
-    // neither anything to write nor anything to prune, on any target platform,
-    // is the empty resolution a mistake worth reporting.
-    let prunable = !force
-        && planned().any(|file| {
-            std::fs::read_to_string(working_dir.join(&file.path))
-                .is_ok_and(|text| !text.trim().is_empty())
-        });
-    if planned().all(|file| crate::generator::managed_jobs(file, &filter).is_empty()) && !prunable {
-        anyhow::bail!("{}", crate::generator::NOTHING_ENABLED);
-    }
 
     // Every file's fate is decided before the first one is written, so a
     // file update refuses to merge leaves the others untouched too
     let updates = crate::generator::pending_updates(&working_dir, &plans, &filter, force)?;
+
+    // A file with content is always merged, so it always has an entry here —
+    // even with nothing enabled its stale cibox jobs get pruned. No entries
+    // at all means nothing to write and nothing to prune on any target
+    // platform: an empty resolution, and a mistake worth reporting.
+    if updates.is_empty() {
+        anyhow::bail!("{}", crate::generator::NOTHING_ENABLED);
+    }
 
     println!();
     for update in updates {
