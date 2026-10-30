@@ -143,9 +143,13 @@ impl Rule for GoLint {
             .with_steps(vec![
                 Step::checkout(),
                 redirect_caches(),
+                // The /v2 is load-bearing: golangci-lint moved to a new
+                // major module, so the unversioned path's @latest is the
+                // frozen v1.64.8, whose analyzers can't read the export
+                // data of any Go newer than 1.24 and fail every run.
                 Step::run(
                     "Install golangci-lint",
-                    "go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest",
+                    "go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest",
                 ),
                 Step::run("Run golangci-lint", "golangci-lint run"),
             ])]
@@ -273,6 +277,28 @@ mod tests {
             let jobs = rule.jobs(&ProjectFacts::default());
             assert_eq!(jobs[0].image.as_deref(), Some("golang:1"), "{}", rule.id());
         }
+    }
+
+    #[test]
+    fn test_lint_installs_golangci_lint_v2() {
+        // The unversioned module path's @latest is v1.64.8, which fails
+        // every run on the golang:1 image ("export data version 5 is
+        // greater than maximum supported version 2")
+        let jobs = GoLint.jobs(&ProjectFacts::default());
+        let installs: Vec<&str> = jobs[0]
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Run { command, .. } if command.starts_with("go install ") => {
+                    Some(command.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            installs,
+            vec!["go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"]
+        );
     }
 
     #[test]
