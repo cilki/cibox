@@ -22,13 +22,29 @@ pub struct RustFacts {
 
 pub(super) fn gather(path: &Path) -> Option<RustFacts> {
     let contents = fs::read_to_string(path.join("Cargo.toml")).ok()?;
-    let manifest = Manifest::from_str(&contents).ok()?;
+    let mut manifest = Manifest::from_str(&contents).ok()?;
+
+    // A root package that is also the workspace root commonly takes
+    // `rust-version.workspace = true` (and `publish`) from its own
+    // `[workspace.package]`. `from_str` leaves those unresolved, which would
+    // hide the MSRV from detection; resolve them from this same file only —
+    // detection reads the project, not whatever workspace lies above it.
+    if let Some(template) = manifest.workspace.as_ref().and_then(|w| w.package.clone()) {
+        if let Some(package) = manifest.package.as_mut() {
+            if let Some(rust_version) = &template.rust_version {
+                if let Some(inheritable) = package.rust_version.as_mut() {
+                    inheritable.inherit(rust_version);
+                }
+            }
+            package.publish.inherit(&template.publish);
+        }
+    }
 
     let package = manifest.package.as_ref();
     let publishable = package.is_some_and(|p| match p.publish.get() {
         Ok(cargo_toml::Publish::Flag(flag)) => *flag,
         Ok(cargo_toml::Publish::Registry(registries)) => !registries.is_empty(),
-        // Inherited from the workspace; assume publishable
+        // Inherited from a workspace outside this manifest; assume publishable
         Err(_) => true,
     });
 
@@ -106,6 +122,36 @@ mod tests {
             facts_for("[package]\nname = \"lib\"\nversion = \"0.1.0\"\nrust-version = \"1.74\"\n")
                 .unwrap();
         assert_eq!(facts.msrv.as_deref(), Some("1.74"));
+    }
+
+    #[test]
+    fn test_msrv_inherited_from_own_workspace_package() {
+        let facts = facts_for(
+            "[workspace]\nmembers = [\"a\"]\n\n[workspace.package]\nrust-version = \"1.80\"\npublish = false\n\n\
+             [package]\nname = \"root\"\nversion = \"0.1.0\"\nrust-version.workspace = true\npublish.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(facts.msrv.as_deref(), Some("1.80"));
+        assert!(!facts.publishable);
+
+        // The inherited value is held to the same standard as a direct one
+        let facts = facts_for(
+            "[workspace]\n\n[workspace.package]\nrust-version = \"$(id)\"\n\n\
+             [package]\nname = \"root\"\nversion = \"0.1.0\"\nrust-version.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(facts.msrv, None);
+    }
+
+    #[test]
+    fn test_msrv_inherited_from_outer_workspace_is_absent() {
+        // The workspace isn't in this manifest, so there is nothing to read
+        let facts = facts_for(
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nrust-version.workspace = true\npublish.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(facts.msrv, None);
+        assert!(facts.publishable);
     }
 
     #[test]
