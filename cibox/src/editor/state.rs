@@ -655,22 +655,18 @@ impl EditorState {
                     .cloned()
                     .unwrap_or_default();
                 match index {
-                    // Committing an empty value removes the entry
-                    Some(i) if value.is_empty() => {
-                        if i < versions.len() {
-                            versions.remove(i);
-                        }
-                    }
                     Some(i) => {
-                        if i < versions.len() {
-                            versions[i] = value;
+                        if let Some(version) = versions.get_mut(i) {
+                            *version = value;
                         }
                     }
-                    None if value.is_empty() => {}
                     None => versions.push(value),
                 }
                 // Normalize exactly as rules::resolve would, so what the
-                // preview shows is what the file means
+                // preview shows is what the file means. That also drops an
+                // entry committed empty, which is how one is removed, and
+                // collapses an emptied list back to "unset" so cibox.ron
+                // stays delta-only.
                 let versions = clean_versions(Some(&versions));
                 self.config
                     .set_versions_override(rule_id, (!versions.is_empty()).then_some(versions));
@@ -681,29 +677,13 @@ impl EditorState {
         self.auto_save_ron();
     }
 
-    /// Remove the toolchain version under the cursor; an empty list collapses
-    /// back to "unset" so cibox.ron stays delta-only
+    /// Remove the toolchain version under the cursor: the same as committing
+    /// it empty
     pub fn delete_current_version(&mut self) {
-        let Some(Row::Version {
-            rule_id,
-            index: Some(index),
-            ..
-        }) = self.rows.get(self.cursor).cloned()
-        else {
-            return;
-        };
-        let mut versions = self
-            .config
-            .versions_override(rule_id)
-            .cloned()
-            .unwrap_or_default();
-        if index < versions.len() {
-            versions.remove(index);
+        if let Some(Row::Version { index: Some(_), .. }) = self.rows.get(self.cursor) {
+            self.input = Some(String::new());
+            self.commit_input();
         }
-        self.config
-            .set_versions_override(rule_id, (!versions.is_empty()).then_some(versions));
-        self.refresh();
-        self.auto_save_ron();
     }
 
     pub fn cancel_input(&mut self) {
