@@ -2,7 +2,14 @@ use super::{with_versions, Rule};
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
 
-pub(crate) const IMAGE: &str = "golang:1.23";
+/// The newest Go release, not a pinned minor. The golang images set
+/// `GOTOOLCHAIN=local`, so the image's go is the only one a job gets: a
+/// go.mod `go` line above it, or a tool whose `@latest` needs a newer go
+/// (gosec does), fails the job instead of fetching a toolchain. Go builds
+/// modules targeting older releases unchanged, so the newest one never
+/// rejects a project — a pin only goes stale (1.23 had stopped installing
+/// gosec at all).
+pub(crate) const IMAGE: &str = "golang:1";
 
 /// Workspace-local directory holding both Go caches
 const CACHE_DIR: &str = ".go-cache";
@@ -203,7 +210,7 @@ mod tests {
     fn test_job_shapes() {
         let jobs = GoTest::default().jobs(&ProjectFacts::default());
         assert_eq!(jobs[0].id, "go-test");
-        assert_eq!(jobs[0].image.as_deref(), Some("golang:1.23"));
+        assert_eq!(jobs[0].image.as_deref(), Some("golang:1"));
         let build = &GoBuild.jobs(&ProjectFacts::default())[0];
         assert_eq!(build.stage, Stage::Build);
         // The -o directory is what makes the binaries collectible as
@@ -248,6 +255,23 @@ mod tests {
                 "{} does not redirect its caches first: {commands:?}",
                 rule.id()
             );
+        }
+    }
+
+    #[test]
+    fn test_jobs_float_with_the_newest_go() {
+        // GOTOOLCHAIN=local in the golang images: a pinned minor fails
+        // `go install gosec@latest` once gosec needs a newer go, and any
+        // project whose go.mod asks for more than the pin
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(GoTest::default()),
+            Box::new(GoBuild),
+            Box::new(GoLint),
+            Box::new(GoAudit),
+        ];
+        for rule in rules {
+            let jobs = rule.jobs(&ProjectFacts::default());
+            assert_eq!(jobs[0].image.as_deref(), Some("golang:1"), "{}", rule.id());
         }
     }
 
