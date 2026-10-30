@@ -10,6 +10,13 @@ use std::collections::BTreeMap;
 /// pipeline, so branch pushes can't satisfy it.
 const TAG_CONDITION: &str = "$CI_COMMIT_TAG =~ /^v/";
 
+/// The daemon a docker job talks to. The `docker` image the job runs in is
+/// only the CLI, and unlike GitHub's hosted runners or CircleCI's
+/// `setup_remote_docker`, a GitLab runner gives a job no daemon of its own:
+/// without this service `docker build` has nothing to connect to.
+const DIND_SERVICE: &str = "docker:dind";
+const DIND_CERT_DIR: &str = "/certs";
+
 pub fn lower_gitlab(jobs: &[Job]) -> GitLabCI {
     let mut lowered = BTreeMap::new();
     let mut stages: Vec<Stage> = Vec::new();
@@ -44,6 +51,12 @@ fn lower_job(job: &Job) -> GitLabJob {
         // GitLab clones shallowly by default
         variables.insert("GIT_DEPTH".to_string(), "0".to_string());
     }
+    if job.needs_docker {
+        // GitLab's documented Docker-in-Docker setup: the dind service
+        // writes its TLS client certs here, and the docker image's entrypoint
+        // finds them and points the CLI at tcp://docker:2376
+        variables.insert("DOCKER_TLS_CERTDIR".to_string(), DIND_CERT_DIR.to_string());
+    }
 
     let script = job
         .steps
@@ -65,6 +78,7 @@ fn lower_job(job: &Job) -> GitLabJob {
         } else {
             job.image.clone()
         },
+        services: job.needs_docker.then(|| vec![DIND_SERVICE.to_string()]),
         variables: (!variables.is_empty()).then_some(variables),
         script,
         needs: (!job.needs.is_empty()).then(|| job.needs.clone()),
@@ -157,6 +171,27 @@ mod tests {
             lower_gitlab(&[Job::new("docker-release", "Docker push", Stage::Deploy).with_docker()]);
         let job = &config.jobs["docker-release"];
         assert_eq!(job.image.as_deref(), Some("docker:latest"));
+    }
+
+    #[test]
+    fn test_docker_job_gets_a_daemon_and_others_dont() {
+        let config = lower_gitlab(&[
+            Job::new("docker-build", "Docker build", Stage::Build)
+                .with_docker()
+                .with_steps(vec![Step::checkout(), Step::run("Build", "docker build .")]),
+            Job::new("rust-test", "Cargo test", Stage::Test),
+        ]);
+        let docker = &config.jobs["docker-build"];
+        // The docker image is only the CLI: the daemon is the dind service
+        assert_eq!(docker.services, Some(vec!["docker:dind".to_string()]));
+        assert_eq!(
+            docker.variables.as_ref().unwrap()["DOCKER_TLS_CERTDIR"],
+            "/certs"
+        );
+        // A privileged service is not something every job should start
+        let test = &config.jobs["rust-test"];
+        assert_eq!(test.services, None);
+        assert_eq!(test.variables, None);
     }
 
     #[test]
