@@ -12,7 +12,8 @@ pub struct RustFacts {
     /// The root package exists and is not `publish = false`
     pub publishable: bool,
     pub package_name: Option<String>,
-    /// The `rust-version` of the root package, if declared and well-formed
+    /// The `rust-version` of the root package (of `[workspace.package]` for a
+    /// virtual workspace), if declared and well-formed
     pub msrv: Option<String>,
     /// The root manifest declares at least one feature
     pub has_features: bool,
@@ -54,11 +55,21 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
     // a bare version is either one no toolchain could resolve or shell being
     // smuggled in, and in both cases the fact is better off absent — the
     // rule falls back to reading the version in shell, where it stays quoted.
-    let msrv = package
-        .and_then(|p| p.rust_version.as_ref())
-        .and_then(|v| v.get().ok())
-        .filter(|v| is_toolchain_version(v))
-        .cloned();
+    //
+    // A virtual workspace has no root package to declare one; its
+    // `[workspace.package]` rust-version is the version every member that
+    // inherits it builds with, and the one `cargo +{msrv} check` at the root
+    // checks them all against.
+    let msrv = match package {
+        Some(p) => p.rust_version.as_ref().and_then(|v| v.get().ok()),
+        None => manifest
+            .workspace
+            .as_ref()
+            .and_then(|w| w.package.as_ref())
+            .and_then(|template| template.rust_version.as_ref()),
+    }
+    .filter(|v| is_toolchain_version(v))
+    .cloned();
 
     Some(RustFacts {
         is_workspace: manifest.workspace.is_some(),
@@ -220,5 +231,37 @@ mod tests {
         assert!(facts.is_workspace);
         assert!(!facts.has_package);
         assert!(!facts.publishable);
+    }
+
+    #[test]
+    fn test_msrv_of_virtual_workspace_from_workspace_package() {
+        let facts = facts_for(
+            "[workspace]\nmembers = [\"a\", \"b\"]\n\n[workspace.package]\nrust-version = \"1.75\"\n",
+        )
+        .unwrap();
+        assert!(!facts.has_package);
+        assert_eq!(facts.msrv.as_deref(), Some("1.75"));
+
+        // Held to the same standard as a package's own rust-version
+        let facts = facts_for(
+            "[workspace]\nmembers = [\"a\"]\n\n[workspace.package]\nrust-version = \"$(id)\"\n",
+        )
+        .unwrap();
+        assert_eq!(facts.msrv, None);
+
+        let facts = facts_for("[workspace]\nmembers = [\"a\"]\n").unwrap();
+        assert_eq!(facts.msrv, None);
+    }
+
+    #[test]
+    fn test_root_package_without_msrv_ignores_workspace_template() {
+        // The root package is what gets checked; a template it doesn't
+        // inherit from says nothing about it
+        let facts = facts_for(
+            "[workspace]\n\n[workspace.package]\nrust-version = \"1.80\"\n\n\
+             [package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(facts.msrv, None);
     }
 }
