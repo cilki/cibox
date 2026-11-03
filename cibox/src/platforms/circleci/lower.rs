@@ -88,9 +88,15 @@ fn lower_job(job: &Job) -> CircleCIJob {
 
     // Matrix legs run different toolchains; sharing one cache key would
     // make them overwrite each other
-    let cache_key = |key: &str| match &job.matrix {
-        Some(_) => format!("{key}-<< parameters.version >>"),
-        None => key.to_string(),
+    //
+    // A saved cache is immutable and `save_cache` skips a key that already
+    // exists, so a constant key would keep the first build's contents forever.
+    // Each build saves under its own number instead, and restores the newest
+    // entry by prefix. The `-run` keeps a plain job's prefix from matching a
+    // matrix leg's keys.
+    let cache_prefix = |key: &str| match &job.matrix {
+        Some(_) => format!("{key}-<< parameters.version >>-run"),
+        None => format!("{key}-run"),
     };
 
     let mut steps = Vec::new();
@@ -105,7 +111,7 @@ fn lower_job(job: &Job) -> CircleCIJob {
                 if let Some(cache) = &job.cache {
                     steps.push(CircleCIStep::Cache {
                         restore_cache: CircleCICache {
-                            keys: vec![cache_key(&cache.key)],
+                            keys: vec![cache_prefix(&cache.key)],
                         },
                     });
                 }
@@ -124,7 +130,7 @@ fn lower_job(job: &Job) -> CircleCIJob {
     if let Some(cache) = &job.cache {
         steps.push(CircleCIStep::SaveCache {
             save_cache: CircleCICacheSave {
-                key: cache_key(&cache.key),
+                key: format!("{}{{{{ .BuildNum }}}}", cache_prefix(&cache.key)),
                 paths: cache.paths.clone(),
             },
         });
@@ -185,8 +191,17 @@ mod tests {
             .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")])
             .with_cache("rust-cache", vec!["target/".to_string()])]);
         let steps = &config.jobs["rust-test"].steps;
-        assert!(matches!(steps[1], CircleCIStep::Cache { .. }));
-        assert!(matches!(steps.last(), Some(CircleCIStep::SaveCache { .. })));
+        // save_cache never overwrites a key, so each build saves under its
+        // own and the restore picks the newest by prefix
+        assert!(matches!(
+            &steps[1],
+            CircleCIStep::Cache { restore_cache } if restore_cache.keys == vec!["rust-cache-run"]
+        ));
+        assert!(matches!(
+            steps.last(),
+            Some(CircleCIStep::SaveCache { save_cache })
+                if save_cache.key == "rust-cache-run{{ .BuildNum }}"
+        ));
     }
 
     #[test]
@@ -214,7 +229,7 @@ mod tests {
         assert!(matches!(
             &job.steps[1],
             CircleCIStep::Cache { restore_cache }
-                if restore_cache.keys == vec!["rust-cache-<< parameters.version >>"]
+                if restore_cache.keys == vec!["rust-cache-<< parameters.version >>-run"]
         ));
 
         let invocations: Vec<&CircleCIWorkflowJobDetail> = config.workflows["main"]

@@ -199,10 +199,19 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                 if let Some(cache) = &job.cache {
                     // Matrix legs run different toolchains; sharing one cache
                     // key would make them overwrite each other
-                    let key = match &job.matrix {
+                    let base = match &job.matrix {
                         Some(_) => format!("{}-${{{{ matrix.version }}}}", cache.key),
                         None => cache.key.clone(),
                     };
+                    // A cache entry is immutable, and a hit on the exact key
+                    // skips the save: with a constant key the first run's
+                    // contents would be restored forever and nothing built
+                    // since would ever be kept. A key unique to the run is
+                    // always saved, and `restore-keys` hands the next run the
+                    // newest one. The `-run` in the prefix keeps a plain
+                    // job's `rust-cache-run` from matching a matrix leg's
+                    // `rust-cache-1.85-run…`.
+                    let prefix = format!("{base}-run");
                     steps.push(GitHubStep {
                         name: "Cache".to_string(),
                         uses: Some("actions/cache@v4".to_string()),
@@ -212,7 +221,16 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                                 "path".to_string(),
                                 serde_yaml::Value::String(cache.paths.join("\n")),
                             ),
-                            ("key".to_string(), serde_yaml::Value::String(key)),
+                            (
+                                "key".to_string(),
+                                serde_yaml::Value::String(format!(
+                                    "{prefix}${{{{ github.run_id }}}}"
+                                )),
+                            ),
+                            (
+                                "restore-keys".to_string(),
+                                serde_yaml::Value::String(prefix),
+                            ),
                         ])),
                     });
                 }
@@ -605,9 +623,16 @@ mod tests {
         assert_eq!(strategy.matrix.include.len(), 2);
         assert_eq!(strategy.matrix.include[1].image, "rustlang/rust:nightly");
         // Each leg caches under its own key
+        let with = job.steps[1].with.as_ref().unwrap();
         assert_eq!(
-            job.steps[1].with.as_ref().unwrap()["key"],
-            serde_yaml::Value::String("rust-cache-${{ matrix.version }}".to_string())
+            with["key"],
+            serde_yaml::Value::String(
+                "rust-cache-${{ matrix.version }}-run${{ github.run_id }}".to_string()
+            )
+        );
+        assert_eq!(
+            with["restore-keys"],
+            serde_yaml::Value::String("rust-cache-${{ matrix.version }}-run".to_string())
         );
     }
 
@@ -633,5 +658,24 @@ mod tests {
         );
         let steps = &workflow.jobs["rust-test"].steps;
         assert_eq!(steps[1].uses.as_deref(), Some("actions/cache@v4"));
+    }
+
+    /// actions/cache never overwrites an entry and skips the save on an
+    /// exact-key hit, so a constant key would freeze the cache at its first
+    /// run. Every run has to save under its own key and restore by prefix.
+    #[test]
+    fn test_cache_saved_per_run_and_restored_by_prefix() {
+        let workflow = lower_github(
+            &[Job::new("rust-test", "Cargo test", Stage::Test)
+                .with_steps(vec![Step::checkout(), Step::run("Run tests", "cargo test")])
+                .with_cache("rust-cache", vec!["target/".to_string()])],
+            WorkflowKind::Ci,
+        );
+        let with = workflow.jobs["rust-test"].steps[1].with.as_ref().unwrap();
+        let key = with["key"].as_str().unwrap();
+        let restore = with["restore-keys"].as_str().unwrap();
+        assert_eq!(key, "rust-cache-run${{ github.run_id }}");
+        assert_eq!(restore, "rust-cache-run");
+        assert!(key.starts_with(restore));
     }
 }
