@@ -525,3 +525,23 @@ fn test_one_unplannable_platform_writes_nothing() {
     assert!(!dir.path().join(".github").exists());
     assert!(!dir.path().join(GITLAB_YML).exists());
 }
+
+/// Run from a subdirectory, update writes the pipeline at the repository
+/// root, where the platform reads it, from the root's facts and cibox.ron
+#[test]
+fn test_update_from_a_subdirectory_works_at_the_repository_root() {
+    let dir = project();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(dir.path().join("cibox.ron"), "(rust_fmt: (enabled: false))").unwrap();
+
+    update(&src)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("working in the repository root .."));
+    assert!(!src.join(".github").exists());
+    let ci = fs::read_to_string(dir.path().join(CI_YML)).unwrap();
+    assert!(ci.contains("cargo test"), "root facts: {ci}");
+    assert!(!ci.contains("rust-fmt"), "root cibox.ron: {ci}");
+    assert!(dir.path().join(RELEASE_YML).is_file());
+}

@@ -1,5 +1,5 @@
 use crate::config::{load_config, platform_names, target_platforms, CiboxConfig, Platform};
-use crate::detection::gather_facts;
+use crate::detection::{gather_facts, project_root};
 use crate::error::Result;
 use crate::generator::FileChange;
 use crate::rules::{resolve, ResolvedRule};
@@ -29,6 +29,33 @@ fn print_rule_table(resolved: &[ResolvedRule]) {
     }
 }
 
+/// The repository root a command started in `dir` works in (see
+/// [`project_root`]), saying so when that isn't `dir` itself
+fn repository_root(dir: &str) -> PathBuf {
+    let root = project_root(Path::new(dir));
+    if root != Path::new(dir) {
+        println!(
+            "{} working in the repository root {}",
+            "Note:".cyan().bold(),
+            root.display().to_string().yellow()
+        );
+    }
+    root
+}
+
+/// Where cibox.ron is read from: the default name lives at the repository
+/// root next to the pipeline, while a path the user typed means what it says
+/// from where they typed it
+fn config_file(working_dir: &Path, config_path: &str) -> PathBuf {
+    if config_path == DEFAULT_CONFIG {
+        working_dir.join(DEFAULT_CONFIG)
+    } else {
+        PathBuf::from(config_path)
+    }
+}
+
+const DEFAULT_CONFIG: &str = "cibox.ron";
+
 /// Handle the update command
 pub fn handle_update(
     config_path: &str,
@@ -36,13 +63,13 @@ pub fn handle_update(
     force: bool,
     rules: &[String],
 ) -> Result<()> {
-    let working_dir = PathBuf::from(".");
+    let working_dir = repository_root(".");
     let facts = gather_facts(&working_dir);
     // A missing file at the default path is fine — detection supplies
     // everything; an explicitly named missing file is an error
-    let config = match load_config(Path::new(config_path))? {
+    let config = match load_config(&config_file(&working_dir, config_path))? {
         Some(config) => config,
-        None if config_path == "cibox.ron" => {
+        None if config_path == DEFAULT_CONFIG => {
             println!(
                 "{} no {} — using detected defaults",
                 "Note:".cyan().bold(),
@@ -153,12 +180,13 @@ pub fn handle_update(
 pub fn handle_validate(config_path: &str) -> Result<()> {
     println!("{} {}", "Validating".cyan().bold(), config_path);
 
-    let config = load_config(Path::new(config_path))?
+    let working_dir = repository_root(".");
+    let config = load_config(&config_file(&working_dir, config_path))?
         .with_context(|| format!("Failed to read config file: {config_path}"))?;
 
     println!("\n{}", "Configuration is valid!".green().bold());
 
-    let facts = gather_facts(Path::new("."));
+    let facts = gather_facts(&working_dir);
     let (platforms, source) = target_platforms(&facts, &[]);
     println!(
         "  Target platforms: {} ({})",
@@ -173,7 +201,7 @@ pub fn handle_validate(config_path: &str) -> Result<()> {
 
 /// Handle the detect command
 pub fn handle_detect(dir: &str) -> Result<()> {
-    let working_dir = PathBuf::from(dir);
+    let working_dir = repository_root(dir);
     let facts = gather_facts(&working_dir);
 
     println!("{}", "Project facts:".cyan().bold());
