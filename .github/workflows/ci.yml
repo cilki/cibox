@@ -24,10 +24,11 @@ jobs:
     - name: Cache
       uses: actions/cache@v4
       with:
-        key: rust-cache
+        key: rust-cache-run${{ github.run_id }}
         path: |-
           target/
           .cargo/
+        restore-keys: rust-cache-run
     - name: Run tests
       run: cargo test --all-features
     timeout-minutes: 30
