@@ -1019,13 +1019,21 @@ fn merge_gitlab(
         .filter(|s| !prune || s.as_str().is_some_and(|s| referenced.contains(&s)))
         .cloned()
         .collect();
-    for stage in get(canonical_map, "stages")
+    // GitLab runs stages in the order they are declared, so a stage cibox
+    // adds goes before the first declared one that canonically follows it.
+    // Appended instead, re-enabling `rust-audit` would put `security` after
+    // `deploy`, and a tag pipeline would publish before the audit ran.
+    let canonical_stages: &[Value] = get(canonical_map, "stages")
         .and_then(Value::as_sequence)
-        .into_iter()
-        .flatten()
-    {
+        .map_or(&[], Vec::as_slice);
+    let rank = |stage: &Value| canonical_stages.iter().position(|s| s == stage);
+    for (at, stage) in canonical_stages.iter().enumerate() {
         if !stages.contains(stage) {
-            stages.push(stage.clone());
+            let pos = stages
+                .iter()
+                .position(|s| rank(s).is_some_and(|r| r > at))
+                .unwrap_or(stages.len());
+            stages.insert(pos, stage.clone());
         }
     }
     let stages = match &stages[..] {
@@ -2335,6 +2343,45 @@ my-job:
         assert!(doc["rust-release"]["only"].is_null(), "{}", content);
         // The user's own job is not cibox's to re-gate
         assert_eq!(doc["my-release"]["only"]["refs"][0].as_str(), Some("tags"));
+    }
+
+    #[test]
+    fn test_gitlab_update_inserts_added_stages_in_pipeline_order() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+        let filter = no_selection(&resolved);
+        let canonical: Value =
+            serde_yaml::from_str(&render_file(Platform::GitLab, &file).unwrap()).unwrap();
+        let canonical: Vec<&str> = canonical["stages"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            canonical.last(),
+            Some(&"deploy"),
+            "fixture rot: {canonical:?}"
+        );
+
+        // A pipeline whose other rules were off: re-enabling them must not
+        // put their stages after `deploy`, which would publish first
+        let existing = "stages: [test, custom, deploy]\n\
+                        my-job:\n  stage: custom\n  script: [echo mine]\n";
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        let stages: Vec<&str> = doc["stages"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+
+        // The user's stage keeps its place, cibox's follow their own order
+        assert_eq!(&stages[..2], ["test", "custom"], "{content}");
+        let ours: Vec<&str> = stages.iter().copied().filter(|s| *s != "custom").collect();
+        assert_eq!(ours, canonical, "{content}");
     }
 
     #[test]
