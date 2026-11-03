@@ -15,7 +15,7 @@ mod rust;
 mod zig;
 
 use crate::config::Platform;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use android::AndroidFacts;
 pub use cmake::CmakeFacts;
@@ -49,6 +49,37 @@ pub struct ProjectFacts {
     pub managed_ci: Vec<Platform>,
     /// Directory basename, the last-resort default for image naming
     pub dir_name: String,
+}
+
+/// The directory cibox works in when started in `dir`: the top of the git
+/// repository `dir` sits in, or `dir` itself outside of one.
+///
+/// Every platform reads its pipeline from the repository root, so a pipeline
+/// written anywhere else is never run — and run from a subdirectory, the
+/// facts are wrong too: no `.git` there means no remote, so the platform,
+/// image name and AUR package fall back to guesses. The nearest `.git` (a
+/// directory, or the file a submodule or linked worktree has instead) marks
+/// the root, the same one `git` itself would pick.
+///
+/// The result stays relative when `dir` is (`../..`), so the paths `update`
+/// reports read the way the user would type them.
+pub fn project_root(dir: &Path) -> PathBuf {
+    let depth = dir.canonicalize().ok().and_then(|absolute| {
+        absolute
+            .ancestors()
+            .position(|ancestor| ancestor.join(".git").exists())
+    });
+    match depth {
+        Some(depth) if depth > 0 => {
+            let up: PathBuf = std::iter::repeat_n("..", depth).collect();
+            if dir == Path::new(".") {
+                up
+            } else {
+                dir.join(up)
+            }
+        }
+        _ => dir.to_path_buf(),
+    }
 }
 
 /// Gather all project facts. Never fails: anything unreadable is just absent.
@@ -179,5 +210,45 @@ mod tests {
             facts.existing_ci,
             vec![Platform::GitHub, Platform::Gitea, Platform::GitLab]
         );
+    }
+
+    /// Run from inside a repository, cibox works at its top, where the
+    /// platforms look for the pipeline and where the remote can be read
+    #[test]
+    fn test_project_root_is_the_repository_top() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let member = repo.join("crates/member");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&member).unwrap();
+
+        assert_eq!(project_root(&repo), repo);
+        let root = project_root(&member);
+        assert_eq!(root, member.join("../.."));
+        assert_eq!(root.canonicalize().unwrap(), repo.canonicalize().unwrap());
+    }
+
+    /// A submodule or linked worktree has a `.git` file instead, and is a
+    /// repository of its own with its own pipeline
+    #[test]
+    fn test_project_root_stops_at_the_nearest_repository() {
+        let dir = tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let sub = outer.join("sub");
+        fs::create_dir_all(outer.join(".git")).unwrap();
+        fs::create_dir_all(sub.join("src")).unwrap();
+        fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+
+        let root = project_root(&sub.join("src"));
+        assert_eq!(root.canonicalize().unwrap(), sub.canonicalize().unwrap());
+    }
+
+    /// Outside of a repository there is nothing to walk up to
+    #[test]
+    fn test_project_root_outside_a_repository_is_the_directory() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        assert_eq!(project_root(&project), project);
     }
 }
