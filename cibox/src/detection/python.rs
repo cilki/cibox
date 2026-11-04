@@ -26,6 +26,82 @@ pub struct PythonFacts {
     /// The PEP 735 `[dependency-groups]` group holding the test requirements,
     /// see [`TEST_SETS`]
     pub test_group: Option<String>,
+    /// pytest has something to run: the project configures pytest, or has a
+    /// file pytest collects by default. Without either, `pytest` collects
+    /// nothing and exits 5, failing the job on a project that has no tests.
+    pub has_tests: bool,
+}
+
+/// Directories visited looking for a test file before giving up and
+/// assuming there are tests. A project with tests usually has one within the
+/// first few directories; this only bounds a tree with none.
+const MAX_TEST_SEARCH_DIRS: usize = 2000;
+
+/// Whether pytest would find tests to run in the project at `path`.
+///
+/// Configuring pytest counts by itself: a project that does may also have
+/// changed `python_files` or `testpaths`, and either one moves what gets
+/// collected out from under the default patterns.
+fn has_tests(path: &Path, pyproject: Option<&toml::Table>) -> bool {
+    let tool_pytest = pyproject
+        .and_then(|t| t.get("tool")?.get("pytest"))
+        .is_some();
+    let ini_section = |file: &str, section: &str| {
+        fs::read_to_string(path.join(file))
+            .is_ok_and(|ini| ini.lines().any(|line| line.trim() == section))
+    };
+    tool_pytest
+        || path.join("pytest.ini").is_file()
+        || path.join(".pytest.ini").is_file()
+        || ini_section("setup.cfg", "[tool:pytest]")
+        || ini_section("tox.ini", "[pytest]")
+        || has_test_file(path)
+}
+
+/// Whether a file matching pytest's default `python_files` (`test_*.py`,
+/// `*_test.py`) is somewhere pytest would look for it. The directories
+/// pytest's default `norecursedirs` skips are skipped here too, as are
+/// virtualenvs, which it doesn't collect from either. A tree too large to
+/// search within [`MAX_TEST_SEARCH_DIRS`] counts as having tests, which keeps
+/// the rule on when this can't tell.
+fn has_test_file(path: &Path) -> bool {
+    let mut stack = vec![path.to_path_buf()];
+    let mut budget = MAX_TEST_SEARCH_DIRS;
+    while let Some(dir) = stack.pop() {
+        if budget == 0 {
+            return true;
+        }
+        budget -= 1;
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let skipped = name.starts_with('.')
+                    || name.ends_with(".egg")
+                    || matches!(
+                        name,
+                        "build" | "dist" | "node_modules" | "venv" | "CVS" | "_darcs" | "{arch}"
+                    );
+                if !skipped && !entry.path().join("pyvenv.cfg").is_file() {
+                    stack.push(entry.path());
+                }
+            } else if name
+                .strip_suffix(".py")
+                .is_some_and(|stem| stem.starts_with("test_") || stem.ends_with("_test"))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The names a project's test requirements go by, most specific first: the
@@ -83,6 +159,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
             .and_then(|table| table.get("project")?.get("optional-dependencies")),
     );
     let test_group = test_set(pyproject.as_ref().and_then(|table| table.get("dependency-groups")));
+    let has_tests = has_tests(path, pyproject.as_ref());
 
     Some(PythonFacts {
         has_pyproject,
@@ -96,6 +173,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
         requires_python,
         test_extra,
         test_group,
+        has_tests,
     })
 }
 
@@ -239,5 +317,82 @@ mod tests {
             "[project]\nname = \"p\"\n[project.optional-dependencies]\ndocs = [\"sphinx\"]\n",
         );
         assert_eq!(facts.test_extra, None);
+    }
+
+    fn has_tests_with(files: &[(&str, &str)]) -> bool {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"p\"\n",
+        )
+        .unwrap();
+        for (name, contents) in files {
+            let file = dir.path().join(name);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, contents).unwrap();
+        }
+        gather(dir.path()).unwrap().has_tests
+    }
+
+    /// pytest exits 5 when it collects nothing, so a project without tests
+    /// would get a test job that fails on every push
+    #[test]
+    fn test_project_without_tests_has_none() {
+        assert!(!has_tests_with(&[]));
+        assert!(!has_tests_with(&[
+            ("src/p/__init__.py", ""),
+            ("src/p/testing.py", ""),
+            ("src/p/contest.py", ""),
+        ]));
+    }
+
+    #[test]
+    fn test_default_test_file_patterns_are_found_at_any_depth() {
+        assert!(has_tests_with(&[("test_root.py", "")]));
+        assert!(has_tests_with(&[("tests/unit/test_x.py", "")]));
+        assert!(has_tests_with(&[("src/p/x_test.py", "")]));
+    }
+
+    /// pytest's default norecursedirs, and virtualenvs, are never collected
+    /// from, so a test file in one doesn't make the project's suite non-empty
+    #[test]
+    fn test_test_files_where_pytest_does_not_look_are_ignored() {
+        assert!(!has_tests_with(&[
+            (".tox/py312/test_vendored.py", ""),
+            ("build/lib/test_copy.py", ""),
+            ("dist/test_x.py", ""),
+            ("node_modules/x/test_x.py", ""),
+            ("venv/lib/test_x.py", ""),
+            ("p.egg/test_x.py", ""),
+            ("env/pyvenv.cfg", ""),
+            ("env/lib/site-packages/x/test_x.py", ""),
+        ]));
+    }
+
+    /// Configuring pytest may move collection off the default patterns
+    /// (`python_files = check_*.py`, `--doctest-modules`), so it counts
+    #[test]
+    fn test_pytest_configuration_counts_as_tests() {
+        assert!(has_tests_with(&[("pytest.ini", "[pytest]\n")]));
+        assert!(has_tests_with(&[(".pytest.ini", "[pytest]\n")]));
+        assert!(has_tests_with(&[(
+            "setup.cfg",
+            "[metadata]\n[tool:pytest]\n"
+        )]));
+        assert!(has_tests_with(&[(
+            "tox.ini",
+            "[tox]\n[pytest]\naddopts = -q\n"
+        )]));
+        // A tox.ini or setup.cfg without a pytest section says nothing
+        assert!(!has_tests_with(&[("tox.ini", "[tox]\nenvlist = py312\n")]));
+        assert!(!has_tests_with(&[("setup.cfg", "[metadata]\nname = p\n")]));
+
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"p\"\n[tool.pytest.ini_options]\naddopts = \"--doctest-modules\"\n",
+        )
+        .unwrap();
+        assert!(gather(dir.path()).unwrap().has_tests);
     }
 }

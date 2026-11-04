@@ -172,7 +172,9 @@ impl Rule for PythonTest {
     }
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
-        is_python(facts)
+        // pytest fails a run that collects nothing (exit 5), so a project
+        // with no tests yet would get a job that fails every push
+        facts.python.as_ref().is_some_and(|py| py.has_tests)
     }
 
     fn jobs(&self, facts: &ProjectFacts) -> Vec<Job> {
@@ -304,10 +306,19 @@ mod tests {
 
     #[test]
     fn test_detect_from_requirements() {
-        let facts = facts_with(&[("requirements.txt", "requests\n")]);
+        let facts = facts_with(&[("requirements.txt", "requests\n"), ("test_app.py", "")]);
         assert!(PythonTest::default().detect(&facts));
         assert!(PythonLint.detect(&facts));
         assert!(!PythonRelease.detect(&facts));
+    }
+
+    #[test]
+    fn test_no_tests_means_no_test_job() {
+        // `pytest` collecting nothing exits 5 and fails the job
+        let facts = facts_with(&[("requirements.txt", "requests\n"), ("app.py", "")]);
+        assert!(!PythonTest::default().detect(&facts));
+        assert!(PythonLint.detect(&facts));
+        assert!(PythonFmt.detect(&facts));
     }
 
     fn install_commands(facts: &ProjectFacts) -> Vec<String> {
