@@ -20,6 +20,27 @@ pub struct PythonFacts {
     /// `[project] requires-python` from pyproject.toml, verbatim: the
     /// interpreter versions pip will agree to install the project on
     pub requires_python: Option<String>,
+    /// The `[project.optional-dependencies]` extra holding the test
+    /// requirements (pytest plugins and the like), see [`TEST_SETS`]
+    pub test_extra: Option<String>,
+    /// The PEP 735 `[dependency-groups]` group holding the test requirements,
+    /// see [`TEST_SETS`]
+    pub test_group: Option<String>,
+}
+
+/// The names a project's test requirements go by, most specific first: the
+/// first one a project declares is what the test job installs. `dev` comes
+/// last since it is the catch-all that usually carries pytest when nothing
+/// narrower exists.
+const TEST_SETS: [&str; 4] = ["test", "tests", "testing", "dev"];
+
+/// The first of [`TEST_SETS`] that `table` has a key for
+fn test_set(table: Option<&toml::Value>) -> Option<String> {
+    let table = table?.as_table()?;
+    TEST_SETS
+        .iter()
+        .find(|name| table.contains_key(**name))
+        .map(|name| name.to_string())
 }
 
 pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
@@ -56,6 +77,13 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
         .and_then(|table| table.get("project")?.get("requires-python")?.as_str())
         .map(str::to_string);
 
+    let test_extra = test_set(
+        pyproject
+            .as_ref()
+            .and_then(|table| table.get("project")?.get("optional-dependencies")),
+    );
+    let test_group = test_set(pyproject.as_ref().and_then(|table| table.get("dependency-groups")));
+
     Some(PythonFacts {
         has_pyproject,
         has_setup_py,
@@ -66,6 +94,8 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
             || declares("build-system"),
         publishable,
         requires_python,
+        test_extra,
+        test_group,
     })
 }
 
@@ -183,5 +213,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gather(dir.path()).unwrap().requires_python, None);
+    }
+
+    fn pyproject_facts(contents: &str) -> PythonFacts {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("pyproject.toml"), contents).unwrap();
+        gather(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn test_test_requirements_are_found_by_their_usual_names() {
+        let facts = pyproject_facts(
+            "[project]\nname = \"p\"\n[project.optional-dependencies]\n\
+             docs = [\"sphinx\"]\ndev = [\"black\"]\ntests = [\"pytest-asyncio\"]\n",
+        );
+        assert_eq!(facts.test_extra.as_deref(), Some("tests"), "narrowest name wins");
+        assert_eq!(facts.test_group, None);
+
+        let facts = pyproject_facts("[dependency-groups]\ndev = [\"pytest\"]\n");
+        assert_eq!(facts.test_group.as_deref(), Some("dev"));
+        assert_eq!(facts.test_extra, None);
+
+        // Extras nobody would run the tests with are left alone
+        let facts = pyproject_facts(
+            "[project]\nname = \"p\"\n[project.optional-dependencies]\ndocs = [\"sphinx\"]\n",
+        );
+        assert_eq!(facts.test_extra, None);
     }
 }

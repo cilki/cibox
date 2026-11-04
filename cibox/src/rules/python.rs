@@ -116,6 +116,12 @@ fn allows(spec: &str, minor: u64) -> Option<bool> {
 /// The requirements file goes first so its pins win: pip leaves a requirement
 /// alone once it is satisfied, so the project's own looser constraints can't
 /// pull a different version in over the top.
+///
+/// The project's test requirements — an extra or a dependency group named
+/// like one of the detector's `TEST_SETS` (`test`, `tests`, `testing`,
+/// `dev`) — come
+/// along: pytest plugins live there, and a suite written against
+/// pytest-asyncio or a fixture plugin fails outright without them.
 fn install_steps(facts: &ProjectFacts) -> Vec<Step> {
     let Some(py) = &facts.python else {
         return Vec::new();
@@ -128,7 +134,19 @@ fn install_steps(facts: &ProjectFacts) -> Vec<Step> {
         ));
     }
     if py.installable {
-        steps.push(Step::run("Install project", "pip install ."));
+        // Quoted: the brackets are a glob pattern to the shell
+        let command = match &py.test_extra {
+            Some(extra) => format!("pip install '.[{extra}]'"),
+            None => "pip install .".to_string(),
+        };
+        steps.push(Step::run("Install project", command));
+    }
+    if let Some(group) = &py.test_group {
+        // `--group` arrived in pip 25.1, newer than the pip some images ship
+        steps.push(Step::run(
+            "Install test dependency group",
+            format!("pip install --upgrade 'pip>=25.1' && pip install --group {group}"),
+        ));
     }
     steps
 }
@@ -356,6 +374,29 @@ mod tests {
             let facts = facts_with(&[("pyproject.toml", backend)]);
             assert_eq!(install_commands(&facts), [PROJECT], "{backend}");
         }
+    }
+
+    /// Test-only requirements (pytest plugins) live in an extra or a
+    /// dependency group; leaving them out fails a suite that needs them
+    #[test]
+    fn test_test_requirements_are_installed() {
+        let facts = facts_with(&[(
+            "pyproject.toml",
+            "[project]\nname = \"p\"\n[project.optional-dependencies]\ntest = [\"pytest-asyncio\"]\n",
+        )]);
+        assert_eq!(install_commands(&facts), ["pip install '.[test]'"]);
+
+        let facts = facts_with(&[
+            ("pyproject.toml", "[dependency-groups]\ntest = [\"pytest-asyncio\"]\n"),
+            ("requirements.txt", "requests\n"),
+        ]);
+        assert_eq!(
+            install_commands(&facts),
+            [
+                REQUIREMENTS,
+                "pip install --upgrade 'pip>=25.1' && pip install --group test"
+            ]
+        );
     }
 
     /// Force-enabling the rule on a project with no Python at all leaves the
