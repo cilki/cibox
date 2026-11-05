@@ -110,7 +110,40 @@ pub struct Counts {
 }
 
 /// Merge one planned file into the existing on-disk content.
+///
+/// A file written with CRLF line endings (a Windows checkout without
+/// `core.autocrlf`, or `eol=crlf` in `.gitattributes`) keeps them. Every line
+/// the merge writes — a conformed job, a re-added one, a regenerated
+/// commented-out block — is rendered with LF, so merging the CRLF text as is
+/// left those lines alone in LF among the file's CRLF ones. The merge runs on
+/// the text with its line endings normalized instead, and the result is
+/// turned back to CRLF as a whole. The file's first line ending decides, so
+/// a file an earlier merge left mixed comes out all CRLF the next time a
+/// merge changes it.
 pub fn merge_file(
+    platform: Platform,
+    file: &PlannedFile,
+    filter: &JobFilter,
+    existing: &str,
+) -> Result<MergeOutcome> {
+    let crlf = existing
+        .find('\n')
+        .is_some_and(|i| existing[..i].ends_with('\r'));
+    if !crlf {
+        return merge_lf(platform, file, filter, existing);
+    }
+    let lf = existing.replace("\r\n", "\n");
+    Ok(match merge_lf(platform, file, filter, &lf)? {
+        MergeOutcome::Merged { content, counts } => MergeOutcome::Merged {
+            content: content.replace('\n', "\r\n"),
+            counts,
+        },
+        other => other,
+    })
+}
+
+/// [`merge_file`] on text with LF line endings
+fn merge_lf(
     platform: Platform,
     file: &PlannedFile,
     filter: &JobFilter,
@@ -1899,6 +1932,54 @@ jobs:
                     "{platform:?} {} not idempotent",
                     file.path.display()
                 );
+            }
+        }
+    }
+
+    /// A CRLF file used to come out of a merge with mixed line endings: the
+    /// lines the merge wrote — the conformed job, the re-added one, the
+    /// regenerated commented-out block — were LF, everything else CRLF
+    #[test]
+    fn test_merge_keeps_crlf_line_endings() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let filter = no_selection(&resolved);
+        for platform in Platform::all() {
+            for file in plan(&facts, &resolved, platform).unwrap() {
+                if file.jobs.len() < 2 {
+                    continue;
+                }
+                let canonical = render_file(platform, &file).unwrap();
+                let crlf = |text: &str| text.replace('\n', "\r\n");
+                let label = format!("{platform:?} {}", file.path.display());
+
+                // Current jobs in CRLF are as current as in LF
+                assert!(
+                    matches!(
+                        merge_file(platform, &file, &filter, &crlf(&canonical)).unwrap(),
+                        MergeOutcome::Unchanged
+                    ),
+                    "{label}: CRLF canonical output not idempotent"
+                );
+
+                // One job with a stale key in it, one commented out
+                let header = format!("{}:\n", file.jobs[0].id);
+                let at = canonical.find(&header).expect("the job's key") + header.len();
+                let indent = canonical[at..].len() - canonical[at..].trim_start().len();
+                let mut stale = canonical.clone();
+                stale.insert_str(at, &format!("{}stale-key: x\n", " ".repeat(indent)));
+                let existing = comment_out_job(&stale, &file.jobs[1].id);
+                let (lf, _) = merged(merge_file(platform, &file, &filter, &existing).unwrap());
+                let (content, _) =
+                    merged(merge_file(platform, &file, &filter, &crlf(&existing)).unwrap());
+                assert!(!content.contains("stale-key"), "{label}: {content}");
+                assert_eq!(
+                    content.matches('\n').count(),
+                    content.matches("\r\n").count(),
+                    "{label}: bare LF in {content:?}"
+                );
+                // The same merge as on the LF file, line endings aside
+                assert_eq!(content, crlf(&lf), "{label}");
             }
         }
     }
