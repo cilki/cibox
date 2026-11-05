@@ -26,6 +26,11 @@ pub struct PythonFacts {
     /// The PEP 735 `[dependency-groups]` group holding the test requirements,
     /// see [`TEST_SETS`]
     pub test_group: Option<String>,
+    /// The Poetry group holding the test requirements, see [`TEST_SETS`]:
+    /// a `[tool.poetry.group.<name>]`, or `dev` for the pre-1.2
+    /// `[tool.poetry.dev-dependencies]` table Poetry still reads as one.
+    /// Only Poetry can install these — pip knows nothing of them.
+    pub poetry_test_group: Option<String>,
     /// pytest has something to run: the project configures pytest, or has a
     /// file pytest collects by default. Without either, `pytest` collects
     /// nothing and exits 5, failing the job on a project that has no tests.
@@ -159,6 +164,12 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
             .and_then(|table| table.get("project")?.get("optional-dependencies")),
     );
     let test_group = test_set(pyproject.as_ref().and_then(|table| table.get("dependency-groups")));
+    let poetry = pyproject.as_ref().and_then(|table| table.get("tool")?.get("poetry"));
+    let poetry_test_group = test_set(poetry.and_then(|poetry| poetry.get("group"))).or_else(|| {
+        poetry
+            .is_some_and(|poetry| poetry.get("dev-dependencies").is_some())
+            .then(|| "dev".to_string())
+    });
     let has_tests = has_tests(path, pyproject.as_ref());
 
     Some(PythonFacts {
@@ -173,6 +184,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
         requires_python,
         test_extra,
         test_group,
+        poetry_test_group,
         has_tests,
     })
 }
@@ -317,6 +329,33 @@ mod tests {
             "[project]\nname = \"p\"\n[project.optional-dependencies]\ndocs = [\"sphinx\"]\n",
         );
         assert_eq!(facts.test_extra, None);
+    }
+
+    #[test]
+    fn test_poetry_test_group_is_found() {
+        let facts = pyproject_facts(
+            "[tool.poetry]\nname = \"p\"\n\
+             [tool.poetry.group.docs.dependencies]\nsphinx = \"*\"\n\
+             [tool.poetry.group.dev.dependencies]\nblack = \"*\"\n\
+             [tool.poetry.group.test.dependencies]\npytest-asyncio = \"*\"\n",
+        );
+        assert_eq!(
+            facts.poetry_test_group.as_deref(),
+            Some("test"),
+            "narrowest name wins"
+        );
+        assert_eq!(facts.test_group, None);
+
+        // The pre-1.2 table is the `dev` group to Poetry
+        let facts = pyproject_facts(
+            "[tool.poetry]\nname = \"p\"\n[tool.poetry.dev-dependencies]\npytest = \"*\"\n",
+        );
+        assert_eq!(facts.poetry_test_group.as_deref(), Some("dev"));
+
+        let facts = pyproject_facts(
+            "[tool.poetry]\nname = \"p\"\n[tool.poetry.group.docs.dependencies]\nsphinx = \"*\"\n",
+        );
+        assert_eq!(facts.poetry_test_group, None);
     }
 
     fn has_tests_with(files: &[(&str, &str)]) -> bool {

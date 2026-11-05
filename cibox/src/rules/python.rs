@@ -121,7 +121,8 @@ fn allows(spec: &str, minor: u64) -> Option<bool> {
 /// like one of the detector's `TEST_SETS` (`test`, `tests`, `testing`,
 /// `dev`) — come
 /// along: pytest plugins live there, and a suite written against
-/// pytest-asyncio or a fixture plugin fails outright without them.
+/// pytest-asyncio or a fixture plugin fails outright without them. A Poetry
+/// project keeps them in a Poetry group instead, which only Poetry installs.
 fn install_steps(facts: &ProjectFacts) -> Vec<Step> {
     let Some(py) = &facts.python else {
         return Vec::new();
@@ -133,7 +134,18 @@ fn install_steps(facts: &ProjectFacts) -> Vec<Step> {
             "pip install -r requirements.txt",
         ));
     }
-    if py.installable {
+    if let Some(group) = &py.poetry_test_group {
+        // pip can't read a Poetry group, so Poetry installs the project, its
+        // dependencies and the group, at the versions poetry.lock pins. It
+        // installs into the job's interpreter rather than a virtualenv of its
+        // own so the plain `pytest` below sees all of it. Poetry also leaves
+        // the project out by itself under `package-mode = false`, which has
+        // no build backend for `pip install .` to use.
+        steps.push(Step::run(
+            "Install project with Poetry",
+            format!("pip install poetry && POETRY_VIRTUALENVS_CREATE=false poetry install --with {group}"),
+        ));
+    } else if py.installable {
         // Quoted: the brackets are a glob pattern to the shell
         let command = match &py.test_extra {
             Some(extra) => format!("pip install '.[{extra}]'"),
@@ -408,6 +420,33 @@ mod tests {
                 "pip install --upgrade 'pip>=25.1' && pip install --group test"
             ]
         );
+    }
+
+    /// `pip install .` builds a Poetry project but never installs its
+    /// groups, so a suite needing a plugin from the dev group failed
+    #[test]
+    fn test_poetry_test_group_is_installed_by_poetry() {
+        const POETRY: &str =
+            "pip install poetry && POETRY_VIRTUALENVS_CREATE=false poetry install --with dev";
+        let facts = facts_with(&[(
+            "pyproject.toml",
+            "[build-system]\nrequires = [\"poetry-core\"]\n\
+             [tool.poetry]\nname = \"p\"\n\
+             [tool.poetry.group.dev.dependencies]\npytest-asyncio = \"*\"\n",
+        )]);
+        assert_eq!(
+            install_commands(&facts),
+            [POETRY],
+            "Poetry installs the project too"
+        );
+
+        // `package-mode = false` has nothing for pip to build, but Poetry
+        // still installs its dependencies
+        let facts = facts_with(&[(
+            "pyproject.toml",
+            "[tool.poetry]\npackage-mode = false\n[tool.poetry.dev-dependencies]\npytest = \"*\"\n",
+        )]);
+        assert_eq!(install_commands(&facts), [POETRY]);
     }
 
     /// Force-enabling the rule on a project with no Python at all leaves the
