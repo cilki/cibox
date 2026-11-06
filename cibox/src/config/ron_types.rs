@@ -88,7 +88,8 @@ pub struct CiboxConfig {
     /// dependencies, as above.
     #[serde(skip_serializing_if = "is_default")]
     pub node_fmt: RuleToggle,
-    /// Run zig build test on every push
+    /// Run zig build test on every push. Detected only when build.zig
+    /// declares a `test` step for it to run.
     #[serde(skip_serializing_if = "is_default")]
     pub zig_test: RuleToggle,
     /// Check formatting with zig fmt

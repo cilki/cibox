@@ -33,7 +33,8 @@ impl Rule for ZigTest {
     }
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
-        is_zig(facts)
+        // `zig build test` fails outright when build.zig declares no such step
+        facts.zig.as_ref().is_some_and(|z| z.has_test_step)
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
@@ -126,10 +127,20 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("build.zig"), "pub fn build() void {}\n").unwrap();
         let facts = crate::detection::gather_facts(dir.path());
-        assert!(ZigTest.detect(&facts));
+        // No test step: `zig build test` would fail with "no step named 'test'"
+        assert!(!ZigTest.detect(&facts));
         assert!(ZigFmt.detect(&facts));
         assert!(ZigBuild.detect(&facts));
         assert!(!ZigTest.detect(&ProjectFacts::default()));
+
+        fs::write(
+            dir.path().join("build.zig"),
+            "pub fn build(b: *std.Build) void {\n    \
+             const test_step = b.step(\"test\", \"Run unit tests\");\n}\n",
+        )
+        .unwrap();
+        let facts = crate::detection::gather_facts(dir.path());
+        assert!(ZigTest.detect(&facts));
     }
 
     #[test]
