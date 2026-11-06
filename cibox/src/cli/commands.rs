@@ -243,8 +243,9 @@ pub fn handle_detect(dir: &str) -> Result<()> {
         );
         println!("    typescript: {}", yes_no(node.has_tsconfig));
     }
-    if facts.zig.is_some() {
+    if let Some(zig) = &facts.zig {
         println!("  {} Zig", "✓".green());
+        println!("    test step: {}", yes_no(zig.has_test_step));
     }
     if let Some(cmake) = &facts.cmake {
         println!("  {} CMake", "✓".green());
