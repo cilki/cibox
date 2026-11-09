@@ -42,6 +42,10 @@ pub struct NodeFacts {
     pub has_typescript_dep: bool,
     /// `prettier` is a declared dependency, as above
     pub has_prettier_dep: bool,
+    /// `engines.node` from package.json, verbatim: the Node versions the
+    /// project declares it runs on. pnpm and Yarn Classic refuse to install a
+    /// project whose own `engines` excludes the running Node.
+    pub engines_node: Option<String>,
 }
 
 pub(super) fn gather(path: &Path) -> Option<NodeFacts> {
@@ -71,6 +75,11 @@ pub(super) fn gather(path: &Path) -> Option<NodeFacts> {
         has_prettier_config: has_prettier_config(path, &manifest),
         has_typescript_dep: has_dependency(&manifest, "typescript"),
         has_prettier_dep: has_dependency(&manifest, "prettier"),
+        engines_node: manifest
+            .get("engines")
+            .and_then(|e| e.get("node"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -412,5 +421,25 @@ mod tests {
         assert!(facts.has_prettier_config);
         assert!(!facts.has_typescript_dep);
         assert!(!facts.has_prettier_dep);
+    }
+
+    #[test]
+    fn test_engines_node_read_verbatim() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"engines": {"node": ">=18 <21", "npm": ">=9"}}"#,
+        )
+        .unwrap();
+        let facts = gather(dir.path()).unwrap();
+        assert_eq!(facts.engines_node.as_deref(), Some(">=18 <21"));
+
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"engines": {"npm": ">=9"}}"#,
+        )
+        .unwrap();
+        assert_eq!(gather(dir.path()).unwrap().engines_node, None);
     }
 }
