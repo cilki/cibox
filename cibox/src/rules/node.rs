@@ -86,10 +86,11 @@ fn tool(n: &NodeFacts, cmd: &str) -> String {
     }
 }
 
-/// Base job with the per-manager image and a project-relative dependency
-/// cache (GitLab caches must live inside the project directory)
-fn base_job(id: &str, name: &str, stage: Stage, timeout: u32, n: &NodeFacts) -> Job {
-    let (cache_env, cache_path) = match n.package_manager {
+/// Where the jobs keep the package manager's download cache, and the env
+/// that points it there. It lives inside the checkout because GitLab caches
+/// must live inside the project directory.
+fn dependency_cache(n: &NodeFacts) -> (Vec<(&'static str, &'static str)>, &'static str) {
+    match n.package_manager {
         NodePackageManager::Npm => (vec![("npm_config_cache", ".npm-cache")], ".npm-cache/"),
         // Modern ignores cacheFolder entirely while enableGlobalCache is on
         // (its default), and puts the cache under $HOME instead — where no
@@ -105,7 +106,12 @@ fn base_job(id: &str, name: &str, stage: Stage, timeout: u32, n: &NodeFacts) -> 
         NodePackageManager::Yarn => (vec![("YARN_CACHE_FOLDER", ".yarn-cache")], ".yarn-cache/"),
         NodePackageManager::Pnpm => (vec![], ".pnpm-store/"),
         NodePackageManager::Bun => (vec![("BUN_INSTALL_CACHE_DIR", ".bun-cache")], ".bun-cache/"),
-    };
+    }
+}
+
+/// Base job with the per-manager image and the dependency cache
+fn base_job(id: &str, name: &str, stage: Stage, timeout: u32, n: &NodeFacts) -> Job {
+    let (cache_env, cache_path) = dependency_cache(n);
     let mut job = Job::new(id, name, stage)
         .with_image(image(n))
         .with_timeout(timeout)
@@ -231,6 +237,19 @@ impl Rule for NodeTypecheck {
     }
 }
 
+/// `prettier --check .`, minus the dependency cache the install step just
+/// filled inside the checkout.
+///
+/// Prettier skips only `node_modules` and VCS directories on its own, so it
+/// would otherwise walk into the cache: pnpm's store keeps a minified
+/// `*-index.json` per package and bun's holds every package unpacked, and
+/// none of that is formatted to the project's style. On a developer's
+/// machine the cache lives under $HOME, so only CI tripped over it.
+fn prettier_check(n: &NodeFacts) -> String {
+    let (_, cache_path) = dependency_cache(n);
+    tool(n, &format!("prettier --check . '!{cache_path}**'"))
+}
+
 /// Check formatting with prettier
 pub struct NodeFmt;
 
@@ -261,7 +280,7 @@ impl Rule for NodeFmt {
         vec![
             base_job(self.id(), self.name(), Stage::Lint, 10, &n).with_steps(steps_with_install(
                 &n,
-                Step::run("Check formatting", tool(&n, "prettier --check .")),
+                Step::run("Check formatting", prettier_check(&n)),
             )),
         ]
     }
@@ -370,7 +389,9 @@ mod tests {
                 "{pm}: {commands:?}"
             );
             assert!(
-                commands.contains(&"./node_modules/.bin/prettier --check .".to_string()),
+                commands
+                    .iter()
+                    .any(|c| c.starts_with("./node_modules/.bin/prettier --check . ")),
                 "{pm}: {commands:?}"
             );
             for command in &commands {
@@ -564,7 +585,7 @@ mod tests {
             "{commands:?}"
         );
         assert!(
-            commands.contains(&"yarn exec prettier --check .".to_string()),
+            commands.contains(&"yarn exec prettier --check . '!.yarn-cache/**'".to_string()),
             "{commands:?}"
         );
         for command in &commands {
@@ -582,9 +603,44 @@ mod tests {
             "{commands:?}"
         );
         assert!(
-            commands.contains(&"./node_modules/.bin/prettier --check .".to_string()),
+            commands
+                .contains(&"./node_modules/.bin/prettier --check . '!.yarn-cache/**'".to_string()),
             "{commands:?}"
         );
+    }
+
+    #[test]
+    fn test_prettier_skips_the_dependency_cache() {
+        // Every manager's cache lives inside the checkout so the backends can
+        // archive it, and prettier only skips node_modules on its own: pnpm's
+        // store and bun's unpacked packages would fail `--check` on files that
+        // aren't the project's
+        for (lockfile, cache) in [
+            ("package-lock.json", ".npm-cache/"),
+            ("pnpm-lock.yaml", ".pnpm-store/"),
+            ("bun.lockb", ".bun-cache/"),
+            ("yarn.lock", ".yarn-cache/"),
+        ] {
+            let facts = facts_with(&[
+                ("package.json", r#"{"devDependencies": {"prettier": "^3"}}"#),
+                (".prettierrc", "{}"),
+                (lockfile, ""),
+            ]);
+            let job = &NodeFmt.jobs(&facts)[0];
+            assert_eq!(job.cache.as_ref().unwrap().paths, vec![cache.to_string()]);
+            let check = job
+                .steps
+                .iter()
+                .find_map(|s| match s {
+                    Step::Run { command, .. } if command.contains("prettier") => Some(command),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                check.ends_with(&format!("prettier --check . '!{cache}**'")),
+                "{lockfile}: {check}"
+            );
+        }
     }
 
     #[test]
