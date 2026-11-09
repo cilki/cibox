@@ -2,7 +2,16 @@ use super::{with_versions, Rule};
 use crate::detection::{NodeFacts, NodePackageManager, ProjectFacts};
 use crate::ir::{Job, Stage, Step};
 
-pub(crate) const IMAGE: &str = "node:22";
+/// The `node:N` images to choose from, oldest first
+const IMAGES: [(u64, &str); 5] = [
+    (16, "node:16"),
+    (18, "node:18"),
+    (20, "node:20"),
+    (22, "node:22"),
+    (24, "node:24"),
+];
+/// The major used whenever the project doesn't rule it out
+const DEFAULT_MAJOR: u64 = 22;
 const BUN_IMAGE: &str = "oven/bun:1";
 
 /// Facts to build jobs from; force-enabled rules fall back to npm without a
@@ -11,11 +20,182 @@ fn node(facts: &ProjectFacts) -> NodeFacts {
     facts.node.clone().unwrap_or_default()
 }
 
+/// The image the node jobs run on when no versions are configured
+pub(crate) fn default_image(facts: &ProjectFacts) -> &'static str {
+    image(&node(facts))
+}
+
+/// The image for a project's jobs.
+///
+/// pnpm and Yarn Classic refuse to install a project whose own
+/// `engines.node` excludes the running Node (npm only warns, unless
+/// `engine-strict` is set), so a fixed default fails every job's install step
+/// for a project pinned to an older line (`"engines": {"node": "20.x"}`) or
+/// needing a newer one (`>=24`). The default stands whenever the project
+/// allows it; otherwise the nearest major it does allow is used, the newer on
+/// a tie. A range this can't read, or one no image satisfies, keeps the
+/// default — the package manager will report it more clearly than a guess
+/// would.
 fn image(n: &NodeFacts) -> &'static str {
-    match n.package_manager {
-        NodePackageManager::Bun => BUN_IMAGE,
-        _ => IMAGE,
+    if n.package_manager == NodePackageManager::Bun {
+        return BUN_IMAGE;
     }
+    let default = || {
+        IMAGES
+            .iter()
+            .find(|(major, _)| *major == DEFAULT_MAJOR)
+            .map(|(_, image)| *image)
+            .expect("the default major has an image")
+    };
+    let Some(range) = n.engines_node.as_deref() else {
+        return default();
+    };
+    let mut nearest = IMAGES.to_vec();
+    nearest.sort_by_key(|&(major, _)| (major.abs_diff(DEFAULT_MAJOR), std::cmp::Reverse(major)));
+    nearest
+        .into_iter()
+        .map(|(major, image)| allows(range, major).map(|ok| ok.then_some(image)))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|admitted| admitted.into_iter().flatten().next())
+        .unwrap_or_else(default)
+}
+
+type Version = [u64; 3];
+
+/// One side of an interval: the version, and a flag ordered so that the
+/// tighter of two bounds at the same version compares as the narrower one —
+/// "excluded" for a lower bound (taken with `max`), "included" for an upper
+/// bound (taken with `min`)
+type Bound = (Version, bool);
+
+/// Whether the node-semver range `range` admits some release of Node
+/// `major`, or `None` when it can't be read (pre-release tags, build
+/// metadata, anything that isn't a comparator). The `node:N` tag follows the
+/// major's releases, so it stands for the whole `N.x` line.
+fn allows(range: &str, major: u64) -> Option<bool> {
+    let mut admitted = false;
+    for set in range.split("||") {
+        admitted |= set_allows(set, major)?;
+    }
+    Some(admitted)
+}
+
+/// One `||`-separated comparator set: every comparator in it must hold
+fn set_allows(set: &str, major: u64) -> Option<bool> {
+    // The line's own bounds, narrowed by each comparator in turn
+    let mut lo: Bound = ([major, 0, 0], false);
+    let mut hi: Bound = ([major + 1, 0, 0], false);
+
+    // `>= 18` is as valid as `>=18`: glue a bare operator to its version
+    let mut tokens: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for token in set.split_whitespace() {
+        if token != "-" && token.chars().all(|c| "<>=~^".contains(c)) {
+            pending.push_str(token);
+        } else {
+            tokens.push(std::mem::take(&mut pending) + token);
+        }
+    }
+    if !pending.is_empty() {
+        return None;
+    }
+
+    let mut constraints = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        // Hyphen range `A - B`: `>=A` and `<=B`
+        if tokens.get(i + 1).is_some_and(|t| t == "-") {
+            let from = partial(tokens[i].as_str())?;
+            let to = partial(tokens.get(i + 2)?)?;
+            constraints.extend(desugar(">=", &from)?);
+            constraints.extend(desugar("<=", &to)?);
+            i += 3;
+            continue;
+        }
+        let token = tokens[i].as_str();
+        let op = [">=", "<=", "~>", ">", "<", "~", "^", "="]
+            .into_iter()
+            .find(|op| token.starts_with(op))
+            .unwrap_or("");
+        constraints.extend(desugar(op, &partial(&token[op.len()..])?)?);
+        i += 1;
+    }
+
+    for (op, v) in constraints {
+        match op {
+            ">=" => lo = lo.max((v, false)),
+            ">" => lo = lo.max((v, true)),
+            "<=" => hi = hi.min((v, true)),
+            "<" => hi = hi.min((v, false)),
+            _ => unreachable!("desugar only emits these four"),
+        }
+    }
+    Some(lo.0 < hi.0 || (lo.0 == hi.0 && !lo.1 && hi.1))
+}
+
+/// A possibly partial version (`18`, `18.2`, `v18.2.1`, `18.x`), as the
+/// components given before any wildcard
+fn partial(version: &str) -> Option<Vec<u64>> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = Vec::new();
+    if version.is_empty() {
+        return Some(parts);
+    }
+    let mut wildcard = false;
+    for part in version.split('.') {
+        if matches!(part, "x" | "X" | "*") {
+            wildcard = true;
+        } else if wildcard {
+            return None;
+        } else {
+            parts.push(part.parse().ok()?);
+        }
+    }
+    (parts.len() <= 3 && version.split('.').count() <= 3).then_some(parts)
+}
+
+/// node-semver's desugaring of `op` applied to a partial version, as plain
+/// `>=`/`>`/`<=`/`<` comparators on full versions
+fn desugar(op: &str, p: &[u64]) -> Option<Vec<(&'static str, Version)>> {
+    let fill = [
+        p.first().copied().unwrap_or(0),
+        p.get(1).copied().unwrap_or(0),
+        p.get(2).copied().unwrap_or(0),
+    ];
+    // The first version past everything `p` matches: `18` -> 19.0.0
+    let bump = || match p.len() {
+        1 => [p[0] + 1, 0, 0],
+        2 => [p[0], p[1] + 1, 0],
+        _ => [p[0], p[1], p[2] + 1],
+    };
+    Some(match (op, p.len()) {
+        // `*`, `>=*`, `<=*`, `~*`, `^*`: anything
+        ("" | "=" | ">=" | "<=" | "~" | "~>" | "^", 0) => vec![],
+        // `>*` and `<*` match nothing; leave such a range unread
+        (">" | "<", 0) => return None,
+        ("" | "=", 3) => vec![(">=", fill), ("<=", fill)],
+        ("" | "=", _) => vec![(">=", fill), ("<", bump())],
+        (">=", _) => vec![(">=", fill)],
+        (">", 3) => vec![(">", fill)],
+        (">", _) => vec![(">=", bump())],
+        ("<", _) => vec![("<", fill)],
+        ("<=", 3) => vec![("<=", fill)],
+        ("<=", _) => vec![("<", bump())],
+        ("~" | "~>", 1) => vec![(">=", fill), ("<", [p[0] + 1, 0, 0])],
+        ("~" | "~>", _) => vec![(">=", fill), ("<", [p[0], p[1] + 1, 0])],
+        ("^", _) => {
+            // Everything up to the next change of the first non-zero part
+            let upper = if p[0] > 0 || p.len() == 1 {
+                [p[0] + 1, 0, 0]
+            } else if p[1] > 0 || p.len() == 2 {
+                [0, p[1] + 1, 0]
+            } else {
+                [0, 0, p[2] + 1]
+            };
+            vec![(">=", fill), ("<", upper)]
+        }
+        _ => return None,
+    })
 }
 
 fn install_steps(n: &NodeFacts) -> Vec<Step> {
@@ -462,6 +642,96 @@ mod tests {
         let entries = jobs[0].matrix.as_ref().unwrap();
         assert_eq!(entries[0].image, "node:20");
         assert_eq!(entries[1].image, "node:22");
+    }
+
+    fn image_for(engines: &str) -> &'static str {
+        let manifest = serde_json::json!({"engines": {"node": engines}}).to_string();
+        default_image(&facts_with(&[
+            ("package.json", &manifest),
+            ("pnpm-lock.yaml", ""),
+        ]))
+    }
+
+    /// pnpm and Yarn Classic refuse to install a project whose own
+    /// `engines.node` excludes the running Node, so the image has to be one
+    /// the project admits
+    #[test]
+    fn test_image_follows_engines_node() {
+        // The default stands whenever it's allowed
+        for range in [
+            ">=18",
+            ">= 18",
+            "^22",
+            "~22.1",
+            "22.x",
+            "22",
+            "v22.3.0",
+            ">=18 <23",
+            "18 - 22",
+            "^18 || ^20 || ^22 || ^24",
+            "*",
+            ">=16.14.0 <=22",
+        ] {
+            assert_eq!(image_for(range), "node:22", "{range}");
+        }
+        // Pinned to an older line: the newest one it allows
+        assert_eq!(image_for("20.x"), "node:20");
+        assert_eq!(image_for("^18"), "node:18");
+        assert_eq!(image_for(">=18 <21"), "node:20");
+        assert_eq!(image_for("<22"), "node:20");
+        assert_eq!(image_for("<=20"), "node:20");
+        assert_eq!(image_for("16 - 20.5"), "node:20");
+        assert_eq!(image_for("~16.20.2"), "node:16");
+        assert_eq!(image_for("^16 || ^18"), "node:18");
+        // Needs a newer one: the oldest it allows
+        assert_eq!(image_for(">=24"), "node:24");
+        assert_eq!(image_for(">22"), "node:24");
+        // `>22.0.0` still admits later 22.x releases
+        assert_eq!(image_for(">22.0.0"), "node:22");
+        // Equidistant from the default: the newer one
+        assert_eq!(image_for("^20 || ^24"), "node:24");
+    }
+
+    /// Anything unreadable or unsatisfiable keeps the default rather than
+    /// guessing; the package manager then names the real problem
+    #[test]
+    fn test_image_falls_back_to_default() {
+        for range in [
+            ">=22.0.0-rc.1",
+            "latest",
+            ">=",
+            ">=30",
+            "<16",
+            ">=22 <20",
+            "22.0.0 - ",
+        ] {
+            assert_eq!(image_for(range), "node:22", "{range:?}");
+        }
+        assert_eq!(default_image(&ProjectFacts::default()), "node:22");
+    }
+
+    /// Every node job runs on the admitted image, and bun keeps its own
+    #[test]
+    fn test_jobs_use_the_admitted_image() {
+        let facts = facts_with(&[
+            (
+                "package.json",
+                r#"{"engines": {"node": "20.x"}, "scripts": {"test": "jest"}}"#,
+            ),
+            ("yarn.lock", "# yarn lockfile v1\n"),
+        ]);
+        let rules: [&dyn Rule; 4] = [&NodeTest::default(), &NodeLint, &NodeTypecheck, &NodeFmt];
+        for rule in rules {
+            for job in rule.jobs(&facts) {
+                assert_eq!(job.image.as_deref(), Some("node:20"), "{}", job.id);
+            }
+        }
+
+        let facts = facts_with(&[
+            ("package.json", r#"{"engines": {"node": "20.x"}}"#),
+            ("bun.lock", ""),
+        ]);
+        assert_eq!(default_image(&facts), "oven/bun:1");
     }
 
     #[test]

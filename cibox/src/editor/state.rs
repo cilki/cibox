@@ -10,7 +10,8 @@ use std::path::PathBuf;
 pub use crate::config::Platform;
 
 /// The image a test rule runs on when no versions are configured, which can
-/// depend on the project (python-test follows `requires-python`)
+/// depend on the project (python-test follows `requires-python`, node-test
+/// follows `engines.node` and the package manager)
 type DefaultImage = fn(&ProjectFacts) -> &'static str;
 
 /// Test rules with a versions knob, and the default image shown when unset
@@ -18,7 +19,7 @@ const VERSIONED_RULES: [(&str, DefaultImage); 4] = [
     ("rust-test", |_| crate::rules::rust::IMAGE),
     ("python-test", crate::rules::python::image),
     ("go-test", |_| crate::rules::go::IMAGE),
-    ("node-test", |_| crate::rules::node::IMAGE),
+    ("node-test", crate::rules::node::default_image),
 ];
 
 /// A rule line in the checklist
