@@ -26,22 +26,33 @@ fn is_python(facts: &ProjectFacts) -> bool {
 /// pip refuses to install a project whose `requires-python` excludes the
 /// running interpreter, so a fixed default fails `pip install .` outright for
 /// a project that needs a newer Python (`>=3.13`) or hasn't caught up to it
-/// yet (`<3.12`). The default stands whenever the project allows it;
-/// otherwise the nearest minor it does allow is used, the newer on a tie. A
-/// specifier this can't read, or one no image satisfies, keeps the default —
-/// pip will report it more clearly than a guess would.
+/// yet (`<3.12`). A Poetry project declares the same thing as its `python`
+/// dependency, and Poetry refuses to install under an interpreter outside it
+/// before it reads a single other dependency. The default stands whenever the
+/// project allows it; otherwise the nearest minor it does allow is used, the
+/// newer on a tie. A specifier this can't read, or one no image satisfies,
+/// keeps the default — pip will report it more clearly than a guess would.
 pub(crate) fn image(facts: &ProjectFacts) -> &'static str {
-    let spec = facts
-        .python
-        .as_ref()
-        .and_then(|py| py.requires_python.as_deref());
+    // The specifier and the grammar it is written in. `[project]
+    // requires-python` first: Poetry 2 itself reads it before the legacy
+    // dependency when a project carries both
+    type Admits = fn(&str, u64) -> Option<bool>;
+    let spec: Option<(&str, Admits)> =
+        facts
+            .python
+            .as_ref()
+            .and_then(|py| match (&py.requires_python, &py.poetry_python) {
+                (Some(spec), _) => Some((spec.as_str(), allows as Admits)),
+                (None, Some(spec)) => Some((spec.as_str(), poetry_allows as Admits)),
+                (None, None) => None,
+            });
     let minor = spec
-        .and_then(|spec| {
+        .and_then(|(spec, admits)| {
             let mut nearest: Vec<u64> = (FIRST_MINOR..FIRST_MINOR + IMAGES.len() as u64).collect();
             nearest.sort_by_key(|&m| (m.abs_diff(DEFAULT_MINOR), std::cmp::Reverse(m)));
             nearest
                 .into_iter()
-                .map(|m| allows(spec, m).map(|ok| ok.then_some(m)))
+                .map(|m| admits(spec, m).map(|ok| ok.then_some(m)))
                 .collect::<Option<Vec<_>>>()?
                 .into_iter()
                 .flatten()
@@ -101,6 +112,92 @@ fn allows(spec: &str, minor: u64) -> Option<bool> {
         };
     }
     Some(admitted)
+}
+
+/// Whether the Poetry constraint `spec` (`[tool.poetry.dependencies] python`)
+/// admits the `python:3.<minor>` image, or `None` when it can't be read.
+///
+/// Poetry's grammar is semver's rather than PEP 440's: `^3.11` and `~3.11`
+/// ranges, `3.11.*` wildcards and bare versions, `||` unions, and clauses
+/// joined by commas or whitespace, besides the PEP 440 comparison operators.
+/// Each clause is rewritten as the PEP 440 clauses admitting the same
+/// releases, so the series semantics of [`allows`] apply unchanged.
+fn poetry_allows(spec: &str, minor: u64) -> Option<bool> {
+    let mut admitted = false;
+    for set in spec.split("||") {
+        // `>= 3.8` is as valid as `>=3.8`: glue a bare operator to its version
+        let mut clauses: Vec<String> = Vec::new();
+        let mut pending = String::new();
+        for token in set.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
+            if token.chars().all(|c| "<>=!~^".contains(c)) {
+                pending.push_str(token);
+            } else {
+                clauses.push(poetry_clause(&(std::mem::take(&mut pending) + token))?);
+            }
+        }
+        if !pending.is_empty() {
+            return None;
+        }
+        admitted |= allows(&clauses.join(","), minor)?;
+    }
+    Some(admitted)
+}
+
+/// One Poetry clause as the PEP 440 clause(s) admitting the same releases.
+/// Comparison operators pass through; `^`, `~`, wildcards and bare versions
+/// are desugared the way Poetry reads them.
+fn poetry_clause(clause: &str) -> Option<String> {
+    if ["~=", "==", "!=", ">=", "<=", ">", "<"]
+        .iter()
+        .any(|op| clause.starts_with(op))
+    {
+        return Some(clause.to_string());
+    }
+    let (op, version) = match clause.strip_prefix('^') {
+        Some(v) => ("^", v),
+        None => match clause.strip_prefix('~') {
+            Some(v) => ("~", v),
+            None => ("", clause),
+        },
+    };
+    // The components before any trailing wildcard: `3.11.*` -> [3, 11]
+    let mut parts: Vec<u64> = Vec::new();
+    let mut wildcard = false;
+    for part in version.split('.') {
+        if matches!(part, "*" | "x" | "X") {
+            wildcard = true;
+        } else if wildcard {
+            return None;
+        } else {
+            parts.push(part.parse().ok()?);
+        }
+    }
+    if parts.len() > 3 || (wildcard && !op.is_empty()) {
+        return None;
+    }
+    let dotted = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(".");
+    Some(match (op, parts.as_slice()) {
+        // `*`, `^*`, `~*`: anything
+        (_, []) => String::new(),
+        ("", p) if wildcard => format!("=={}.*", dotted(p)),
+        ("", p) => format!("=={}", dotted(p)),
+        // `~3.11` is `>=3.11,<3.12`; `~3` is `>=3,<4`
+        ("~", [major]) => format!(">={major},<{}", major + 1),
+        ("~", [major, minor, ..]) => format!(">={},<{major}.{}", dotted(&parts), minor + 1),
+        // `^` holds everything up to the next change of the first non-zero
+        // part: `^3.11` is `>=3.11,<4`, `^0.2` is `>=0.2,<0.3`
+        ("^", p) => {
+            let upper = if p[0] > 0 || p.len() == 1 {
+                dotted(&[p[0] + 1])
+            } else if p[1] > 0 || p.len() == 2 {
+                dotted(&[0, p[1] + 1])
+            } else {
+                dotted(&[0, 0, p[2] + 1])
+            };
+            format!(">={},<{upper}", dotted(p))
+        }
+        _ => return None,
+    })
 }
 
 /// Install steps appropriate for the project layout.
@@ -501,6 +598,63 @@ mod tests {
         assert_eq!(image_for(">=3.8, !=3.12.*"), "python:3.13");
         // Excluding one release leaves the rest of its series
         assert_eq!(image_for("!=3.12.0"), "python:3.12");
+    }
+
+    fn poetry_image_for(python: &str) -> &'static str {
+        let pyproject = format!(
+            "[tool.poetry]\nname = \"p\"\n[tool.poetry.dependencies]\npython = \"{python}\"\n"
+        );
+        image(&facts_with(&[("pyproject.toml", &pyproject)]))
+    }
+
+    /// Poetry refuses to install under an interpreter its `python`
+    /// dependency excludes, and the constraint is written in Poetry's own
+    /// grammar rather than PEP 440's
+    #[test]
+    fn test_image_follows_poetry_python_dependency() {
+        for spec in [
+            "^3.8",
+            "^3.12",
+            "^3.12.4",
+            "*",
+            ">=3.9,<3.14",
+            ">=3.9 <3.14",
+            ">= 3.9, < 3.14",
+            "3.12.*",
+            "3.12",
+            "~3.12",
+            "^3.9 || ^3.12",
+            "3.*",
+        ] {
+            assert_eq!(poetry_image_for(spec), "python:3.12", "{spec}");
+        }
+        // Too old for the project: the oldest one it allows
+        assert_eq!(poetry_image_for("^3.13"), "python:3.13");
+        assert_eq!(poetry_image_for("^3.13.1"), "python:3.13");
+        assert_eq!(poetry_image_for("~3.13"), "python:3.13");
+        assert_eq!(poetry_image_for(">=3.13"), "python:3.13");
+        assert_eq!(poetry_image_for("3.14.*"), "python:3.14");
+        // Too new for it: the newest one it allows
+        assert_eq!(poetry_image_for("~3.11"), "python:3.11");
+        assert_eq!(poetry_image_for("~3.11.2"), "python:3.11");
+        assert_eq!(poetry_image_for(">=3.8,<3.12"), "python:3.11");
+        assert_eq!(poetry_image_for("^3.8,!=3.12.*"), "python:3.13");
+        assert_eq!(poetry_image_for("3.10.*"), "python:3.10");
+        assert_eq!(poetry_image_for("~3.9 || ^3.10, <3.11"), "python:3.10");
+        assert_eq!(poetry_image_for("3.9 || 3.13"), "python:3.13");
+
+        // Unreadable or unsatisfiable keeps the default, as for pip
+        for spec in ["", "^3.12rc1", "^3.*", "^3.13,<3.13", ">=4", "3.8 - 3.11"] {
+            assert_eq!(poetry_image_for(spec), "python:3.12", "{spec:?}");
+        }
+
+        // `[project] requires-python` is what Poetry 2 reads when both exist
+        let facts = facts_with(&[(
+            "pyproject.toml",
+            "[project]\nname = \"p\"\nrequires-python = \">=3.13\"\n\
+             [tool.poetry.dependencies]\npython = \"^3.11\"\n",
+        )]);
+        assert_eq!(image(&facts), "python:3.13");
     }
 
     /// The jobs a project gets run on that image, not on the fixed default

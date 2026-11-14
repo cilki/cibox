@@ -20,6 +20,14 @@ pub struct PythonFacts {
     /// `[project] requires-python` from pyproject.toml, verbatim: the
     /// interpreter versions pip will agree to install the project on
     pub requires_python: Option<String>,
+    /// `[tool.poetry.dependencies] python` from pyproject.toml, verbatim, in
+    /// Poetry's own constraint syntax (`^3.11`): the interpreter versions
+    /// Poetry will agree to install the project on. Poetry checks the running
+    /// interpreter against it before installing anything, and poetry-core
+    /// writes it into the built distribution's `Requires-Python`, so pip
+    /// enforces it too. Poetry 2 projects declare `[project] requires-python`
+    /// instead, which Poetry reads first when both are present.
+    pub poetry_python: Option<String>,
     /// The `[project.optional-dependencies]` extra holding the test
     /// requirements (pytest plugins and the like), see [`TEST_SETS`]
     pub test_extra: Option<String>,
@@ -165,6 +173,9 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
     );
     let test_group = test_set(pyproject.as_ref().and_then(|table| table.get("dependency-groups")));
     let poetry = pyproject.as_ref().and_then(|table| table.get("tool")?.get("poetry"));
+    let poetry_python = poetry
+        .and_then(|poetry| poetry.get("dependencies")?.get("python")?.as_str())
+        .map(str::to_string);
     let poetry_test_group = test_set(poetry.and_then(|poetry| poetry.get("group"))).or_else(|| {
         poetry
             .is_some_and(|poetry| poetry.get("dev-dependencies").is_some())
@@ -182,6 +193,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
             || declares("build-system"),
         publishable,
         requires_python,
+        poetry_python,
         test_extra,
         test_group,
         poetry_test_group,
@@ -309,6 +321,34 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("pyproject.toml"), contents).unwrap();
         gather(dir.path()).unwrap()
+    }
+
+    /// A Poetry project declares its interpreters as a dependency on
+    /// `python`, which is kept apart from `requires-python`: the syntax is
+    /// Poetry's, not PEP 440's
+    #[test]
+    fn test_poetry_python_constraint_is_read_from_its_dependencies() {
+        let facts = pyproject_facts(
+            "[tool.poetry]\nname = \"p\"\n\
+             [tool.poetry.dependencies]\npython = \"^3.11\"\nrequests = \"*\"\n",
+        );
+        assert_eq!(facts.poetry_python.as_deref(), Some("^3.11"));
+        assert_eq!(facts.requires_python, None);
+
+        // Both stay available as written; which one wins is the rule's call
+        let facts = pyproject_facts(
+            "[project]\nname = \"p\"\nrequires-python = \">=3.13\"\n\
+             [tool.poetry.dependencies]\npython = \"^3.11\"\n",
+        );
+        assert_eq!(facts.requires_python.as_deref(), Some(">=3.13"));
+        assert_eq!(facts.poetry_python.as_deref(), Some("^3.11"));
+
+        // A Poetry project without the python dependency, or any other
+        // dependency named python, declares nothing
+        let facts = pyproject_facts("[tool.poetry]\nname = \"p\"\n");
+        assert_eq!(facts.poetry_python, None);
+        let facts = pyproject_facts("[tool.poetry.group.dev.dependencies]\npython = \"^3.11\"\n");
+        assert_eq!(facts.poetry_python, None);
     }
 
     #[test]
