@@ -38,7 +38,33 @@ fn matches() -> ArgMatches {
     }
 }
 
+/// Let a reader that hangs up end the process the way it ends every other
+/// Unix tool.
+///
+/// Rust starts each program with SIGPIPE ignored, so a write to a pipe whose
+/// reader is gone reports EPIPE instead of killing the process — and
+/// `println!` turns that error into a panic. `cibox detect | head` or quitting
+/// `cibox validate | less` early therefore ended with "failed printing to
+/// stdout: Broken pipe" and a backtrace hint, as if cibox had crashed. Nothing
+/// cibox prints needs to outlive its reader: the commands print a report, the
+/// LSP has no one left to answer once the editor has hung up, and no child
+/// process inherits the disposition because none is ever spawned. The default
+/// disposition — exit quietly on the first failed write — is the right one.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: `signal` is async-signal-safe and only installs a disposition.
+    // It runs before any other thread exists, and nothing in cibox relies on
+    // a write to stdout reporting EPIPE rather than ending the process.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() -> Result<()> {
+    reset_sigpipe();
     let cli = Cli::from_arg_matches(&matches())?;
 
     match cli.command {

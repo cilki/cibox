@@ -333,6 +333,7 @@ dependencies = [
  "clap",
  "colored",
  "crossterm",
+ "libc",
  "predicates",
  "ratatui",
  "ratatui-image",
