@@ -164,6 +164,13 @@ pub struct EditorState {
     /// Whether cibox.ron existed (or has been written) — once true, auto-save
     /// keeps the file up to date even when the delta becomes empty again
     pub has_ron_file: bool,
+    /// Why the last auto-save of cibox.ron failed, until one succeeds.
+    ///
+    /// The checklist and the preview are computed from `config` in memory, so
+    /// a toggle whose write failed still shows as applied — the only sign that
+    /// the edit never reached disk is this message, which the information bar
+    /// displays and `EditorApp::run` reports once the editor is closed.
+    pub save_error: Option<String>,
 
     /// The platforms a plain `cibox update` would target: every one with a
     /// cibox-managed file on disk, or the inferred one when there is none
@@ -224,6 +231,7 @@ impl EditorState {
             working_dir,
             config,
             has_ron_file,
+            save_error: None,
             platforms: Vec::new(),
             rows: Vec::new(),
             cursor: 0,
@@ -770,15 +778,27 @@ impl EditorState {
     }
 
     /// Write cibox.ron when there is anything to say (or the file already
-    /// exists and needs updating)
+    /// exists and needs updating).
+    ///
+    /// A failed write is recorded in [`Self::save_error`] rather than
+    /// dropped: the edit is already showing in the checklist and the preview,
+    /// and without the message there is nothing to say it was lost — a
+    /// `--dir` that doesn't exist or a directory the user can't write to
+    /// looked exactly like a successful save.
     pub fn auto_save_ron(&mut self) {
         if self.config.is_default() && !self.has_ron_file {
             return;
         }
         let path = self.working_dir.join("cibox.ron");
-        if let Ok(ron_str) = serialize_config(&self.config) {
-            if std::fs::write(&path, ron_str).is_ok() {
+        let written = serialize_config(&self.config)
+            .and_then(|ron_str| std::fs::write(&path, ron_str).map_err(Into::into));
+        match written {
+            Ok(()) => {
                 self.has_ron_file = true;
+                self.save_error = None;
+            }
+            Err(e) => {
+                self.save_error = Some(format!("Could not write {}: {e}", path.display()));
             }
         }
     }
@@ -904,6 +924,36 @@ mod tests {
         // Toggling back removes the override entirely
         state.activate_current();
         assert!(state.config.is_default());
+    }
+
+    /// A toggle whose write fails still shows as applied, so the failure has
+    /// to be recorded somewhere the UI can show it; it clears once a save
+    /// goes through
+    #[test]
+    fn test_failed_save_is_reported_until_one_succeeds() {
+        let dir = rust_dir();
+        let mut state = state_for(dir.path());
+        // Where cibox.ron would go doesn't exist (the `--dir` was mistyped,
+        // say), so every write fails
+        let missing = dir.path().join("missing");
+        state.working_dir = missing.clone();
+
+        state.cursor = rule_index(&state, "rust-fmt");
+        state.activate_current();
+        assert!(!rule_row(&state, "rust-fmt").enabled);
+        assert!(!missing.join("cibox.ron").exists());
+        let error = state.save_error.clone().expect("the lost edit is reported");
+        assert!(error.contains("cibox.ron"), "{error}");
+        assert!(!state.has_ron_file);
+
+        // The next successful save clears it
+        fs::create_dir(&missing).unwrap();
+        state.activate_current();
+        state.activate_current();
+        assert_eq!(state.save_error, None);
+        assert!(state.has_ron_file);
+        let ron_str = fs::read_to_string(missing.join("cibox.ron")).unwrap();
+        assert!(ron_str.contains("rust_fmt"), "{ron_str}");
     }
 
     #[test]

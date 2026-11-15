@@ -367,21 +367,25 @@ fn panel_border(focused: bool, color: Color) -> Style {
 }
 
 fn render_info_bar(f: &mut Frame, area: Rect, state: &EditorState) {
-    let description = state.current_description();
-    let text = if description.is_empty() {
-        "Navigate with ↑↓, toggle rules with Space/Enter".to_string()
-    } else {
-        description
+    // A save that failed takes the bar over: the toggle it belongs to is
+    // already drawn as applied, so this is the only place the loss shows
+    let (text, color, title) = match &state.save_error {
+        Some(error) => (error.clone(), Color::Red, " Error "),
+        None => {
+            let description = state.current_description();
+            let text = if description.is_empty() {
+                "Navigate with ↑↓, toggle rules with Space/Enter".to_string()
+            } else {
+                description
+            };
+            (text, Color::Gray, " Information ")
+        }
     };
 
     let paragraph = Paragraph::new(text)
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(color))
         .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Information "),
-        );
+        .block(Block::default().borders(Borders::ALL).title(title));
 
     f.render_widget(paragraph, area);
 }

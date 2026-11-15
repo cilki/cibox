@@ -82,7 +82,13 @@ impl EditorApp {
             }
         }
 
-        Ok(())
+        // The alternate screen takes the information bar with it when the
+        // editor closes, so an edit that never reached cibox.ron is reported
+        // again where the user will see it — and the exit status says so
+        match self.state.save_error.take() {
+            Some(error) => Err(anyhow::anyhow!("{error}")),
+            None => Ok(()),
+        }
     }
 }
 
