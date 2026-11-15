@@ -19,6 +19,27 @@ pub struct RustFacts {
     pub has_features: bool,
     /// The root package is a library crate ([lib] section or src/lib.rs)
     pub is_library: bool,
+    /// The root package has at least one binary target: a `[[bin]]`
+    /// section, or (unless `autobins = false`) a `src/main.rs` or anything
+    /// under `src/bin/`. A crate is commonly both: a library with a thin
+    /// `src/main.rs` over it still builds an executable.
+    pub has_binaries: bool,
+}
+
+/// Whether `src/bin/` holds an auto-discovered binary target: a `.rs` file,
+/// or a directory with a `main.rs` in it
+fn has_bin_dir_targets(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path.join("src/bin")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            path.join("main.rs").is_file()
+        } else {
+            path.extension().is_some_and(|ext| ext == "rs")
+        }
+    })
 }
 
 pub(super) fn gather(path: &Path) -> Option<RustFacts> {
@@ -71,6 +92,13 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
     .filter(|v| is_toolchain_version(v))
     .cloned();
 
+    // `from_str` never looks at the filesystem, so `manifest.bin` holds only
+    // the explicit `[[bin]]` sections; the targets cargo would discover on
+    // its own are found here the same way it does
+    let has_binaries = !manifest.bin.is_empty()
+        || package.is_some_and(|p| p.autobins)
+            && (path.join("src/main.rs").is_file() || has_bin_dir_targets(path));
+
     Some(RustFacts {
         is_workspace: manifest.workspace.is_some(),
         has_package: package.is_some(),
@@ -79,6 +107,7 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
         msrv,
         has_features: !manifest.features.is_empty(),
         is_library: manifest.lib.is_some() || path.join("src/lib.rs").is_file(),
+        has_binaries,
     })
 }
 
@@ -226,11 +255,67 @@ mod tests {
     }
 
     #[test]
+    fn test_binaries_detected_from_main_rs_and_bin_dir() {
+        let dir = tempdir().unwrap();
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
+        fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
+        fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        assert!(!gather(dir.path()).unwrap().has_binaries);
+
+        // A library with a thin src/main.rs over it is still a binary crate
+        fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let facts = gather(dir.path()).unwrap();
+        assert!(facts.is_library);
+        assert!(facts.has_binaries);
+
+        fs::remove_file(dir.path().join("src/main.rs")).unwrap();
+        assert!(!gather(dir.path()).unwrap().has_binaries);
+
+        // src/bin/<name>.rs and src/bin/<name>/main.rs are both targets;
+        // anything else in there is not
+        fs::write(dir.path().join("src/bin/notes.txt"), "").unwrap();
+        assert!(!gather(dir.path()).unwrap().has_binaries);
+        fs::write(dir.path().join("src/bin/tool.rs"), "fn main() {}").unwrap();
+        assert!(gather(dir.path()).unwrap().has_binaries);
+        fs::remove_file(dir.path().join("src/bin/tool.rs")).unwrap();
+        fs::create_dir(dir.path().join("src/bin/nested")).unwrap();
+        assert!(!gather(dir.path()).unwrap().has_binaries);
+        fs::write(dir.path().join("src/bin/nested/main.rs"), "fn main() {}").unwrap();
+        assert!(gather(dir.path()).unwrap().has_binaries);
+    }
+
+    #[test]
+    fn test_binaries_detected_from_bin_section() {
+        // An explicit target counts wherever its source lives
+        let facts = facts_for(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
+        )
+        .unwrap();
+        assert!(facts.has_binaries);
+    }
+
+    #[test]
+    fn test_autobins_false_hides_main_rs() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nautobins = false\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(!gather(dir.path()).unwrap().has_binaries);
+    }
+
+    #[test]
     fn test_workspace_without_root_package() {
         let facts = facts_for("[workspace]\nmembers = [\"a\", \"b\"]\n").unwrap();
         assert!(facts.is_workspace);
         assert!(!facts.has_package);
         assert!(!facts.publishable);
+        // The members' targets aren't read, so none are claimed
+        assert!(!facts.has_binaries);
     }
 
     #[test]

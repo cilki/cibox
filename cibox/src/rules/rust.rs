@@ -389,8 +389,12 @@ impl Rule for RustBuild {
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
         // A pure library has no binaries worth uploading, and rust-test
-        // already proves it compiles
-        facts.rust.as_ref().is_some_and(|r| !r.is_library)
+        // already proves it compiles. A library with binary targets beside
+        // it is not pure: those executables are the project's product
+        facts
+            .rust
+            .as_ref()
+            .is_some_and(|r| !r.is_library || r.has_binaries)
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
@@ -537,6 +541,23 @@ mod tests {
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n"
         )));
         assert!(!RustBuild.detect(&ProjectFacts::default()));
+
+        // A library with a binary beside it still produces an executable
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(RustBuild.detect(&crate::detection::gather_facts(dir.path())));
+
+        // ...as does one whose only binary is declared in the manifest
+        assert!(RustBuild.detect(&library_facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"a\"\npath = \"bin/a.rs\"\n"
+        )));
     }
 
     #[test]
