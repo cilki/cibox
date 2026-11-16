@@ -15,6 +15,39 @@ fn project() -> tempfile::TempDir {
     dir
 }
 
+/// Detection never fails, so a mistyped `--dir` used to look like an empty
+/// project: `detect` said every rule was "not detected" and exited 0. A
+/// directory that isn't there, or a file in its place, has to be refused.
+#[test]
+fn test_dir_that_is_not_a_directory_is_refused() {
+    let dir = project();
+    let missing = dir.path().join("typo");
+    let file = dir.path().join("Cargo.toml");
+    for command in ["detect", "editor"] {
+        for (bad, reason) in [(&missing, "no such directory"), (&file, "not a directory")] {
+            let output = Command::new(env!("CARGO_BIN_EXE_cibox"))
+                .args([command, "--dir"])
+                .arg(bad)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{command} {bad:?}: {stderr}");
+            assert!(stderr.contains(reason), "{command} {bad:?}: {stderr}");
+            assert!(output.stdout.is_empty(), "{command} {bad:?}: {output:?}");
+        }
+    }
+
+    // A real directory is still accepted
+    let output = Command::new(env!("CARGO_BIN_EXE_cibox"))
+        .args(["detect", "--dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Rust"));
+}
+
 /// `cibox detect | head` used to end in "failed printing to stdout: Broken
 /// pipe" with a backtrace hint: Rust ignores SIGPIPE, so the write to the
 /// closed pipe reported EPIPE and `println!` panicked on it. A reader that

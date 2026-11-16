@@ -39,6 +39,22 @@ impl PlatformFlags {
     }
 }
 
+/// Accept `--dir` only when it names a directory.
+///
+/// Detection never fails — an unreadable file just means the fact is absent —
+/// so a mistyped `--dir` used to read as a directory with nothing in it:
+/// `detect` reported every rule "not detected" and exited 0, and the editor
+/// opened on an empty project.
+fn existing_dir(dir: &str) -> Result<String, String> {
+    if std::path::Path::new(dir).is_dir() {
+        Ok(dir.to_string())
+    } else if std::path::Path::new(dir).exists() {
+        Err("not a directory".to_string())
+    } else {
+        Err("no such directory".to_string())
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "cibox")]
 #[command(about = "Control your CI/CD configuration")]
@@ -86,14 +102,14 @@ pub enum Commands {
     /// Run interactive editor (default)
     Editor {
         /// Project directory
-        #[arg(short, long, default_value = ".")]
+        #[arg(short, long, default_value = ".", value_parser = existing_dir)]
         dir: String,
     },
 
     /// Show project facts and which rules they trigger
     Detect {
         /// Project directory
-        #[arg(short, long, default_value = ".")]
+        #[arg(short, long, default_value = ".", value_parser = existing_dir)]
         dir: String,
     },
 
