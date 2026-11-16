@@ -48,6 +48,35 @@ fn test_dir_that_is_not_a_directory_is_refused() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("Rust"));
 }
 
+/// A bare `cibox` opens the editor, so `cibox | less` or a script calling it
+/// used to draw the editor into the pipe and wait for keys on a terminal
+/// showing nothing — or, with no terminal at all, fail with "No such device
+/// or address". Both have to be told plainly what to run instead, and
+/// neither may leave cibox.ron behind.
+#[test]
+fn test_editor_without_a_terminal_says_what_to_run_instead() {
+    let dir = project();
+    for args in [&[][..], &["editor"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cibox"))
+            .current_dir(dir.path())
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "args {args:?}: {output:?}");
+        assert!(
+            stderr.contains(cibox::editor::NEEDS_TERMINAL),
+            "args {args:?}: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "args {args:?}: {output:?}");
+    }
+    assert!(!dir.path().join("cibox.ron").exists());
+}
+
 /// `cibox detect | head` used to end in "failed printing to stdout: Broken
 /// pipe" with a backtrace hint: Rust ignores SIGPIPE, so the write to the
 /// closed pipe reported EPIPE and `println!` panicked on it. A reader that
