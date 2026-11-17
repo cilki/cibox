@@ -676,7 +676,11 @@ impl EditorState {
                 // entry committed empty, which is how one is removed, and
                 // collapses an emptied list back to "unset" so cibox.ron
                 // stays delta-only.
-                let versions = clean_versions(Some(&versions));
+                // An entry parse_config would reject is dropped the same
+                // way, so the editor never saves a cibox.ron that `cibox
+                // update` then refuses to read.
+                let mut versions = clean_versions(Some(&versions));
+                versions.retain(|v| crate::config::is_valid_version(rule_id, v));
                 self.config
                     .set_versions_override(rule_id, (!versions.is_empty()).then_some(versions));
             }
@@ -1183,6 +1187,21 @@ mod tests {
             state.config.rust_test.versions,
             Some(vec!["nightly".to_string()])
         );
+
+        // A version with no image is dropped rather than saved into a
+        // cibox.ron that `cibox update` would refuse to read
+        state.cursor = idx + 2;
+        state.activate_current();
+        for c in "beta".chars() {
+            state.input_push(c);
+        }
+        state.commit_input();
+        assert_eq!(
+            state.config.rust_test.versions,
+            Some(vec!["nightly".to_string()])
+        );
+        let ron_str = fs::read_to_string(dir.path().join("cibox.ron")).unwrap();
+        crate::config::parse_config(&ron_str).unwrap();
 
         // Removing the last version collapses the override entirely
         state.cursor = idx + 1;

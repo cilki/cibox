@@ -121,7 +121,9 @@ fn split_tag(reference: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn is_valid_tag(tag: &str) -> bool {
+/// Whether `tag` is a valid docker image tag: alphanumerics and `_.-`, not
+/// starting with `.` or `-`, at most 128 characters
+pub fn is_valid_tag(tag: &str) -> bool {
     let bytes = tag.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= MAX_TAG_LEN
