@@ -420,7 +420,56 @@ pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
     validate_image_names(&config)?;
     validate_aur_packages(&config)?;
     validate_android_build(&config)?;
+    validate_versions(&config)?;
     Ok(config)
+}
+
+/// Whether `version` is an entry the `versions` knob of the test rule
+/// `rule_id` can turn into a job image: for rust-test one of the toolchains
+/// [`crate::rules::rust::toolchain_image`] has an image for, for the others
+/// a docker tag of the language's official image. Blank entries are
+/// dropped by [`crate::rules::clean_versions`] and so are accepted.
+pub fn is_valid_version(rule_id: &str, version: &str) -> bool {
+    let version = version.trim();
+    version.is_empty()
+        || match rule_id {
+            "rust-test" => crate::config::android::is_valid_toolchain(version),
+            _ => crate::config::image::is_valid_tag(version),
+        }
+}
+
+/// Each `versions` entry becomes the tag of a job's container image, so one
+/// that can't be pulled fails every run of that job. Reject the ones that
+/// certainly can't: the docker tag grammar for every rule, and for
+/// rust-test anything but the toolchains it has an image for — `beta`,
+/// the natural third leg of a stable/beta/nightly matrix, has none.
+fn validate_versions(config: &CiboxConfig) -> Result<()> {
+    for (field, rule) in [
+        ("rust_test", &config.rust_test),
+        ("python_test", &config.python_test),
+        ("go_test", &config.go_test),
+        ("node_test", &config.node_test),
+    ] {
+        let rule_id = field.replace('_', "-");
+        for version in rule.versions.iter().flatten() {
+            if is_valid_version(&rule_id, version) {
+                continue;
+            }
+            if field == "rust_test" {
+                anyhow::bail!(
+                    "rust_test.versions entry {version:?} is not a toolchain \
+                     cibox has an image for: \"stable\", \"nightly\", or \
+                     \"x.y[.z]\" (there is no image for beta)."
+                );
+            }
+            anyhow::bail!(
+                "{field}.versions entry {version:?} is not a valid docker image \
+                 tag: alphanumerics and `_.-`, not starting with `.` or `-`, at \
+                 most 128 characters."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Image names are interpolated into `docker build -t <image> .` in the
@@ -687,6 +736,33 @@ mod tests {
         );
         // Versions alone leave detection in charge of enablement
         assert_eq!(config.rust_test.enabled, None);
+    }
+
+    #[test]
+    fn test_versions_without_an_image_are_rejected() {
+        // Each entry is the tag of a job's container image: rust:beta does
+        // not exist, and no image tag holds a space
+        for (ron, field) in [
+            (r#"(rust_test: (versions: ["stable", "beta"]))"#, "rust_test"),
+            (r#"(rust_test: (versions: ["1.90-alpine"]))"#, "rust_test"),
+            (r#"(go_test: (versions: ["1.24 x"]))"#, "go_test"),
+            (r#"(python_test: (versions: ["3.13:slim"]))"#, "python_test"),
+            (r#"(node_test: (versions: ["-22"]))"#, "node_test"),
+        ] {
+            let err = parse_config(ron).unwrap_err().to_string();
+            assert!(err.contains(&format!("{field}.versions")), "{ron}: {err}");
+        }
+        // The documented shapes still parse, and blank entries are dropped
+        // later rather than rejected
+        parse_config(
+            r#"(
+                rust_test: (versions: ["stable", "nightly", "1", "1.90", "1.90.1", ""]),
+                python_test: (versions: ["3.13", "3.13-slim"]),
+                go_test: (versions: ["1.24", " 1.23 "]),
+                node_test: (versions: ["22", "lts-alpine"]),
+            )"#,
+        )
+        .unwrap();
     }
 
     #[test]
