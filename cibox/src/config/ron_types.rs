@@ -128,7 +128,7 @@ pub struct CiboxConfig {
 
 /// Override for a rule without knobs
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuleToggle {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,7 +137,7 @@ pub struct RuleToggle {
 
 /// Override for a test rule that supports a toolchain-version matrix
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VersionedRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,7 +150,7 @@ pub struct VersionedRule {
 
 /// Override for the docker-build rule: toggle plus image name
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,7 +171,7 @@ pub struct DockerRule {
 /// GitHub/Gitea the credentials are read from repository Secrets, falling
 /// back to Variables for values that needn't be secret (e.g. the username).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerReleaseRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,7 +206,7 @@ pub struct DockerReleaseRule {
 /// with makepkg and lints with namcap, regenerates .SRCINFO, and pushes —
 /// authenticating with the AUR_SSH_PRIVATE_KEY secret.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AurReleaseRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,7 +226,7 @@ pub struct AurReleaseRule {
 /// a cargo-ndk pre-build produces the JNI libraries first. The Android SDK
 /// is installed at job runtime into a cached directory inside the checkout.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AndroidBuildRule {
     /// Force this rule on or off; omit to let detection decide
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -589,6 +589,28 @@ mod tests {
         let config = parse_config(r#"(docker_build: (image_name: "a/b"))"#).unwrap();
         assert_eq!(config.docker_build.enabled, None);
         assert_eq!(config.docker_build.image_name.as_deref(), Some("a/b"));
+    }
+
+    /// A misspelled or misplaced key inside a rule's entry is an error, the
+    /// same as a misspelled rule name: ignoring it would leave the rule doing
+    /// what detection decided while the file says otherwise
+    #[test]
+    fn test_unknown_field_inside_a_rule_is_rejected() {
+        for (ron, field) in [
+            // A typo for `enabled`, on each kind of override
+            ("(rust_fmt: (enable: false))", "enable"),
+            ("(rust_test: (enable: false))", "enable"),
+            ("(docker_build: (enable: false))", "enable"),
+            ("(docker_release: (enable: false))", "enable"),
+            ("(aur_release: (enable: true))", "enable"),
+            ("(android_build: (enable: true))", "enable"),
+            // A knob under its short name, or on a rule that lacks it
+            (r#"(docker_build: (image: "a/b"))"#, "image"),
+            (r#"(rust_fmt: (versions: ["nightly"]))"#, "versions"),
+        ] {
+            let msg = parse_config(ron).unwrap_err().to_string();
+            assert!(msg.contains(&format!("`{field}`")), "{ron}: {msg}");
+        }
     }
 
     #[test]
