@@ -39,6 +39,12 @@ pub struct PythonFacts {
     /// `[tool.poetry.dev-dependencies]` table Poetry still reads as one.
     /// Only Poetry can install these — pip knows nothing of them.
     pub poetry_test_group: Option<String>,
+    /// The requirements file holding the test requirements, relative to the
+    /// project root (`requirements-dev.txt`, `test-requirements.txt`,
+    /// `requirements/test.txt`, …), see [`test_requirements_file`]. The
+    /// usual home for pytest plugins in a project that keeps its
+    /// dependencies in requirements files rather than in pyproject.toml.
+    pub test_requirements: Option<String>,
     /// pytest has something to run: the project configures pytest, or has a
     /// file pytest collects by default. Without either, `pytest` collects
     /// nothing and exits 5, failing the job on a project that has no tests.
@@ -132,6 +138,26 @@ fn test_set(table: Option<&toml::Value>) -> Option<String> {
         .map(|name| name.to_string())
 }
 
+/// The first test requirements file present in the project at `path`, by
+/// [`TEST_SETS`] name first (narrowest wins, as for extras and groups) and
+/// then by the spellings projects use for it: `requirements-dev.txt`,
+/// `requirements_dev.txt`, `dev-requirements.txt`, `dev_requirements.txt`,
+/// and `requirements/dev.txt`.
+fn test_requirements_file(path: &Path) -> Option<String> {
+    TEST_SETS
+        .iter()
+        .flat_map(|name| {
+            [
+                format!("requirements-{name}.txt"),
+                format!("requirements_{name}.txt"),
+                format!("{name}-requirements.txt"),
+                format!("{name}_requirements.txt"),
+                format!("requirements/{name}.txt"),
+            ]
+        })
+        .find(|file| path.join(file).is_file())
+}
+
 pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
     let has_pyproject = path.join("pyproject.toml").is_file();
     let has_setup_py = path.join("setup.py").is_file();
@@ -197,6 +223,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
         test_extra,
         test_group,
         poetry_test_group,
+        test_requirements: test_requirements_file(path),
         has_tests,
     })
 }
@@ -396,6 +423,40 @@ mod tests {
             "[tool.poetry]\nname = \"p\"\n[tool.poetry.group.docs.dependencies]\nsphinx = \"*\"\n",
         );
         assert_eq!(facts.poetry_test_group, None);
+    }
+
+    fn test_requirements_with(files: &[&str]) -> Option<String> {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), "requests\n").unwrap();
+        for name in files {
+            let file = dir.path().join(name);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "pytest-mock\n").unwrap();
+        }
+        gather(dir.path()).unwrap().test_requirements
+    }
+
+    #[test]
+    fn test_test_requirements_file_is_found_by_its_usual_names() {
+        for name in [
+            "requirements-dev.txt",
+            "requirements_test.txt",
+            "test-requirements.txt",
+            "dev_requirements.txt",
+            "requirements/tests.txt",
+        ] {
+            assert_eq!(test_requirements_with(&[name]).as_deref(), Some(name));
+        }
+        // The narrowest name wins, as it does for extras and groups
+        assert_eq!(
+            test_requirements_with(&["requirements-dev.txt", "requirements-test.txt"]).as_deref(),
+            Some("requirements-test.txt")
+        );
+        // Requirements for anything else are not the tests'
+        assert_eq!(
+            test_requirements_with(&["requirements-docs.txt", "requirements/prod.txt"]),
+            None
+        );
     }
 
     fn has_tests_with(files: &[(&str, &str)]) -> bool {

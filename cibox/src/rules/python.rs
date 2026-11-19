@@ -214,10 +214,9 @@ fn poetry_clause(clause: &str) -> Option<String> {
 /// alone once it is satisfied, so the project's own looser constraints can't
 /// pull a different version in over the top.
 ///
-/// The project's test requirements — an extra or a dependency group named
-/// like one of the detector's `TEST_SETS` (`test`, `tests`, `testing`,
-/// `dev`) — come
-/// along: pytest plugins live there, and a suite written against
+/// The project's test requirements — a requirements file, extra or
+/// dependency group named like one of the detector's `TEST_SETS` (`test`,
+/// `tests`, `testing`, `dev`) — come along: pytest plugins live there, and a suite written against
 /// pytest-asyncio or a fixture plugin fails outright without them. A Poetry
 /// project keeps them in a Poetry group instead, which only Poetry installs.
 fn install_steps(facts: &ProjectFacts) -> Vec<Step> {
@@ -229,6 +228,14 @@ fn install_steps(facts: &ProjectFacts) -> Vec<Step> {
         steps.push(Step::run(
             "Install requirements",
             "pip install -r requirements.txt",
+        ));
+    }
+    if let Some(file) = &py.test_requirements {
+        // Named by the detector from a fixed list, so safe to put in a shell
+        // command as is
+        steps.push(Step::run(
+            "Install test requirements",
+            format!("pip install -r {file}"),
         ));
     }
     if let Some(group) = &py.poetry_test_group {
@@ -516,6 +523,31 @@ mod tests {
                 REQUIREMENTS,
                 "pip install --upgrade 'pip>=25.1' && pip install --group test"
             ]
+        );
+    }
+
+    /// A project that keeps its dependencies in requirements files keeps the
+    /// test ones (pytest-mock, pytest-cov) in a second file; without it a
+    /// suite using `mocker` or `--cov` errors out on every run
+    #[test]
+    fn test_test_requirements_file_is_installed() {
+        let facts = facts_with(&[
+            ("requirements.txt", "requests\n"),
+            ("requirements-dev.txt", "-r requirements.txt\npytest-mock\n"),
+        ]);
+        assert_eq!(
+            install_commands(&facts),
+            [REQUIREMENTS, "pip install -r requirements-dev.txt"]
+        );
+
+        // Its pins go in ahead of the project, like the main file's
+        let facts = facts_with(&[
+            ("setup.py", "from setuptools import setup\nsetup()\n"),
+            ("test-requirements.txt", "pytest-cov\n"),
+        ]);
+        assert_eq!(
+            install_commands(&facts),
+            ["pip install -r test-requirements.txt", PROJECT]
         );
     }
 
