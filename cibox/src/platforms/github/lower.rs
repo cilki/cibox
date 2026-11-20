@@ -166,7 +166,29 @@ fn base_permissions() -> BTreeMap<String, String> {
     BTreeMap::from([("contents".to_string(), "read".to_string())])
 }
 
+/// Marks the checkout as safe for the git inside a job container.
+///
+/// GitHub creates the workspace on the host as the runner user and mounts it
+/// into the container, whose steps run as root. Git refuses to work in a
+/// repository owned by someone else ("detected dubious ownership"), and the
+/// exception actions/checkout adds for itself lives in a temporary global
+/// config that is gone by the next step — so `go build` (which asks git for
+/// the VCS stamp of every binary) and `git describe` in the release jobs fail.
+/// `$GITHUB_WORKSPACE` is the container-side path; `${{ github.workspace }}`
+/// would be the host's. Images without git (oven/bun) have no repository to
+/// protect either: checkout fell back to a tarball there.
+const SAFE_DIRECTORY: &str = "if command -v git >/dev/null; then git config --global --add safe.directory \"$GITHUB_WORKSPACE\"; fi";
+
 fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
+    // Docker-daemon jobs run directly on the host runner
+    let container = if job.needs_docker {
+        None
+    } else if job.matrix.is_some() {
+        Some("${{ matrix.image }}".to_string())
+    } else {
+        job.image.clone()
+    };
+
     let mut steps = Vec::new();
 
     for step in &job.steps {
@@ -196,6 +218,14 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                     run: None,
                     with: Some(with),
                 });
+                if container.is_some() {
+                    steps.push(GitHubStep {
+                        name: "Trust the checkout".to_string(),
+                        uses: None,
+                        run: Some(SAFE_DIRECTORY.to_string()),
+                        with: None,
+                    });
+                }
                 if let Some(cache) = &job.cache {
                     // Matrix legs run different toolchains; sharing one cache
                     // key would make them overwrite each other
@@ -318,14 +348,7 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
                 shell: "bash".to_string(),
             },
         }),
-        // Docker-daemon jobs run directly on the host runner
-        container: if job.needs_docker {
-            None
-        } else if job.matrix.is_some() {
-            Some("${{ matrix.image }}".to_string())
-        } else {
-            job.image.clone()
-        },
+        container,
         permissions,
         env: (!env.is_empty()).then_some(env),
         steps,
@@ -403,6 +426,56 @@ mod tests {
             Some("rust:1.80")
         );
         assert_eq!(workflow.jobs["docker-build"].container, None);
+    }
+
+    /// The workspace is the runner user's and container steps run as root,
+    /// so without the exception git — and `go build`, which asks it for the
+    /// VCS stamp — refuses the checkout as "dubious ownership"
+    #[test]
+    fn test_container_jobs_trust_the_checkout() {
+        let entries = vec![MatrixEntry {
+            version: "1.24".to_string(),
+            image: "golang:1.24".to_string(),
+        }];
+        let workflow = lower_github(
+            &[
+                Job::new("go-build", "Go build", Stage::Build)
+                    .with_image("golang:1")
+                    .with_steps(vec![Step::checkout(), Step::run("Build", "go build ./...")]),
+                Job::new("go-test", "Go test", Stage::Test)
+                    .with_matrix(entries)
+                    .with_steps(vec![Step::checkout(), Step::run("Test", "go test ./...")]),
+                Job::new("docker-release", "Docker push", Stage::Deploy)
+                    .with_image("ignored")
+                    .with_docker()
+                    .with_steps(vec![Step::checkout(), Step::run("Push", "docker push x")]),
+            ],
+            WorkflowKind::Ci,
+        );
+        for id in ["go-build", "go-test"] {
+            let steps = &workflow.jobs[id].steps;
+            assert_eq!(
+                steps[0].uses.as_deref(),
+                Some("actions/checkout@v4"),
+                "{id}"
+            );
+            // Straight after the checkout, before anything that runs git
+            let run = steps[1].run.as_deref().unwrap();
+            assert!(
+                run.contains("git config --global --add safe.directory \"$GITHUB_WORKSPACE\""),
+                "{id}: {run}"
+            );
+        }
+        // On the host the runner user owns its own workspace
+        let host_runs: Vec<&str> = workflow.jobs["docker-release"]
+            .steps
+            .iter()
+            .filter_map(|s| s.run.as_deref())
+            .collect();
+        assert!(
+            !host_runs.iter().any(|r| r.contains("safe.directory")),
+            "{host_runs:?}"
+        );
     }
 
     #[test]
@@ -623,7 +696,12 @@ mod tests {
         assert_eq!(strategy.matrix.include.len(), 2);
         assert_eq!(strategy.matrix.include[1].image, "rustlang/rust:nightly");
         // Each leg caches under its own key
-        let with = job.steps[1].with.as_ref().unwrap();
+        let cache = job
+            .steps
+            .iter()
+            .find(|s| s.uses.as_deref() == Some("actions/cache@v4"))
+            .unwrap();
+        let with = cache.with.as_ref().unwrap();
         assert_eq!(
             with["key"],
             serde_yaml::Value::String(

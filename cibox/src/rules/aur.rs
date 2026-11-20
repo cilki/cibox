@@ -101,8 +101,8 @@ impl AurRelease {
                 ),
             ),
             // The clone lives in builder's home, not the workspace: the
-            // workspace is root-owned on every platform and has no business
-            // inside the package build
+            // workspace is not builder's (root's, or the GitHub runner
+            // user's) and has no business inside the package build
             Step::run(
                 format!("Clone {pkg} from the AUR"),
                 format!(
