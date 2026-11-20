@@ -171,6 +171,11 @@ fn is_yarn_berry(path: &Path, manifest: &serde_json::Value) -> bool {
         .is_ok_and(|lock| lock.lines().any(|line| line.trim_end() == "__metadata:"))
 }
 
+/// Every config file name Prettier itself resolves (prettier.io/docs/configuration).
+///
+/// The TypeScript names (`.ts`, `.mts`, `.cts`) have been accepted since
+/// Prettier 3.5, and the Node the jobs run on strips types natively, so they
+/// load in CI as they do locally.
 fn has_prettier_config(path: &Path, manifest: &serde_json::Value) -> bool {
     if manifest.get("prettier").is_some() {
         return true;
@@ -184,10 +189,16 @@ fn has_prettier_config(path: &Path, manifest: &serde_json::Value) -> bool {
         ".prettierrc.js",
         ".prettierrc.cjs",
         ".prettierrc.mjs",
+        ".prettierrc.ts",
+        ".prettierrc.cts",
+        ".prettierrc.mts",
         ".prettierrc.toml",
         "prettier.config.js",
         "prettier.config.cjs",
         "prettier.config.mjs",
+        "prettier.config.ts",
+        "prettier.config.cts",
+        "prettier.config.mts",
     ]
     .iter()
     .any(|f| path.join(f).is_file())
@@ -380,6 +391,25 @@ mod tests {
         )
         .unwrap();
         assert!(gather(dir.path()).unwrap().has_prettier_config);
+    }
+
+    /// Prettier 3.5+ reads TypeScript config files; a project configured
+    /// that way must still get its node-fmt job
+    #[test]
+    fn test_typescript_prettier_config_detected() {
+        for name in [
+            "prettier.config.ts",
+            "prettier.config.mts",
+            "prettier.config.cts",
+            ".prettierrc.ts",
+            ".prettierrc.mts",
+            ".prettierrc.cts",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("package.json"), "{}").unwrap();
+            fs::write(dir.path().join(name), "export default {};\n").unwrap();
+            assert!(gather(dir.path()).unwrap().has_prettier_config, "{name}");
+        }
     }
 
     #[test]
