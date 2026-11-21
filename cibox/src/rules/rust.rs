@@ -223,6 +223,22 @@ impl Rule for RustDoc {
     }
 }
 
+/// Re-resolve the lockfile for the MSRV check, with the image's own (new)
+/// cargo.
+///
+/// The MSRV toolchain's cargo resolves to the newest release of every
+/// dependency whatever Rust it needs — `clap = "4"` gets a clap that wants
+/// Rust 1.85 — so a crate declaring `rust-version = "1.70"` failed the check
+/// on its dependencies, never on its own code. A committed lockfile made by
+/// a recent cargo fails it too: format v4 is unreadable before Rust 1.78.
+/// The `fallback` resolver (stable since Rust 1.84, ignored by older cargo)
+/// picks the newest versions whose own rust-version fits ours, and a fresh
+/// lockfile is written in the newest format that rust-version reads. That is
+/// the dependency set a downstream user on the MSRV gets, which is what the
+/// check is for; the committed lockfile is only replaced inside the job.
+const MSRV_LOCKFILE: &str =
+    "CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo generate-lockfile";
+
 /// Check the build with the minimum supported rust version
 pub struct RustMsrv;
 
@@ -247,6 +263,7 @@ impl Rule for RustMsrv {
         let steps = match facts.rust.as_ref().and_then(|r| r.msrv.as_deref()) {
             Some(msrv) => vec![
                 Step::checkout(),
+                Step::run("Resolve MSRV-compatible dependencies", MSRV_LOCKFILE),
                 Step::run(
                     "Install MSRV toolchain",
                     format!("rustup toolchain install {msrv} --profile minimal"),
@@ -258,9 +275,12 @@ impl Rule for RustMsrv {
                 Step::checkout(),
                 Step::run(
                     "Check with MSRV",
-                    "MSRV=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' Cargo.toml | head -n1) \
-                     && rustup toolchain install \"$MSRV\" --profile minimal \
-                     && cargo \"+$MSRV\" check",
+                    format!(
+                        "MSRV=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' Cargo.toml | head -n1) \
+                         && {MSRV_LOCKFILE} \
+                         && rustup toolchain install \"$MSRV\" --profile minimal \
+                         && cargo \"+$MSRV\" check"
+                    ),
                 ),
             ],
         };
@@ -599,13 +619,44 @@ mod tests {
         ));
     }
 
+    fn run_commands(job: &Job) -> Vec<&str> {
+        job.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Run { command, .. } => Some(command.as_str()),
+                Step::Checkout { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The MSRV's own cargo picks dependency releases that need a newer
+    /// Rust, and can't read a v4 lockfile, so the lockfile is re-resolved
+    /// with the image's MSRV-aware cargo before the old toolchain sees it
+    #[test]
+    fn test_msrv_resolves_dependencies_its_toolchain_can_build() {
+        let with_msrv = facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nrust-version = \"1.70\"\n",
+        );
+        let jobs = RustMsrv.jobs(&with_msrv);
+        assert_eq!(
+            run_commands(&jobs[0]),
+            [
+                "CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo generate-lockfile",
+                "rustup toolchain install 1.70 --profile minimal",
+                "cargo +1.70 check",
+            ]
+        );
+    }
+
     #[test]
     fn test_msrv_force_enabled_derives_version_in_shell() {
         let jobs = RustMsrv.jobs(&ProjectFacts::default());
-        assert!(jobs[0].steps.iter().any(
-            |s| matches!(s, Step::Run { command, .. }
-                if command.contains("rust-version") && command.contains("$MSRV"))
-        ));
+        let commands = run_commands(&jobs[0]);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(commands[0].contains("rust-version") && commands[0].contains("$MSRV"));
+        // Re-resolved before the MSRV toolchain checks anything
+        let resolve = commands[0].find(MSRV_LOCKFILE).expect("no re-resolve");
+        assert!(resolve < commands[0].find("cargo \"+$MSRV\" check").unwrap());
     }
 
     #[test]
