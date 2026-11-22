@@ -197,8 +197,10 @@ take a list of toolchain versions and run against each one:
 
 Each version selects an image tag: `python:3.13`, `golang:1.24`, `node:22`,
 and for Rust `rust:1.85`, with `stable` meaning `rust:latest` and `nightly`
-meaning `rustlang/rust:nightly`. Blank and duplicate entries are dropped.
-A single version just pins the job's image; omitting `versions` leaves the
+meaning `rustlang/rust:nightly`. Blank and duplicate entries are dropped, and
+an entry no image exists for is rejected by `cibox validate`: for `rust-test`
+anything but `stable`, `nightly` or `x.y[.z]` (there is no `beta` image), for
+the others anything that isn't a valid docker tag. A single version just pins the job's image; omitting `versions` leaves the
 rule's default image in place — `rust:latest`, `golang:1`, and `python:3.12`
 or `node:22` unless the project's `requires-python` (or Poetry's `python`
 dependency) or `engines.node` excludes it, in which case the nearest release
