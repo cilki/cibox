@@ -467,8 +467,13 @@ impl Rule for RustRelease {
 
     fn detect(&self, facts: &ProjectFacts) -> bool {
         // Workspaces without a root package need multi-crate publish
-        // ordering, which this rule doesn't attempt; force-enable if wanted
-        facts.rust.as_ref().is_some_and(|r| r.publishable)
+        // ordering, which this rule doesn't attempt; force-enable if wanted.
+        // A crate whose `publish` names other registries isn't headed for
+        // crates.io, and a bare `cargo publish` wouldn't take it there
+        facts
+            .rust
+            .as_ref()
+            .is_some_and(|r| r.publishes_to_crates_io)
     }
 
     fn jobs(&self, _facts: &ProjectFacts) -> Vec<Job> {
@@ -740,6 +745,23 @@ mod tests {
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = false\n"
         )));
         assert!(!RustRelease.detect(&facts("[workspace]\nmembers = []\n")));
+    }
+
+    #[test]
+    fn test_release_requires_crates_io_as_the_publish_target() {
+        // The job runs a bare `cargo publish` with the crates.io token; a
+        // crate bound for another registry would go there (or nowhere) instead
+        assert!(RustRelease.detect(&facts(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = [\"crates-io\"]\n"
+        )));
+        for publish in [r#"["my-registry"]"#, r#"["crates-io", "my-registry"]"#] {
+            let facts = library_facts(&format!(
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = {publish}\n"
+            ));
+            assert!(!RustRelease.detect(&facts), "{publish}");
+            // The crate still has consumers wherever it is published
+            assert!(RustMinimalVersions.detect(&facts), "{publish}");
+        }
     }
 
     #[test]
