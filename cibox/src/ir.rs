@@ -14,6 +14,15 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Every stage, in pipeline order
+    pub const ALL: [Stage; 5] = [
+        Stage::Test,
+        Stage::Lint,
+        Stage::Security,
+        Stage::Build,
+        Stage::Deploy,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Stage::Test => "test",
@@ -241,6 +250,8 @@ mod tests {
         assert!(Stage::Test < Stage::Lint);
         assert!(Stage::Security < Stage::Build);
         assert!(Stage::Build < Stage::Deploy);
+        // The GitLab merge ranks stages by their place in `ALL`
+        assert!(Stage::ALL.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

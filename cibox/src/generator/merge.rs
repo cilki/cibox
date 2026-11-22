@@ -17,7 +17,7 @@ use crate::config::Platform;
 use crate::error::Result;
 use crate::generator::disabled::{self, DisabledBlock, Scan};
 use crate::generator::{JobFilter, PlannedFile};
-use crate::ir::Job;
+use crate::ir::{Job, Stage};
 use crate::platforms::github::lower::{tag_gate as gate_of_triggers, TagGate};
 use anyhow::{anyhow, bail, Context};
 use serde_yaml::Value;
@@ -1056,15 +1056,24 @@ fn merge_gitlab(
     // adds goes before the first declared one that canonically follows it.
     // Appended instead, re-enabling `rust-audit` would put `security` after
     // `deploy`, and a tag pipeline would publish before the audit ran.
+    //
+    // Ranked by cibox's whole stage order, not just the stages this file's
+    // jobs use: a `deploy` the user declared for jobs of their own still
+    // runs last when no cibox job of this pipeline is in it.
     let canonical_stages: &[Value] = get(canonical_map, "stages")
         .and_then(Value::as_sequence)
         .map_or(&[], Vec::as_slice);
-    let rank = |stage: &Value| canonical_stages.iter().position(|s| s == stage);
-    for (at, stage) in canonical_stages.iter().enumerate() {
+    let rank = |stage: &Value| {
+        Stage::ALL
+            .iter()
+            .position(|s| stage.as_str() == Some(s.as_str()))
+    };
+    for stage in canonical_stages {
         if !stages.contains(stage) {
+            let at = rank(stage);
             let pos = stages
                 .iter()
-                .position(|s| rank(s).is_some_and(|r| r > at))
+                .position(|s| rank(s).is_some_and(|r| Some(r) > at))
                 .unwrap_or(stages.len());
             stages.insert(pos, stage.clone());
         }
@@ -2861,6 +2870,43 @@ workflows:
             merge_file(Platform::GitLab, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
         ));
+    }
+
+    /// A `deploy` stage of the user's own, with no cibox job in it: the
+    /// stages cibox adds still go before it, or the user's deploy would run
+    /// before any test did
+    #[test]
+    fn test_gitlab_added_stages_go_before_the_users_deploy() {
+        let facts = cargo_facts();
+        let mut config = CiboxConfig::default();
+        config.rust_release.enabled = Some(false);
+        let resolved = resolve(&facts, &config);
+        let file = plan(&facts, &resolved, Platform::GitLab)
+            .unwrap()
+            .swap_remove(0);
+        let filter = no_selection(&resolved);
+        let canonical: Value =
+            serde_yaml::from_str(&render_file(Platform::GitLab, &file).unwrap()).unwrap();
+        assert!(
+            !canonical["stages"]
+                .as_sequence()
+                .unwrap()
+                .contains(&Value::from("deploy")),
+            "fixture rot: {canonical:?}"
+        );
+
+        let existing = "stages:\n- deploy\n\
+                        deploy-prod:\n  stage: deploy\n  script: [./deploy.sh]\n";
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, existing).unwrap());
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        let stages: Vec<&str> = doc["stages"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(stages.len() > 1, "{content}");
+        assert_eq!(stages.last(), Some(&"deploy"), "{content}");
     }
 
     /// A `stage` a job inherits instead of naming: GitLab's own idiom for
