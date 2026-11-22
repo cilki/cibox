@@ -169,9 +169,18 @@ impl DockerRelease {
     /// description API to target, so the knob is silently ignored.
     ///
     /// The sync reuses the registry credentials, so it is guarded the same way
-    /// the login is — plus a check that there is a README to send, since the
-    /// bind mount would otherwise have docker create an empty `README.md`
-    /// *directory* in the checkout.
+    /// the login is — plus a check that there is a README to send.
+    ///
+    /// The README reaches the container on its stdin (`-i … < README.md`,
+    /// read back as `--file /dev/stdin`) rather than through a bind mount.
+    /// The daemon is often not on the machine holding the checkout —
+    /// CircleCI's `setup_remote_docker`, a GitLab `docker:dind` service, a
+    /// Gitea act_runner job container talking to the host's socket — and a
+    /// `-v "$PWD/README.md":…` path is resolved on the daemon's side, where
+    /// it doesn't exist: docker creates an empty directory there instead and
+    /// the push fails reading it. Stdin travels over the API connection, so
+    /// it arrives wherever the daemon is. It also hands the third-party image
+    /// the README's bytes and nothing else of the checkout.
     ///
     /// The credentials reach the container through the environment rather than
     /// `-e NAME=VALUE`: the latter writes the registry password into the
@@ -181,8 +190,7 @@ impl DockerRelease {
     /// `docker inspect` keeps it for the container's lifetime. The prefix
     /// assignment puts it in docker's environment instead and `-e NAME`
     /// forwards it by name, so the value never becomes a command-line
-    /// argument. Only README.md is mounted, read-only, instead of handing the
-    /// whole checkout to a third-party image with write access.
+    /// argument.
     fn readme_sync_step(&self) -> Option<Step> {
         (self.sync_readme && !self.uses_ghcr()).then(|| {
             Step::run(
@@ -190,9 +198,8 @@ impl DockerRelease {
                 format!(
                     "if [ -n \"${{DOCKER_USERNAME:-}}\" ] && [ -f README.md ]; then \
                      DOCKER_USER=\"$DOCKER_USERNAME\" DOCKER_PASS=\"$DOCKER_PASSWORD\" \
-                     docker run --rm -e DOCKER_USER -e DOCKER_PASS \
-                     -v \"$PWD/README.md\":/workspace/README.md:ro \
-                     chko/docker-pushrm:1 --file /workspace/README.md {}; \
+                     docker run --rm -i -e DOCKER_USER -e DOCKER_PASS \
+                     chko/docker-pushrm:1 --file /dev/stdin {} < README.md; \
                      else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi",
                     self.image
                 ),
@@ -734,9 +741,8 @@ mod tests {
             run_command(job, SYNC_STEP),
             "if [ -n \"${DOCKER_USERNAME:-}\" ] && [ -f README.md ]; then \
              DOCKER_USER=\"$DOCKER_USERNAME\" DOCKER_PASS=\"$DOCKER_PASSWORD\" \
-             docker run --rm -e DOCKER_USER -e DOCKER_PASS \
-             -v \"$PWD/README.md\":/workspace/README.md:ro \
-             chko/docker-pushrm:1 --file /workspace/README.md owner/app; \
+             docker run --rm -i -e DOCKER_USER -e DOCKER_PASS \
+             chko/docker-pushrm:1 --file /dev/stdin owner/app < README.md; \
              else echo \"DOCKER_USERNAME not set or no README.md; skipping README sync\"; fi"
         );
         // The sync reuses the push credentials, so nothing extra is declared
@@ -792,27 +798,32 @@ mod tests {
             sync.starts_with("if [ -n \"${DOCKER_USERNAME:-}\" ]"),
             "{sync}"
         );
-        // A missing README.md would otherwise have docker create a directory
-        // of that name in the checkout
+        // Nor is there anything to push without a README
         assert!(sync.contains("[ -f README.md ]"), "{sync}");
     }
 
     #[test]
-    fn test_sync_readme_mounts_only_the_readme_read_only() {
-        // A third-party image handed the registry password has no business
-        // with a writable mount of the whole checkout
-        let rule = DockerRelease {
-            image: "owner/app".to_string(),
-            platforms: vec![],
-            sync_readme: true,
-        };
-        let job = &rule.jobs(&docker_facts())[0];
-        let sync = run_command(job, SYNC_STEP);
-        assert!(
-            sync.contains("-v \"$PWD/README.md\":/workspace/README.md:ro"),
-            "{sync}"
-        );
-        assert!(!sync.contains("-v \"$PWD\":"), "{sync}");
+    fn test_sync_readme_streams_the_readme_instead_of_mounting_it() {
+        // CircleCI's remote docker, a GitLab dind service and a Gitea
+        // act_runner job container all talk to a daemon that can't see the
+        // checkout, so a bind mount of it would resolve to nothing there.
+        // Stdin reaches the container wherever the daemon runs, and carries
+        // the README alone rather than any of the checkout.
+        for platforms in [vec![], vec![DockerPlatform::LinuxArm64]] {
+            let rule = DockerRelease {
+                image: "owner/app".to_string(),
+                platforms,
+                sync_readme: true,
+            };
+            let job = &rule.jobs(&docker_facts())[0];
+            let sync = run_command(job, SYNC_STEP);
+            assert!(!sync.contains("-v "), "{sync}");
+            assert!(sync.contains("docker run --rm -i "), "{sync}");
+            assert!(
+                sync.contains("--file /dev/stdin owner/app < README.md;"),
+                "{sync}"
+            );
+        }
     }
 
     #[test]
