@@ -101,9 +101,9 @@ if you no longer want it.
 Detection runs per rule, not per ecosystem. For most rules the ecosystem's
 marker file is the whole of it: a `Cargo.toml` enables `rust-test`,
 `rust-fmt`, `rust-clippy`, `rust-audit` and `rust-doc`, a `go.mod` all four
-Go rules, a `build.zig` all three Zig rules, a `pyproject.toml`, `setup.py`
-or `requirements.txt` `python-lint` and `python-fmt`, a `CMakeLists.txt`
-`cmake-build`, and a `Dockerfile` both docker rules. The rest ask for more
+Go rules, a `build.zig` `zig-fmt` and `zig-build`, a `pyproject.toml`,
+`setup.py` or `requirements.txt` `python-lint` and `python-fmt`, a
+`CMakeLists.txt` `cmake-build`, and a `Dockerfile` both docker rules. The rest ask for more
 than the marker, because with the marker alone they would generate a job
 with nothing to run:
 
@@ -118,8 +118,11 @@ with nothing to run:
   `[features]` table, and `rust-minimal-versions` a library that is also
   publishable. Both check what downstream crates get; a binary picks its own
   features and ships its own lockfile.
-- `rust-build` needs the opposite — a crate that is *not* a library, since
-  the artifacts it uploads are the binaries `cargo build --release` produces.
+- `rust-build` needs a binary, since the artifacts it uploads are the
+  executables `cargo build --release` produces: a crate that is not a library,
+  or a library that ships binaries beside it — a `[[bin]]` section, a
+  `src/main.rs`, or a target under `src/bin/`. Only a pure library goes
+  without.
 - `android-build` needs a Gradle root: a `gradlew` beside a `settings.gradle`
   or `settings.gradle.kts`, holding a module with
   `src/main/AndroidManifest.xml`. It is looked for up to three directories
@@ -136,6 +139,8 @@ with nothing to run:
   project's dependencies as well as the config file. Both tools are run from
   `node_modules/.bin` and never downloaded, so a `tsconfig.json` committed
   just for an editor doesn't enable a job that would have no compiler.
+- `zig-test` needs `build.zig` to declare a `test` step (`b.step("test", ...)`);
+  without one, `zig build test` fails with "no step named 'test'".
 - `cmake-test` needs `enable_testing()` or `include(CTest)` in the root
   `CMakeLists.txt`; `cmake-fmt` needs a `.clang-format`.
 - `gitleaks` and `aur-release` are never detected. Scanning the full git
