@@ -10,17 +10,25 @@ pub(crate) const IMAGE: &str = "rust:latest";
 /// can cache: GitLab rejects cache paths outside the project directory, and
 /// the others would need an absolute path that differs per image. Moving it
 /// into the checkout makes one project-relative path work everywhere.
-const CARGO_HOME: &str = ".cargo";
+///
+/// Not `.cargo`: that is the project's own config directory, so caching it
+/// would archive a committed `.cargo/config.toml` with the downloads, and
+/// every restore — which unpacks over the fresh checkout — would put the
+/// previous run's copy back. An edit to the config would never reach CI.
+pub(crate) const CARGO_HOME: &str = ".cargo-home";
+
+/// [`CARGO_HOME`] as a cache path
+const CARGO_HOME_CACHE: &str = ".cargo-home/";
 
 fn is_rust(facts: &ProjectFacts) -> bool {
     facts.rust.is_some()
 }
 
-/// Cache `paths` under `key` and relocate CARGO_HOME, so the `.cargo/` entry
+/// Cache `paths` under `key` and relocate CARGO_HOME, so the cargo home entry
 /// among them is the directory cargo actually writes to.
 fn with_cargo_cache(job: Job, key: &str, paths: &[&str]) -> Job {
     debug_assert!(
-        paths.contains(&".cargo/"),
+        paths.contains(&CARGO_HOME_CACHE),
         "{key}: only jobs caching cargo's home need CARGO_HOME moved"
     );
     job.with_env("CARGO_HOME", CARGO_HOME)
@@ -66,7 +74,7 @@ impl Rule for RustTest {
                 .with_image(IMAGE)
                 .with_timeout(30),
             "rust-cache",
-            &["target/", ".cargo/"],
+            &["target/", CARGO_HOME_CACHE],
         )
         .with_steps(vec![
             Step::checkout(),
@@ -135,7 +143,7 @@ impl Rule for RustClippy {
                 .with_image(IMAGE)
                 .with_timeout(15),
             "rust-cache",
-            &["target/", ".cargo/"],
+            &["target/", CARGO_HOME_CACHE],
         )
         .with_steps(vec![
             Step::checkout(),
@@ -172,11 +180,11 @@ impl Rule for RustAudit {
                 .with_image(IMAGE)
                 .with_timeout(10),
             "cargo-audit-cache",
-            &[".cargo/"],
+            &[CARGO_HOME_CACHE],
         )
         .with_steps(vec![
             Step::checkout(),
-            // Lands in .cargo/bin, which cargo searches for subcommands, so
+            // Lands in .cargo-home/bin, which cargo searches for subcommands, so
             // a cache hit turns this into a no-op instead of a rebuild
             Step::run("Install cargo-audit", "cargo install cargo-audit"),
             Step::run("Run audit", "cargo audit"),
@@ -214,7 +222,7 @@ impl Rule for RustDoc {
                 .with_env("RUSTDOCFLAGS", "--cfg docsrs"),
             // Nightly artifacts don't mix with the shared stable rust-cache
             "rust-doc-cache",
-            &["target/", ".cargo/"],
+            &["target/", CARGO_HOME_CACHE],
         )
         .with_steps(vec![
             Step::checkout(),
@@ -289,7 +297,7 @@ impl Rule for RustMsrv {
                 .with_image(IMAGE)
                 .with_timeout(15),
             "rust-msrv-cache",
-            &["target/", ".cargo/"],
+            &["target/", CARGO_HOME_CACHE],
         )
         .with_steps(steps)]
     }
@@ -326,7 +334,7 @@ impl Rule for RustFeatureCombos {
                 .with_image(IMAGE)
                 .with_timeout(30),
             "rust-cache",
-            &["target/", ".cargo/"],
+            &["target/", CARGO_HOME_CACHE],
         )
         .with_steps(vec![
             Step::checkout(),
@@ -371,7 +379,7 @@ impl Rule for RustMinimalVersions {
                 .with_image(IMAGE)
                 .with_timeout(30),
             "rust-minimal-cache",
-            &["target/", ".cargo/"],
+            &["target/", CARGO_HOME_CACHE],
         )
         .with_steps(vec![
             Step::checkout(),
@@ -424,7 +432,7 @@ impl Rule for RustBuild {
                 .with_timeout(30),
             // Release artifacts don't mix with the debug-profile rust-cache
             "rust-build-cache",
-            &["target/", ".cargo/"],
+            &["target/", CARGO_HOME_CACHE],
         )
         .with_artifacts(vec!["artifacts/".to_string()])
         .with_steps(vec![
@@ -770,9 +778,9 @@ mod tests {
         rules.iter().flat_map(|r| r.jobs(&facts)).collect()
     }
 
-    /// `.cargo/` is only worth caching if cargo writes there: the official
-    /// images keep CARGO_HOME at /usr/local/cargo, so without the env the
-    /// backends archive a directory that never exists.
+    /// The cargo home is only worth caching if cargo writes there: the
+    /// official images keep CARGO_HOME at /usr/local/cargo, so without the
+    /// env the backends archive a directory that never exists.
     #[test]
     fn test_cached_cargo_home_is_the_one_cargo_uses() {
         let jobs = all_rust_jobs();
@@ -781,16 +789,37 @@ mod tests {
             let caches_cargo_home = job
                 .cache
                 .as_ref()
-                .is_some_and(|c| c.paths.iter().any(|p| p == ".cargo/"));
+                .is_some_and(|c| c.paths.iter().any(|p| p == CARGO_HOME_CACHE));
             let moves_cargo_home = job
                 .env
                 .iter()
-                .any(|(k, v)| k == "CARGO_HOME" && v == ".cargo");
+                .any(|(k, v)| k == "CARGO_HOME" && v == CARGO_HOME);
             assert_eq!(
                 caches_cargo_home, moves_cargo_home,
-                "{}: caching .cargo/ and setting CARGO_HOME must go together",
+                "{}: caching the cargo home and setting CARGO_HOME must go together",
                 job.id
             );
+        }
+    }
+
+    /// `.cargo/` holds the project's committed `config.toml`. A cache restore
+    /// unpacks over the checkout, so caching that directory would replace
+    /// the committed config with the previous run's copy on every run.
+    #[test]
+    fn test_cache_never_holds_the_project_cargo_config() {
+        for job in all_rust_jobs() {
+            for path in job.cache.iter().flat_map(|c| &c.paths) {
+                assert!(
+                    !path.trim_end_matches('/').eq(".cargo"),
+                    "{}: caches the project's .cargo/ config directory",
+                    job.id
+                );
+            }
+            for (key, value) in &job.env {
+                if key == "CARGO_HOME" {
+                    assert_ne!(value.trim_end_matches('/'), ".cargo", "{}", job.id);
+                }
+            }
         }
     }
 

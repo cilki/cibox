@@ -1,3 +1,4 @@
+use super::rust::CARGO_HOME;
 use super::Rule;
 use crate::config::android::{
     is_safe_path_component, is_valid_project_dir, is_valid_toolchain, DEFAULT_TOOLCHAIN,
@@ -167,12 +168,12 @@ impl AndroidBuild {
                      \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" \"ndk;{NDK_VERSION}\" > /dev/null"
                 ),
             ),
-            // Lands in .cargo/bin, which cargo searches for subcommands, so
+            // Lands in .cargo-home/bin, which cargo searches for subcommands, so
             // a cache hit turns the install into a no-op instead of a rebuild
             Step::run(
                 "Install cargo-ndk",
                 format!(
-                    "export CARGO_HOME=\"$PWD/.cargo\"; \
+                    "export CARGO_HOME=\"$PWD/{CARGO_HOME}\"; \
                      rustup target add {ABI_TRIPLE} && cargo install cargo-ndk"
                 ),
             ),
@@ -186,7 +187,7 @@ impl AndroidBuild {
                 format!(
                     "export ANDROID_HOME=\"$PWD/{SDK_DIR}\" \
                      ANDROID_NDK_HOME=\"$PWD/{SDK_DIR}/ndk/{NDK_VERSION}\" \
-                     CARGO_HOME=\"$PWD/.cargo\" CARGO_TARGET_DIR=\"$PWD/target\"; \
+                     CARGO_HOME=\"$PWD/{CARGO_HOME}\" CARGO_TARGET_DIR=\"$PWD/target\"; \
                      {}cargo ndk -t {ABI}{platform} -o ./{jni_dir} build --release --link-libcxx-shared",
                     Self::enter(rust_dir)
                 ),
@@ -227,7 +228,7 @@ impl Rule for AndroidBuild {
 
         let mut cache_paths = vec![format!("{SDK_DIR}/"), format!("{GRADLE_HOME}/")];
         if layout.rust_dir.is_some() {
-            cache_paths.extend([".cargo/".to_string(), "target/".to_string()]);
+            cache_paths.extend([format!("{CARGO_HOME}/"), "target/".to_string()]);
         }
 
         let artifact_dir = format!(

@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     container: rust:latest
     env:
-      CARGO_HOME: .cargo
+      CARGO_HOME: .cargo-home
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -29,7 +29,7 @@ jobs:
         key: rust-cache-run${{ github.run_id }}
         path: |-
           target/
-          .cargo/
+          .cargo-home/
         restore-keys: rust-cache-run
     - name: Run tests
       run: cargo test --all-features

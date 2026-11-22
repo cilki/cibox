@@ -2508,7 +2508,7 @@ my-job:
             doc["rust-doc"]["variables"]["RUSTDOCFLAGS"].as_str(),
             Some("--cfg docsrs")
         );
-        assert_eq!(doc["rust-test"]["variables"]["CARGO_HOME"].as_str(), Some(".cargo"));
+        assert_eq!(doc["rust-test"]["variables"]["CARGO_HOME"].as_str(), Some(".cargo-home"));
         assert!(doc["rust-test"]["variables"]["RUSTDOCFLAGS"].is_null(), "{}", content);
     }
 
@@ -3036,7 +3036,7 @@ workflows:
         assert!(doc.get("variables").is_none(), "{content}");
         assert_eq!(
             doc["rust-test"]["variables"]["CARGO_HOME"].as_str(),
-            Some(".cargo"),
+            Some(".cargo-home"),
             "{content}"
         );
     }
