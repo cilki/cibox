@@ -405,6 +405,20 @@ pub fn parse_config(ron_str: &str) -> Result<CiboxConfig> {
     let config: CiboxConfig = crate::config::ron_options()
         .from_str(ron_str)
         .map_err(|e| {
+            // Every rule id cibox prints is kebab-case, so `rust-test:` is the
+            // natural thing to write — and RON's own advice for it, the raw
+            // identifier `r#rust-test`, parses only to be rejected as an
+            // unknown field. The field it means is the snake_case spelling.
+            if let ron::Error::SuggestRawIdentifier(ident) = &e.code {
+                if ident.contains('-') {
+                    return anyhow::anyhow!(
+                        "{}: `{ident}` is not a valid cibox.ron field name; fields are \
+                         snake_case, so write `{}` instead",
+                        e.span,
+                        field_name(ident)
+                    );
+                }
+            }
             let msg = e.to_string();
             if msg.contains("`platform`") || msg.contains("`rules`") {
                 anyhow::anyhow!(
@@ -714,6 +728,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("old pipeline-list format"));
+    }
+
+    /// The kebab-case rule id cibox prints everywhere is pointed at its
+    /// snake_case field, not at the raw identifier RON would suggest, which
+    /// only fails again as an unknown field
+    #[test]
+    fn test_kebab_case_field_points_at_the_snake_case_spelling() {
+        for (doc, field) in [
+            ("(rust-test: (enabled: false))", "rust_test"),
+            ("(docker_release: (image-name: \"a/b\"))", "image_name"),
+        ] {
+            let err = parse_config(doc).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("write `{field}` instead")),
+                "{doc}: {err}"
+            );
+            assert!(!err.contains("r#"), "{doc}: {err}");
+            assert!(err.starts_with("1:"), "the position is kept: {err}");
+        }
     }
 
     #[test]
