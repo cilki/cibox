@@ -30,6 +30,14 @@ pub struct PythonFacts {
     /// enforces it too. Poetry 2 projects declare `[project] requires-python`
     /// instead, which Poetry reads first when both are present.
     pub poetry_python: Option<String>,
+    /// The minor of the CPython 3 release `.python-version` pins (`10` for
+    /// `3.10` or `3.10.12`): the interpreter the project is developed on, as
+    /// written by pyenv, `uv python pin` and `uv init`. Unlike
+    /// `requires-python` it is a preference, not a bound — but it is the only
+    /// statement of a version a requirements-only project makes, and its
+    /// pins (wheels built for that interpreter, packages since dropped from
+    /// the standard library) may not install on any other.
+    pub pinned_minor: Option<u64>,
     /// The `[project.optional-dependencies]` extra holding the test
     /// requirements (pytest plugins and the like), see [`TEST_SETS`]
     pub test_extra: Option<String>,
@@ -160,6 +168,33 @@ fn test_requirements_file(path: &Path) -> Option<String> {
         .find(|file| path.join(file).is_file())
 }
 
+/// The CPython 3 minor `.python-version` in `path` pins, see
+/// [`PythonFacts::pinned_minor`]. pyenv reads the first version listed (one
+/// per line, `#` comments allowed); one that isn't a plain `3.N[.P]` —
+/// `pypy3.10`, `system`, a virtualenv name, a pre-release — names no
+/// `python:3.N` image and is ignored.
+fn pinned_minor(path: &Path) -> Option<u64> {
+    let contents = fs::read_to_string(path.join(".python-version")).ok()?;
+    let version = contents
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .find(|line| !line.is_empty())?;
+    let mut parts = version.split('.');
+    let numeric = |part: Option<&str>| {
+        part.filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u64>().ok())
+    };
+    if numeric(parts.next())? != 3 {
+        return None;
+    }
+    let minor = numeric(parts.next())?;
+    match (parts.next(), parts.next()) {
+        (None, None) => Some(minor),
+        (patch @ Some(_), None) => numeric(patch).map(|_| minor),
+        _ => None,
+    }
+}
+
 pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
     let has_pyproject = path.join("pyproject.toml").is_file();
     let has_setup_py = path.join("setup.py").is_file();
@@ -221,6 +256,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
         publishable,
         requires_python,
         poetry_python,
+        pinned_minor: pinned_minor(path),
         test_extra,
         test_group,
         poetry_test_group,

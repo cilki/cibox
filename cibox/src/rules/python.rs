@@ -28,37 +28,39 @@ fn is_python(facts: &ProjectFacts) -> bool {
 /// a project that needs a newer Python (`>=3.13`) or hasn't caught up to it
 /// yet (`<3.12`). A Poetry project declares the same thing as its `python`
 /// dependency, and Poetry refuses to install under an interpreter outside it
-/// before it reads a single other dependency. The default stands whenever the
-/// project allows it; otherwise the nearest minor it does allow is used, the
-/// newer on a tie. A specifier this can't read, or one no image satisfies,
-/// keeps the default — pip will report it more clearly than a guess would.
+/// before it reads a single other dependency.
+///
+/// The minor aimed for is the one `.python-version` pins, else the default.
+/// It stands whenever the project allows it; otherwise the nearest minor it
+/// does allow is used, the newer on a tie. A pin no image exists for gets
+/// the nearest one that does. A specifier this can't read, or one no image
+/// satisfies, keeps the minor aimed for — pip will report it more clearly
+/// than a guess would.
 pub(crate) fn image(facts: &ProjectFacts) -> &'static str {
+    let py = facts.python.as_ref();
     // The specifier and the grammar it is written in. `[project]
     // requires-python` first: Poetry 2 itself reads it before the legacy
     // dependency when a project carries both
     type Admits = fn(&str, u64) -> Option<bool>;
     let spec: Option<(&str, Admits)> =
-        facts
-            .python
-            .as_ref()
-            .and_then(|py| match (&py.requires_python, &py.poetry_python) {
-                (Some(spec), _) => Some((spec.as_str(), allows as Admits)),
-                (None, Some(spec)) => Some((spec.as_str(), poetry_allows as Admits)),
-                (None, None) => None,
-            });
-    let minor = spec
-        .and_then(|(spec, admits)| {
-            let mut nearest: Vec<u64> = (FIRST_MINOR..FIRST_MINOR + IMAGES.len() as u64).collect();
-            nearest.sort_by_key(|&m| (m.abs_diff(DEFAULT_MINOR), std::cmp::Reverse(m)));
-            nearest
-                .into_iter()
-                .map(|m| admits(spec, m).map(|ok| ok.then_some(m)))
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .next()
-        })
-        .unwrap_or(DEFAULT_MINOR);
+        py.and_then(|py| match (&py.requires_python, &py.poetry_python) {
+            (Some(spec), _) => Some((spec.as_str(), allows as Admits)),
+            (None, Some(spec)) => Some((spec.as_str(), poetry_allows as Admits)),
+            (None, None) => None,
+        });
+    let target = py.and_then(|py| py.pinned_minor).unwrap_or(DEFAULT_MINOR);
+    let mut nearest: Vec<u64> = (FIRST_MINOR..FIRST_MINOR + IMAGES.len() as u64).collect();
+    nearest.sort_by_key(|&m| (m.abs_diff(target), std::cmp::Reverse(m)));
+    let fallback = nearest[0];
+    let minor = match spec {
+        None => fallback,
+        Some((spec, admits)) => nearest
+            .into_iter()
+            .map(|m| admits(spec, m).map(|ok| ok.then_some(m)))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|admitted| admitted.into_iter().flatten().next())
+            .unwrap_or(fallback),
+    };
     IMAGES[(minor - FIRST_MINOR) as usize]
 }
 
@@ -729,6 +731,55 @@ mod tests {
             image(&facts_with(&[("requirements.txt", "requests\n")])),
             "python:3.12"
         );
+    }
+
+    /// A requirements-only project pinned to an older interpreter by
+    /// `.python-version` can pin dependencies that don't install on 3.12
+    /// (no wheel for it, `distutils` gone); the jobs run on the pinned one
+    #[test]
+    fn test_image_follows_python_version_file() {
+        let pinned = |version: &str, pyproject: Option<&str>| {
+            let mut files = vec![
+                ("requirements.txt", "numpy==1.24.4\n"),
+                (".python-version", version),
+            ];
+            if let Some(pyproject) = pyproject {
+                files.push(("pyproject.toml", pyproject));
+            }
+            image(&facts_with(&files))
+        };
+        assert_eq!(pinned("3.10\n", None), "python:3.10");
+        assert_eq!(pinned("3.11.9\n", None), "python:3.11");
+        assert_eq!(pinned("# pyenv\n\n3.9.18\n3.12\n", None), "python:3.9");
+        assert_eq!(pinned("3.13 # newest\n", None), "python:3.13");
+        // No image for the pin: the nearest one there is
+        assert_eq!(pinned("3.7\n", None), "python:3.8");
+        assert_eq!(pinned("3.15\n", None), "python:3.14");
+        // Nothing a python:3.N image stands for: the default
+        for version in [
+            "pypy3.10\n",
+            "system\n",
+            "myenv\n",
+            "3.13t\n",
+            "3.13.0rc1\n",
+            "2.7\n",
+            "3\n",
+            "",
+        ] {
+            assert_eq!(pinned(version, None), "python:3.12", "{version:?}");
+        }
+
+        // requires-python still bounds it: the pin within the bound wins, a
+        // pin outside it gets the admitted minor nearest to it
+        const AT_LEAST_311: &str = "[project]\nname = \"p\"\nrequires-python = \">=3.11\"\n";
+        assert_eq!(pinned("3.13\n", Some(AT_LEAST_311)), "python:3.13");
+        assert_eq!(pinned("3.9\n", Some(AT_LEAST_311)), "python:3.11");
+        const POETRY: &str =
+            "[tool.poetry]\nname = \"p\"\n[tool.poetry.dependencies]\npython = \"~3.10\"\n";
+        assert_eq!(pinned("3.12\n", Some(POETRY)), "python:3.10");
+        // ...and a bound that can't be read leaves the pin in charge
+        const UNREADABLE: &str = "[project]\nname = \"p\"\nrequires-python = \"===3.10\"\n";
+        assert_eq!(pinned("3.10\n", Some(UNREADABLE)), "python:3.10");
     }
 
     #[test]
