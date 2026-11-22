@@ -9,6 +9,11 @@ pub struct RustFacts {
     pub is_workspace: bool,
     /// The root package exists and is not `publish = false`
     pub publishable: bool,
+    /// A bare `cargo publish` of the root package goes to crates.io. Not so
+    /// when `publish` lists only other registries — cargo picks a sole listed
+    /// registry by itself, and refuses to guess between several — or lists
+    /// crates.io beside others, where it wants `--registry` too.
+    pub publishes_to_crates_io: bool,
     pub package_name: Option<String>,
     /// The `rust-version` of the root package (of `[workspace.package]` for a
     /// virtual workspace), if declared and well-formed
@@ -61,12 +66,20 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
     }
 
     let package = manifest.package.as_ref();
-    let publishable = package.is_some_and(|p| match p.publish.get() {
-        Ok(cargo_toml::Publish::Flag(flag)) => *flag,
-        Ok(cargo_toml::Publish::Registry(registries)) => !registries.is_empty(),
+    let publish = package.map(|p| p.publish.get());
+    let publishable = match publish {
+        None => false,
+        Some(Ok(cargo_toml::Publish::Flag(flag))) => *flag,
+        Some(Ok(cargo_toml::Publish::Registry(registries))) => !registries.is_empty(),
         // Inherited from a workspace outside this manifest; assume publishable
-        Err(_) => true,
-    });
+        Some(Err(_)) => true,
+    };
+    let publishes_to_crates_io = match publish {
+        Some(Ok(cargo_toml::Publish::Registry(registries))) => {
+            matches!(registries.as_slice(), [only] if only == "crates-io")
+        }
+        _ => publishable,
+    };
 
     // The rust-msrv rule bakes this fact into `rustup toolchain install
     // {msrv}` and `cargo +{msrv} check`, so a manifest from a repository we
@@ -100,6 +113,7 @@ pub(super) fn gather(path: &Path) -> Option<RustFacts> {
     Some(RustFacts {
         is_workspace: manifest.workspace.is_some(),
         publishable,
+        publishes_to_crates_io,
         package_name: package.map(|p| p.name().to_string()),
         msrv,
         has_features: !manifest.features.is_empty(),
@@ -140,6 +154,34 @@ mod tests {
             facts_for("[package]\nname = \"app\"\nversion = \"0.1.0\"\npublish = false\n")
                 .unwrap();
         assert!(!facts.publishable);
+        assert!(!facts.publishes_to_crates_io);
+    }
+
+    #[test]
+    fn test_publish_registry_list_decides_crates_io() {
+        for (publish, publishable, crates_io) in [
+            // No `publish` key is crates.io
+            ("", true, true),
+            ("publish = true\n", true, true),
+            (r#"publish = ["crates-io"]"#, true, true),
+            // cargo publishes to a sole listed registry by itself, so
+            // crates.io never sees the crate
+            (r#"publish = ["my-registry"]"#, true, false),
+            // and with several it refuses to run without `--registry`
+            (r#"publish = ["crates-io", "my-registry"]"#, true, false),
+            ("publish = []\n", false, false),
+        ] {
+            let facts = facts_for(&format!(
+                "[package]\nname = \"lib\"\nversion = \"0.1.0\"\n{publish}\n"
+            ))
+            .unwrap();
+            assert_eq!(facts.publishable, publishable, "{publish}");
+            assert_eq!(facts.publishes_to_crates_io, crates_io, "{publish}");
+        }
+
+        // A virtual workspace has no package to publish
+        let facts = facts_for("[workspace]\nmembers = [\"a\"]\n").unwrap();
+        assert!(!facts.publishes_to_crates_io);
     }
 
     #[test]

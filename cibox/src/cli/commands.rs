@@ -217,6 +217,9 @@ pub fn handle_detect(dir: &str) -> Result<()> {
             if rust.is_workspace { " [workspace]" } else { "" },
         );
         println!("    publishable: {}", yes_no(rust.publishable));
+        if rust.publishable {
+            println!("    to crates.io: {}", yes_no(rust.publishes_to_crates_io));
+        }
     }
     if let Some(python) = &facts.python {
         println!("  {} Python", "✓".green());
