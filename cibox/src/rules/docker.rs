@@ -83,6 +83,14 @@ impl DockerRelease {
         self.image.starts_with("ghcr.io/")
     }
 
+    /// The account a ghcr.io image belongs to: `ghcr.io/owner/app` → `owner`
+    fn ghcr_owner(&self) -> &str {
+        let path = self.image.trim_start_matches("ghcr.io/");
+        let first = path.split('/').next().unwrap_or(path);
+        // A single-component name carries its tag on this component
+        first.split(':').next().unwrap_or(first)
+    }
+
     /// `-t` flags for the final image: `latest` plus the git tag name, which
     /// a preceding [`READ_VERSION`] leaves in `$version`. The expansion is
     /// quoted, so a hostile tag name stays a single argument for docker to
@@ -107,10 +115,19 @@ impl DockerRelease {
     /// configured — a registry may not require any (e.g. a local private
     /// one). GitHub interpolates missing secrets as empty strings while the
     /// other platforms leave the variables unset, so test with `${VAR:-}`.
+    ///
+    /// For ghcr.io the user name is `GITHUB_ACTOR`, which only GitHub and
+    /// Gitea runners provide. GitLab and CircleCI leave it unset, and
+    /// `docker login --password-stdin` refuses an empty `-u` outright, so a
+    /// release with a configured GITHUB_TOKEN would still fail there: the
+    /// image's owner, the account the token has to be able to push for
+    /// anyway, stands in.
     fn login_command(&self) -> String {
         if self.uses_ghcr() {
-            "if [ -n \"${GITHUB_TOKEN:-}\" ]; then echo \"$GITHUB_TOKEN\" | docker login ghcr.io -u \"$GITHUB_ACTOR\" --password-stdin; else echo \"GITHUB_TOKEN not set; skipping docker login\"; fi"
-                .to_string()
+            format!(
+                "if [ -n \"${{GITHUB_TOKEN:-}}\" ]; then echo \"$GITHUB_TOKEN\" | docker login ghcr.io -u \"${{GITHUB_ACTOR:-{owner}}}\" --password-stdin; else echo \"GITHUB_TOKEN not set; skipping docker login\"; fi",
+                owner = self.ghcr_owner()
+            )
         } else {
             // Non-default registries need their host on the login command,
             // or the credentials would go to Docker Hub
@@ -140,7 +157,8 @@ impl DockerRelease {
     /// without the password being invited to follow it there.
     fn variables(&self) -> Vec<String> {
         if self.uses_ghcr() {
-            // GITHUB_ACTOR is runner-provided; nothing to declare
+            // The user name is GITHUB_ACTOR where the runner provides it and
+            // the image's owner elsewhere; nothing to declare
             Vec::new()
         } else {
             vec!["DOCKER_USERNAME".to_string()]
@@ -607,16 +625,38 @@ mod tests {
         };
         let job = &rule.jobs(&docker_facts())[0];
         assert_eq!(job.secrets, vec!["GITHUB_TOKEN"]);
-        // GITHUB_ACTOR comes from the runner, so there is nothing to declare
+        // The user name needs no declaring: see below
         assert!(job.variables.is_empty());
         let login = run_command(job, "Login to registry");
         assert!(login.contains("docker login ghcr.io"));
         assert!(login.starts_with("if [ -n \"${GITHUB_TOKEN:-}\" ]; then"));
+        // GitLab and CircleCI have no GITHUB_ACTOR, and docker refuses an
+        // empty `-u` with --password-stdin, so the image's owner stands in
+        assert!(
+            login.contains("-u \"${GITHUB_ACTOR:-owner}\" --password-stdin"),
+            "{login}"
+        );
         // The default token can't push packages without this scope
         assert_eq!(
             job.permissions,
             vec![("packages".to_string(), "write".to_string())]
         );
+    }
+
+    #[test]
+    fn test_ghcr_owner_ignores_nesting_and_tags() {
+        let owner = |image: &str| {
+            DockerRelease {
+                image: image.to_string(),
+                platforms: vec![],
+                sync_readme: false,
+            }
+            .ghcr_owner()
+            .to_string()
+        };
+        assert_eq!(owner("ghcr.io/owner/app"), "owner");
+        assert_eq!(owner("ghcr.io/owner/group/app:edge"), "owner");
+        assert_eq!(owner("ghcr.io/app:edge"), "app");
     }
 
     #[test]

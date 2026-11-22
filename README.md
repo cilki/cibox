@@ -168,7 +168,10 @@ The registry is inferred from the image name. `docker-release` logs in to
 `ghcr.io` with `GITHUB_TOKEN`, and everywhere else — the host prefix if the name
 has one, Docker Hub otherwise — with the `DOCKER_USERNAME` and `DOCKER_PASSWORD`
 secrets. If the credentials aren't configured in CI, the login is skipped, for
-registries that don't require any.
+registries that don't require any. The `ghcr.io` user name is the runner's
+`GITHUB_ACTOR` on GitHub and Gitea; GitLab and CircleCI have none, so there it
+is the image's owner (`example` for `ghcr.io/example/app`), and `GITHUB_TOKEN`
+is a personal access token you add as a project CI variable.
 
 `sync_readme` additionally pushes `README.md` to the Docker Hub repository
 description once the image is released, reusing the same two secrets. It is
