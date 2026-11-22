@@ -280,7 +280,7 @@ When the Gradle root's parent directory holds a Rust crate with
 writes the JNI libraries into the app module's `src/main/jniLibs` before Gradle
 packages them. That variant also downloads the NDK (the Gradle plugin brings
 its own, `cargo-ndk` doesn't) and runs on a rust image instead of
-`fossable/cibox`, caching `.cargo/` and `target/` as well. Only `arm64-v8a` is
+`fossable/cibox`, caching `.cargo-home/` and `target/` as well. Only `arm64-v8a` is
 built, since the APK is a build canary rather than a shipped artifact, and
 `minSdk` from the app module's `build.gradle(.kts)` becomes cargo-ndk's
 `--platform`.
