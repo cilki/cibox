@@ -75,6 +75,17 @@ impl Changes {
         self.0 = true;
     }
 
+    fn insert_item(&mut self, seq: &yaml_edit::Sequence, index: usize, value: impl AsYaml) {
+        seq.insert(index, value);
+        self.0 = true;
+    }
+
+    fn remove_item(&mut self, seq: &yaml_edit::Sequence, index: usize) {
+        if seq.remove(index).is_some() {
+            self.0 = true;
+        }
+    }
+
     /// Removing a key the mapping doesn't have changes nothing, and must not
     /// count as an edit
     fn remove(&mut self, map: &Mapping, key: impl AsYaml) {
@@ -976,6 +987,15 @@ enum StagesEdit {
     /// Leave it as the user wrote it
     Leave,
     Remove,
+    /// Edit the declared list in place: drop the entries at `drop` (indices
+    /// into the list as declared), then insert each of `insert` at its index
+    /// in the final list. In place, not replaced wholesale, so the list
+    /// keeps the user's flow or block style, item indentation and comments.
+    Edit {
+        drop: Vec<usize>,
+        insert: Vec<(usize, String)>,
+    },
+    /// There is no list to edit: write this one
     Set(Vec<Value>),
 }
 
@@ -1054,15 +1074,17 @@ fn merge_gitlab(
     // any parsed job, but the canonical stages cover it: it stays where the
     // user declared it rather than being pruned and re-inserted elsewhere,
     // which would reorder it against the user's own stages
-    let mut stages: Vec<Value> = existing_stages
-        .iter()
-        .filter(|s| {
-            !prune
-                || canonical_stages.contains(s)
-                || s.as_str().is_some_and(|s| referenced.contains(&s))
-        })
-        .cloned()
+    let keep = |s: &Value| {
+        !prune
+            || canonical_stages.contains(s)
+            || s.as_str().is_some_and(|s| referenced.contains(&s))
+    };
+    let drop: Vec<usize> = (0..existing_stages.len())
+        .filter(|&i| !keep(&existing_stages[i]))
         .collect();
+    let mut stages: Vec<Value> = existing_stages.iter().filter(|s| keep(s)).cloned().collect();
+    // Which of `stages` cibox inserts, as opposed to keeping from the list
+    let mut inserted: Vec<bool> = vec![false; stages.len()];
     // GitLab runs stages in the order they are declared, so a stage cibox
     // adds goes before the first declared one that canonically follows it.
     // Appended instead, re-enabling `rust-audit` would put `security` after
@@ -1084,15 +1106,27 @@ fn merge_gitlab(
                 .position(|s| rank(s).is_some_and(|r| Some(r) > at))
                 .unwrap_or(stages.len());
             stages.insert(pos, stage.clone());
+            inserted.insert(pos, true);
         }
     }
+    let declared = get(current_map, "stages");
     let stages = match &stages[..] {
         // An empty list is no list: GitLab rejects `stages: []`
-        [] => match get(current_map, "stages").is_some() {
+        [] => match declared.is_some() {
             true => StagesEdit::Remove,
             false => StagesEdit::Leave,
         },
         _ if stages == existing_stages => StagesEdit::Leave,
+        _ if declared.is_some_and(Value::is_sequence) => StagesEdit::Edit {
+            drop,
+            insert: stages
+                .iter()
+                .zip(&inserted)
+                .enumerate()
+                .filter(|(_, (_, new))| **new)
+                .filter_map(|(at, (stage, _))| Some((at, stage.as_str()?.to_string())))
+                .collect(),
+        },
         _ => StagesEdit::Set(stages),
     };
 
@@ -1128,6 +1162,17 @@ fn merge_gitlab(
             match stages {
                 StagesEdit::Leave => {}
                 StagesEdit::Remove => changes.remove(root, "stages"),
+                StagesEdit::Edit { drop, insert } => {
+                    let seq = root
+                        .get_sequence("stages")
+                        .context("`stages` parsed as a list but has no list node")?;
+                    for &at in drop.iter().rev() {
+                        changes.remove_item(&seq, at);
+                    }
+                    for (at, stage) in &insert {
+                        changes.insert_item(&seq, *at, stage.as_str());
+                    }
+                }
                 StagesEdit::Set(stages) => {
                     let (_doc, node) = fragment("stages", &Value::Sequence(stages))?;
                     changes.set(root, "stages", node);
@@ -2480,6 +2525,59 @@ my-job:
         assert_eq!(&stages[..2], ["test", "custom"], "{content}");
         let ours: Vec<&str> = stages.iter().copied().filter(|s| *s != "custom").collect();
         assert_eq!(ours, canonical, "{content}");
+    }
+
+    /// Adding and pruning stages edits the declared list in place. Replaced
+    /// wholesale, a list written the way cibox renders it (`- test` at the
+    /// key's column) came back re-indented, a flow list turned into a block
+    /// one, and comments on the user's own stages were lost.
+    #[test]
+    fn test_gitlab_stages_edit_keeps_the_list_style() {
+        let facts = full_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = planned_file(Platform::GitLab, &resolved, 0);
+        let filter = no_selection(&resolved);
+        let canonical = render_file(Platform::GitLab, &file).unwrap();
+        let declared = |content: &str| -> Vec<String> {
+            let doc: Value = serde_yaml::from_str(content).unwrap();
+            doc["stages"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        };
+        let want = declared(&canonical);
+
+        // A stage nothing references anymore goes, a missing one comes back,
+        // and the user's stage keeps its comment
+        let block = canonical
+            .replacen("stages:\n", "stages:\n- gone\n", 1)
+            .replacen("- test\n", "", 1)
+            .replacen("- deploy\n", "- deploy\n- e2e # mine\n", 1)
+            + "e2e-job:\n  stage: e2e\n  script: [echo mine]\n";
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, &block).unwrap());
+        let mut expected = want.clone();
+        expected.push("e2e".to_string());
+        assert_eq!(declared(&content), expected, "{content}");
+        let list: String = expected
+            .iter()
+            .map(|s| match s.as_str() {
+                "e2e" => "- e2e # mine\n".to_string(),
+                s => format!("- {s}\n"),
+            })
+            .collect();
+        assert!(content.contains(&format!("stages:\n{list}")), "{content}");
+
+        let flow = "stages: [gone, custom]\n\
+                    my-job:\n  stage: custom\n  script: [echo mine]\n";
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, flow).unwrap());
+        let line = content.lines().find(|l| l.starts_with("stages:")).unwrap();
+        assert!(line.starts_with("stages: [custom, "), "{content}");
+        assert!(line.ends_with(']'), "{content}");
+        let mut expected = vec!["custom".to_string()];
+        expected.extend(want);
+        assert_eq!(declared(&content), expected, "{content}");
     }
 
     #[test]
