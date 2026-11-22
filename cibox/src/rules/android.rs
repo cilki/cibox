@@ -118,6 +118,10 @@ impl AndroidBuild {
         // the `cmdline-tools/latest/` layout to agree with its own path.
         // Accepting the licenses up front is what lets AGP download the
         // platform and build-tools the project asks for on its own.
+        // sdkmanager stops reading once every license is accepted, so `yes`
+        // dies of SIGPIPE (141); GitLab and CircleCI run steps under
+        // `pipefail`, where that alone would fail the job. `|| true` swallows
+        // only `yes`'s status — sdkmanager's still decides the step.
         steps.push(Step::run(
             "Install Android SDK",
             format!(
@@ -129,7 +133,7 @@ impl AndroidBuild {
                  unzip -q /tmp/cmdline-tools.zip -d \"$ANDROID_HOME/cmdline-tools\" && \
                  mv \"$ANDROID_HOME/cmdline-tools/cmdline-tools\" \"$ANDROID_HOME/cmdline-tools/latest\"; \
                  fi; \
-                 yes | \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --licenses > /dev/null"
+                 (yes || true) | \"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager\" --licenses > /dev/null"
             ),
         ));
 
@@ -249,5 +253,61 @@ impl Rule for AndroidBuild {
             .with_cache("android-build-cache", cache_paths)
             .with_artifacts(vec![artifact_dir])
             .with_steps(self.steps(&layout))]
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    fn sdk_step_command() -> String {
+        let rule = AndroidBuild {
+            dir: None,
+            apt_packages: Vec::new(),
+            rust_toolchain: None,
+        };
+        rule.jobs(&ProjectFacts::default())[0]
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Run { name, command } if name == "Install Android SDK" => {
+                    Some(command.clone())
+                }
+                _ => None,
+            })
+            .expect("android-build has an SDK install step")
+    }
+
+    /// Run the SDK step the way GitLab and CircleCI do (`bash -eo
+    /// pipefail`), against a cached SDK whose sdkmanager is `script`
+    fn run_sdk_step(script: &str) -> std::process::ExitStatus {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(SDK_DIR).join("cmdline-tools/latest/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let sdkmanager = bin.join("sdkmanager");
+        fs::write(&sdkmanager, script).unwrap();
+        fs::set_permissions(&sdkmanager, fs::Permissions::from_mode(0o755)).unwrap();
+        Command::new("bash")
+            .args(["-eo", "pipefail", "-c", &sdk_step_command()])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+    }
+
+    /// sdkmanager stops reading once the licenses are accepted, which kills
+    /// `yes` with SIGPIPE; under pipefail that must not fail the step
+    #[test]
+    fn test_accepting_licenses_survives_pipefail() {
+        let status = run_sdk_step("#!/bin/sh\nhead -n 3 > /dev/null\n");
+        assert!(status.success(), "SDK step failed under pipefail: {status}");
+    }
+
+    #[test]
+    fn test_sdkmanager_failure_still_fails_the_step() {
+        let status = run_sdk_step("#!/bin/sh\nhead -n 3 > /dev/null\nexit 3\n");
+        assert!(!status.success());
     }
 }
