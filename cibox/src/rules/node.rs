@@ -3,12 +3,13 @@ use crate::detection::{NodeFacts, NodePackageManager, ProjectFacts};
 use crate::ir::{Job, Stage, Step};
 
 /// The `node:N` images to choose from, oldest first
-const IMAGES: [(u64, &str); 5] = [
+const IMAGES: [(u64, &str); 6] = [
     (16, "node:16"),
     (18, "node:18"),
     (20, "node:20"),
     (22, "node:22"),
     (24, "node:24"),
+    (26, "node:26"),
 ];
 /// The major used whenever the project doesn't rule it out
 const DEFAULT_MAJOR: u64 = 22;
@@ -198,6 +199,19 @@ fn desugar(op: &str, p: &[u64]) -> Option<Vec<(&'static str, Version)>> {
     })
 }
 
+/// Put the project's yarn or pnpm on the PATH through corepack.
+///
+/// Node stopped distributing corepack with 25, so the `node:26` image has
+/// neither it nor the yarn the older images ship. Installed only where it's
+/// missing, so the images up to `node:24` keep the corepack they come with
+/// — a `versions` matrix can span both.
+fn enable_corepack() -> Step {
+    Step::run(
+        "Enable corepack",
+        "command -v corepack >/dev/null || npm install -g corepack; corepack enable",
+    )
+}
+
 fn install_steps(n: &NodeFacts) -> Vec<Step> {
     match n.package_manager {
         NodePackageManager::Npm => vec![Step::run(
@@ -209,7 +223,7 @@ fn install_steps(n: &NodeFacts) -> Vec<Step> {
             },
         )],
         NodePackageManager::Yarn => vec![
-            Step::run("Enable corepack", "corepack enable"),
+            enable_corepack(),
             Step::run(
                 "Install dependencies",
                 if n.yarn_berry {
@@ -221,7 +235,7 @@ fn install_steps(n: &NodeFacts) -> Vec<Step> {
             ),
         ],
         NodePackageManager::Pnpm => vec![
-            Step::run("Enable corepack", "corepack enable"),
+            enable_corepack(),
             Step::run(
                 "Install dependencies",
                 "pnpm install --frozen-lockfile --store-dir .pnpm-store",
@@ -707,6 +721,10 @@ mod tests {
         // Needs a newer one: the oldest it allows
         assert_eq!(image_for(">=24"), "node:24");
         assert_eq!(image_for(">22"), "node:24");
+        // Beyond node:24, including the odd line no image is kept for
+        assert_eq!(image_for(">=25"), "node:26");
+        assert_eq!(image_for("^26"), "node:26");
+        assert_eq!(image_for(">24"), "node:26");
         // `>22.0.0` still admits later 22.x releases
         assert_eq!(image_for(">22.0.0"), "node:22");
         // Equidistant from the default: the newer one
@@ -938,13 +956,32 @@ mod tests {
         assert_eq!(keys, vec!["YARN_CACHE_FOLDER"]);
     }
 
+    /// pnpm and yarn come from corepack, which Node stopped shipping with 25:
+    /// the step installs it where the image lacks it before enabling it
     #[test]
-    fn test_pnpm_enables_corepack() {
-        let facts = facts_with(&[("package.json", "{}"), ("pnpm-lock.yaml", "")]);
+    fn test_pnpm_and_yarn_enable_corepack() {
+        for lockfile in ["pnpm-lock.yaml", "yarn.lock"] {
+            let facts = facts_with(&[("package.json", "{}"), (lockfile, "")]);
+            let jobs = NodeLint.jobs(&facts);
+            let commands: Vec<&str> = jobs[0]
+                .steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Run { command, .. } => Some(command.as_str()),
+                    Step::Checkout { .. } => None,
+                })
+                .collect();
+            assert_eq!(
+                commands[0],
+                "command -v corepack >/dev/null || npm install -g corepack; corepack enable",
+                "{lockfile}"
+            );
+        }
+        let facts = facts_with(&[("package.json", "{}"), ("package-lock.json", "")]);
         let jobs = NodeLint.jobs(&facts);
-        assert!(jobs[0].steps.iter().any(|s| matches!(
+        assert!(!jobs[0].steps.iter().any(|s| matches!(
             s,
-            Step::Run { command, .. } if command == "corepack enable"
+            Step::Run { command, .. } if command.contains("corepack")
         )));
     }
 
