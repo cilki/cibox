@@ -1047,9 +1047,20 @@ fn merge_gitlab(
     // there is no telling which of the declared stages they land in. Keep
     // the list as it is and only append what cibox's own jobs need.
     let prune = get(current_map, "include").is_none();
+    let canonical_stages: &[Value] = get(canonical_map, "stages")
+        .and_then(Value::as_sequence)
+        .map_or(&[], Vec::as_slice);
+    // A stage only a commented-out managed job lands in is not referenced by
+    // any parsed job, but the canonical stages cover it: it stays where the
+    // user declared it rather than being pruned and re-inserted elsewhere,
+    // which would reorder it against the user's own stages
     let mut stages: Vec<Value> = existing_stages
         .iter()
-        .filter(|s| !prune || s.as_str().is_some_and(|s| referenced.contains(&s)))
+        .filter(|s| {
+            !prune
+                || canonical_stages.contains(s)
+                || s.as_str().is_some_and(|s| referenced.contains(&s))
+        })
         .cloned()
         .collect();
     // GitLab runs stages in the order they are declared, so a stage cibox
@@ -1060,9 +1071,6 @@ fn merge_gitlab(
     // Ranked by cibox's whole stage order, not just the stages this file's
     // jobs use: a `deploy` the user declared for jobs of their own still
     // runs last when no cibox job of this pipeline is in it.
-    let canonical_stages: &[Value] = get(canonical_map, "stages")
-        .and_then(Value::as_sequence)
-        .map_or(&[], Vec::as_slice);
     let rank = |stage: &Value| {
         Stage::ALL
             .iter()
@@ -2598,6 +2606,43 @@ my-job:
             merge_file(Platform::GitLab, &file, &filter, &content).unwrap(),
             MergeOutcome::Unchanged
         ));
+    }
+
+    #[test]
+    fn test_gitlab_commented_job_stage_keeps_its_place_among_the_users() {
+        let facts = cargo_facts();
+        let resolved = resolve(&facts, &CiboxConfig::default());
+        let file = plan(&facts, &resolved, Platform::GitLab).unwrap().swap_remove(0);
+        let filter = no_selection(&resolved);
+
+        // The user runs their own stage after cibox's `deploy`, whose only
+        // job they commented out
+        let canonical = render_file(Platform::GitLab, &file).unwrap();
+        assert!(canonical.contains("- deploy\n"), "fixture rot: {canonical}");
+        let existing = comment_out_job(&canonical, "rust-release")
+            .replacen("- deploy\n", "- deploy\n- notify\n", 1)
+            + "my-job:\n  stage: notify\n  script: [echo mine]\n";
+
+        let (content, _) = merged(merge_file(Platform::GitLab, &file, &filter, &existing).unwrap());
+        // Moving `deploy` after `notify` would run the release after the
+        // user's job meant to follow it
+        let doc: Value = serde_yaml::from_str(&content).unwrap();
+        let stages: Vec<&str> = doc["stages"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(&stages[stages.len() - 2..], ["deploy", "notify"], "{content}");
+        // ...and the list is left exactly as the user wrote it
+        let declared = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|l| *l != "stages:")
+                .take_while(|l| *l == "stages:" || l.starts_with("- "))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(declared(&content), declared(&existing), "{content}");
     }
 
     #[test]
