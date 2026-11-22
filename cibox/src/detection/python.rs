@@ -16,8 +16,10 @@ pub struct PythonFacts {
     /// not one — there `pip install .` builds an empty `UNKNOWN-0.0.0`
     /// distribution and installs none of the project's dependencies.
     pub installable: bool,
-    /// pyproject.toml declares a `[project]` with a name, so the package can
-    /// be built and uploaded to PyPI
+    /// pyproject.toml names the package, so it can be built and uploaded to
+    /// PyPI: in `[project]`, or in `[tool.poetry]` when poetry-core is the
+    /// build backend (Poetry before 2.0). Poetry's `package-mode = false`
+    /// opts out.
     pub publishable: bool,
     /// `[project] requires-python` from pyproject.toml, verbatim: the
     /// interpreter versions pip will agree to install the project on
@@ -216,13 +218,24 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
     // file that exists at all.
     let unparsed_pyproject = has_pyproject && pyproject.is_none();
 
-    let publishable = pyproject
-        .as_ref()
-        .and_then(|table| {
-            let project = table.get("project")?.as_table()?;
-            Some(project.contains_key("name"))
-        })
-        .unwrap_or(false);
+    let poetry = pyproject.as_ref().and_then(|table| table.get("tool")?.get("poetry"));
+    let publishable = pyproject.as_ref().is_some_and(|table| {
+        let named = |section: Option<&toml::Value>| section.is_some_and(|s| s.get("name").is_some());
+        // `package-mode = false` is Poetry's switch for a project that only
+        // uses it to manage dependencies: there is no package to upload
+        let package_mode = poetry
+            .and_then(|poetry| poetry.get("package-mode")?.as_bool())
+            .unwrap_or(true);
+        // Poetry before 2.0 keeps the metadata in `[tool.poetry]` rather
+        // than `[project]`. poetry-core reads it from there, so `python -m
+        // build` builds the distribution all the same — but only with
+        // poetry-core as the backend: pip's setuptools fallback ignores it.
+        let poetry_core = table
+            .get("build-system")
+            .and_then(|b| b.get("build-backend")?.as_str())
+            .is_some_and(|backend| backend.starts_with("poetry.core"));
+        package_mode && (named(table.get("project")) || (poetry_core && named(poetry)))
+    });
 
     let requires_python = pyproject
         .as_ref()
@@ -235,7 +248,6 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
             .and_then(|table| table.get("project")?.get("optional-dependencies")),
     );
     let test_group = test_set(pyproject.as_ref().and_then(|table| table.get("dependency-groups")));
-    let poetry = pyproject.as_ref().and_then(|table| table.get("tool")?.get("poetry"));
     let poetry_python = poetry
         .and_then(|poetry| poetry.get("dependencies")?.get("python")?.as_str())
         .map(str::to_string);
@@ -316,12 +328,51 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("pyproject.toml"),
-            "[build-system]\nrequires = [\"poetry-core\"]\n[tool.poetry]\nname = \"p\"\n",
+            "[build-system]\nrequires = [\"setuptools\"]\n",
         )
         .unwrap();
         let facts = gather(dir.path()).unwrap();
         assert!(facts.installable);
-        assert!(!facts.publishable, "no [project] to publish from");
+        assert!(!facts.publishable, "nothing names a package to publish");
+    }
+
+    const POETRY_CORE: &str =
+        "[build-system]\nrequires = [\"poetry-core\"]\nbuild-backend = \"poetry.core.masonry.api\"\n";
+
+    #[test]
+    fn test_poetry_1_package_is_publishable() {
+        // poetry-core builds from `[tool.poetry]` metadata, so `python -m
+        // build` produces a real distribution without any `[project]`
+        let facts = pyproject_facts(&format!(
+            "{POETRY_CORE}[tool.poetry]\nname = \"p\"\nversion = \"0.1.0\"\n"
+        ));
+        assert!(facts.installable);
+        assert!(facts.publishable);
+    }
+
+    #[test]
+    fn test_poetry_metadata_needs_the_poetry_backend_to_publish() {
+        // Without poetry-core pip falls back to setuptools, which ignores
+        // `[tool.poetry]` and builds a 0.0.0 distribution with no dependencies
+        let facts = pyproject_facts("[tool.poetry]\nname = \"p\"\nversion = \"0.1.0\"\n");
+        assert!(!facts.publishable);
+        let facts = pyproject_facts(
+            "[build-system]\nrequires = [\"setuptools\"]\n\
+             [tool.poetry]\nname = \"p\"\nversion = \"0.1.0\"\n",
+        );
+        assert!(!facts.publishable);
+    }
+
+    #[test]
+    fn test_poetry_package_mode_false_is_not_publishable() {
+        let facts = pyproject_facts(&format!(
+            "{POETRY_CORE}[tool.poetry]\nname = \"p\"\npackage-mode = false\n"
+        ));
+        assert!(!facts.publishable);
+        let facts = pyproject_facts(&format!(
+            "{POETRY_CORE}[project]\nname = \"p\"\n[tool.poetry]\npackage-mode = false\n"
+        ));
+        assert!(!facts.publishable);
     }
 
     #[test]
