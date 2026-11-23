@@ -114,3 +114,36 @@ fn test_closed_stdout_ends_the_process_without_a_panic() {
         output.status
     );
 }
+
+/// No cibox.ron is needed until the user wants to override something, and
+/// `update` already runs on the detected defaults without one. `validate`
+/// used to fail there with "Failed to read config file: cibox.ron", which
+/// made a project with nothing to configure look broken. It has to report
+/// the defaults it resolved instead, while a file named explicitly on the
+/// command line still has to exist.
+#[test]
+fn test_validate_without_cibox_ron_resolves_the_detected_defaults() {
+    let dir = project();
+    let output = Command::new(env!("CARGO_BIN_EXE_cibox"))
+        .current_dir(dir.path())
+        .arg("validate")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(stdout.contains("using detected defaults"), "{stdout}");
+    assert!(!stdout.contains("Configuration is valid"), "{stdout}");
+    assert!(stdout.contains("rust-test"), "{stdout}");
+    assert!(!dir.path().join("cibox.ron").exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cibox"))
+        .current_dir(dir.path())
+        .args(["validate", "other.ron"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("other.ron"),
+        "{output:?}"
+    );
+}
