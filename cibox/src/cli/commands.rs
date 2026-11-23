@@ -291,7 +291,7 @@ pub fn handle_detect(dir: &str) -> Result<()> {
     println!();
     println!("{}", "Rules:".cyan().bold());
     let config = load_config(&working_dir.join("cibox.ron")).unwrap_or_else(|e| {
-        eprintln!("Warning: ignoring unparseable cibox.ron: {e:#}");
+        eprintln!("Warning: ignoring cibox.ron: {e:#}");
         None
     });
     print_rule_table(&resolve(&facts, &config.unwrap_or_default()));
