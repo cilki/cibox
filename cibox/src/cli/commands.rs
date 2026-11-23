@@ -56,6 +56,27 @@ fn config_file(working_dir: &Path, config_path: &str) -> PathBuf {
 
 const DEFAULT_CONFIG: &str = "cibox.ron";
 
+/// The overrides a command applies, `None` when there are none to read.
+///
+/// A missing file at the default path is fine — no cibox.ron is needed
+/// until the user wants to change something, and detection supplies
+/// everything until then — so it is noted and read as no overrides. An
+/// explicitly named missing file is a mistake, and an error.
+fn config_or_defaults(working_dir: &Path, config_path: &str) -> Result<Option<CiboxConfig>> {
+    match load_config(&config_file(working_dir, config_path))? {
+        Some(config) => Ok(Some(config)),
+        None if config_path == DEFAULT_CONFIG => {
+            println!(
+                "{} no {} — using detected defaults",
+                "Note:".cyan().bold(),
+                config_path
+            );
+            Ok(None)
+        }
+        None => anyhow::bail!("Failed to read config file: {config_path}"),
+    }
+}
+
 /// Handle the update command
 pub fn handle_update(
     config_path: &str,
@@ -65,20 +86,7 @@ pub fn handle_update(
 ) -> Result<()> {
     let working_dir = repository_root(".");
     let facts = gather_facts(&working_dir);
-    // A missing file at the default path is fine — detection supplies
-    // everything; an explicitly named missing file is an error
-    let config = match load_config(&config_file(&working_dir, config_path))? {
-        Some(config) => config,
-        None if config_path == DEFAULT_CONFIG => {
-            println!(
-                "{} no {} — using detected defaults",
-                "Note:".cyan().bold(),
-                config_path
-            );
-            CiboxConfig::default()
-        }
-        None => anyhow::bail!("Failed to read config file: {config_path}"),
-    };
+    let config = config_or_defaults(&working_dir, config_path)?.unwrap_or_default();
     let (platforms, _) = target_platforms(&facts, requested);
     let resolved = resolve(&facts, &config);
 
@@ -181,10 +189,11 @@ pub fn handle_validate(config_path: &str) -> Result<()> {
     println!("{} {}", "Validating".cyan().bold(), config_path);
 
     let working_dir = repository_root(".");
-    let config = load_config(&config_file(&working_dir, config_path))?
-        .with_context(|| format!("Failed to read config file: {config_path}"))?;
-
-    println!("\n{}", "Configuration is valid!".green().bold());
+    let config = config_or_defaults(&working_dir, config_path)?;
+    if config.is_some() {
+        println!("\n{}", "Configuration is valid!".green().bold());
+    }
+    let config = config.unwrap_or_default();
 
     let facts = gather_facts(&working_dir);
     let (platforms, source) = target_platforms(&facts, &[]);
