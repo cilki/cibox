@@ -156,7 +156,9 @@ argument to `docker build -t`: lowercase alphanumerics separated by `.`, `-` or
 `_`, optionally prefixed with a registry host and suffixed with a `:tag`.
 Anything else is rejected by `cibox validate`. The default is derived from the
 git remote (or the directory name) and normalized to fit, so a `Fossable/CiBox`
-remote becomes `fossable/cibox`.
+remote becomes `fossable/cibox`. The derived name is pushed to Docker Hub, which
+only has `namespace/repository`, so a GitLab subgroup remote like
+`group/subgroup/app` becomes `group/app`; set `image_name` to push elsewhere.
 
 `docker-release` pushes the image under two tags of its own: `latest` and the
 name of the git tag that triggered the release. An `image_name` that already
