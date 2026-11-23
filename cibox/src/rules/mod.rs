@@ -122,14 +122,32 @@ pub(crate) fn with_versions(
 /// malformed knob outright; anything that still gets this far is sanitized
 /// rather than pasted into a command.
 pub fn docker_image(facts: &ProjectFacts, config: &CiboxConfig) -> String {
-    let raw = config
+    let configured = config
         .docker_build
         .image_name
         .as_deref()
-        .or(config.docker_release.image_name.as_deref())
-        .or(facts.repo_slug.as_deref())
-        .unwrap_or(&facts.dir_name);
-    crate::config::image::coerce_reference(raw)
+        .or(config.docker_release.image_name.as_deref());
+    let derived = || {
+        facts
+            .repo_slug
+            .as_deref()
+            .map(docker_hub_path)
+            .unwrap_or_else(|| facts.dir_name.clone())
+    };
+    let raw = configured.map(str::to_string).unwrap_or_else(derived);
+    crate::config::image::coerce_reference(&raw)
+}
+
+/// The Docker Hub repository a remote slug maps to. A derived name carries
+/// no registry host, so it is pushed to Docker Hub — and Docker Hub only has
+/// `namespace/repository`: `docker push group/subgroup/project` is refused
+/// however the credentials are set up. A nested GitLab path keeps its
+/// top-level group as the namespace and its project as the repository.
+fn docker_hub_path(slug: &str) -> String {
+    match (slug.split_once('/'), slug.rsplit_once('/')) {
+        (Some((namespace, _)), Some((_, repository))) => format!("{namespace}/{repository}"),
+        _ => slug.to_string(),
+    }
 }
 
 /// The AUR package names the aur-release rule publishes, in effect for this
@@ -571,9 +589,10 @@ mod tests {
         );
     }
 
-    /// A GitLab subgroup project's path is its whole namespace chain, and
-    /// that is also the image path its registry serves. The AUR has no
-    /// namespaces, so only the last component names the package.
+    /// A GitLab subgroup project's path is its whole namespace chain, but the
+    /// derived image is pushed to Docker Hub, which only has
+    /// `namespace/repository` — the subgroups drop out. The AUR has no
+    /// namespaces at all, so only the last component names the package.
     #[test]
     fn test_nested_remote_path_drives_the_derived_names() {
         let dir = tempdir().unwrap();
@@ -587,11 +606,21 @@ mod tests {
         let facts = crate::detection::gather_facts(dir.path());
 
         let config = CiboxConfig::default();
-        assert_eq!(docker_image(&facts, &config), "acme/platform/api");
+        assert_eq!(docker_image(&facts, &config), "acme/api");
         assert!(docker_commands(&facts, &config)
             .iter()
-            .any(|c| c == "docker build -t acme/platform/api ."));
+            .any(|c| c == "docker build -t acme/api ."));
         assert_eq!(aur_packages(&facts, &config), vec!["api"]);
+
+        // A configured name is the user's choice of registry and path, so a
+        // nested one is kept as written
+        let mut config = CiboxConfig::default();
+        config.docker_release.image_name =
+            Some("registry.gitlab.com/acme/platform/api".to_string());
+        assert_eq!(
+            docker_image(&facts, &config),
+            "registry.gitlab.com/acme/platform/api"
+        );
     }
 
     #[test]
