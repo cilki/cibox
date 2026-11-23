@@ -16,10 +16,12 @@ pub struct PythonFacts {
     /// not one — there `pip install .` builds an empty `UNKNOWN-0.0.0`
     /// distribution and installs none of the project's dependencies.
     pub installable: bool,
-    /// pyproject.toml names the package, so it can be built and uploaded to
-    /// PyPI: in `[project]`, or in `[tool.poetry]` when poetry-core is the
-    /// build backend (Poetry before 2.0). Poetry's `package-mode = false`
-    /// opts out.
+    /// pyproject.toml names a package, so it can be built and uploaded to
+    /// PyPI: in `[project]` alongside a `[build-system]`, or in
+    /// `[tool.poetry]` when poetry-core is the build backend (Poetry before
+    /// 2.0). uv's `tool.uv.package` and PDM's `tool.pdm.distribution`
+    /// override the `[build-system]` test either way. Poetry's
+    /// `package-mode = false` and a `Private ::` classifier opt out.
     pub publishable: bool,
     /// `[project] requires-python` from pyproject.toml, verbatim: the
     /// interpreter versions pip will agree to install the project on
@@ -197,6 +199,11 @@ fn pinned_minor(path: &Path) -> Option<u64> {
     }
 }
 
+/// pyproject.toml's `[tool.<name>]` table
+fn tool<'a>(pyproject: &'a toml::Table, name: &str) -> Option<&'a toml::Value> {
+    pyproject.get("tool")?.get(name)
+}
+
 pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
     let has_pyproject = path.join("pyproject.toml").is_file();
     let has_setup_py = path.join("setup.py").is_file();
@@ -218,7 +225,7 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
     // file that exists at all.
     let unparsed_pyproject = has_pyproject && pyproject.is_none();
 
-    let poetry = pyproject.as_ref().and_then(|table| table.get("tool")?.get("poetry"));
+    let poetry = pyproject.as_ref().and_then(|table| tool(table, "poetry"));
     let publishable = pyproject.as_ref().is_some_and(|table| {
         let named = |section: Option<&toml::Value>| section.is_some_and(|s| s.get("name").is_some());
         // `package-mode = false` is Poetry's switch for a project that only
@@ -234,7 +241,32 @@ pub(super) fn gather(path: &Path) -> Option<PythonFacts> {
             .get("build-system")
             .and_then(|b| b.get("build-backend")?.as_str())
             .is_some_and(|backend| backend.starts_with("poetry.core"));
-        package_mode && (named(table.get("project")) || (poetry_core && named(poetry)))
+        // `[project]` alone describes an application as often as a library:
+        // `uv init` writes one with no `[build-system]`, and uv (like PDM)
+        // takes that as "not a package" — nothing is built or installed, only
+        // its dependencies. Libraries declare a backend, as every packaging
+        // tool's library template does; `tool.uv.package = true` is uv's way
+        // to package one without, and `false` its way to opt one out.
+        let uv_package = tool(table, "uv").and_then(|uv| uv.get("package")?.as_bool());
+        let pdm_distribution =
+            tool(table, "pdm").and_then(|pdm| pdm.get("distribution")?.as_bool());
+        let package = uv_package
+            .or(pdm_distribution)
+            .unwrap_or_else(|| table.contains_key("build-system"));
+        // PyPI rejects any upload carrying this classifier: it is how a
+        // project guards against being published by accident
+        let private = table
+            .get("project")
+            .and_then(|project| project.get("classifiers")?.as_array())
+            .is_some_and(|classifiers| {
+                classifiers.iter().any(|c| {
+                    c.as_str()
+                        .is_some_and(|c| c.trim_start().starts_with("Private ::"))
+                })
+            });
+        package_mode
+            && !private
+            && ((package && named(table.get("project"))) || (poetry_core && named(poetry)))
     });
 
     let requires_python = pyproject
@@ -384,18 +416,49 @@ mod tests {
         assert!(!facts.publishable);
     }
 
+    const HATCHLING: &str =
+        "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n";
+
     #[test]
     fn test_pyproject_with_project_name_is_publishable() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("pyproject.toml"),
-            "[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n",
+            format!("{HATCHLING}[project]\nname = \"mypkg\"\nversion = \"0.1.0\"\n"),
         )
         .unwrap();
         let facts = gather(dir.path()).unwrap();
         assert!(facts.has_pyproject);
         assert!(facts.installable);
         assert!(facts.publishable);
+    }
+
+    #[test]
+    fn test_project_without_build_system_is_an_application() {
+        // What `uv init` writes: uv builds and installs nothing of it
+        let app = "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                   requires-python = \">=3.12\"\ndependencies = []\n";
+        let facts = pyproject_facts(app);
+        assert!(facts.installable, "pip can still install its dependencies");
+        assert!(!facts.publishable);
+
+        // ...unless the project asks to be packaged anyway
+        assert!(pyproject_facts(&format!("{app}[tool.uv]\npackage = true\n")).publishable);
+        assert!(pyproject_facts(&format!("{app}[tool.pdm]\ndistribution = true\n")).publishable);
+    }
+
+    #[test]
+    fn test_package_opt_outs_are_not_publishable() {
+        let lib = format!("{HATCHLING}[project]\nname = \"p\"\nversion = \"0.1.0\"\n");
+        assert!(!pyproject_facts(&format!("{lib}[tool.uv]\npackage = false\n")).publishable);
+        assert!(!pyproject_facts(&format!("{lib}[tool.pdm]\ndistribution = false\n")).publishable);
+        let private = lib.replace(
+            "version",
+            "classifiers = [\"Private :: Do Not Upload\"]\nversion",
+        );
+        let facts = pyproject_facts(&private);
+        assert!(facts.installable);
+        assert!(!facts.publishable);
     }
 
     #[test]

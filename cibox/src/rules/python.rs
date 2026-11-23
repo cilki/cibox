@@ -786,7 +786,8 @@ mod tests {
     fn test_release_detected_for_publishable_pyproject() {
         let facts = facts_with(&[(
             "pyproject.toml",
-            "[project]\nname = \"p\"\nversion = \"0.1.0\"\n",
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\
+             [project]\nname = \"p\"\nversion = \"0.1.0\"\n",
         )]);
         assert!(PythonRelease.detect(&facts));
         let jobs = PythonRelease.jobs(&facts);
@@ -795,5 +796,16 @@ mod tests {
         assert!(jobs[0]
             .env
             .contains(&("TWINE_USERNAME".to_string(), "__token__".to_string())));
+    }
+
+    /// A `uv init` application has nothing to publish: uploading it would
+    /// claim its name on PyPI the first time a version is tagged
+    #[test]
+    fn test_release_not_detected_for_an_application() {
+        let facts = facts_with(&[(
+            "pyproject.toml",
+            "[project]\nname = \"p\"\nversion = \"0.1.0\"\ndependencies = []\n",
+        )]);
+        assert!(!PythonRelease.detect(&facts));
     }
 }
