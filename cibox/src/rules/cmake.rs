@@ -71,6 +71,9 @@ impl Rule for CmakeBuild {
     }
 }
 
+const FMT_COMMAND: &str = "git ls-files -z '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' \
+                           | xargs -0 -r clang-format --dry-run -Werror";
+
 /// Check formatting with clang-format
 pub struct CmakeFmt;
 
@@ -97,11 +100,10 @@ impl Rule for CmakeFmt {
             .with_timeout(10)
             .with_steps(vec![
                 Step::checkout(),
-                Step::run(
-                    "Check formatting",
-                    "git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' \
-                     | xargs -r clang-format --dry-run -Werror",
-                ),
+                // NUL-delimited: newline-separated output gets split on spaces
+                // by xargs, and git quotes non-ASCII names as octal escapes,
+                // so clang-format would be handed paths that don't exist.
+                Step::run("Check formatting", FMT_COMMAND),
             ])]
     }
 }
@@ -156,5 +158,71 @@ mod tests {
             CmakeFmt.jobs(&ProjectFacts::default())[0].stage,
             Stage::Lint
         );
+    }
+
+    /// Run the format step in a repo with awkward file names, against a
+    /// clang-format stub that fails on any path that doesn't exist and
+    /// prints the ones it was handed
+    #[test]
+    fn test_fmt_step_hands_clang_format_real_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("clang-format");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nfor f; do case \"$f\" in -*) ;; *) [ -f \"$f\" ] || exit 1; echo \"$f\";; esac; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let names = ["src/main.c", "src/my file.c", "src/café.h"];
+        for name in names {
+            fs::write(repo.join(name), "int x;\n").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+
+        let command = CmakeFmt.jobs(&ProjectFacts::default())[0]
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Run { command, .. } => Some(command.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new("bash")
+            .args(["-eo", "pipefail", "-c", &command])
+            .env("PATH", path)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "format step failed: {output:?}");
+        let mut seen: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        seen.sort();
+        let mut expected: Vec<_> = names.iter().map(|n| n.to_string()).collect();
+        expected.sort();
+        assert_eq!(seen, expected);
     }
 }
