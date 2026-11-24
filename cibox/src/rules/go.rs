@@ -30,8 +30,9 @@ fn cached(job: Job) -> Job {
 /// GitLab only caches paths inside the project directory — so a `/go/pkg/mod`
 /// cache entry never survived a job there. The go tool rejects relative cache
 /// directories, so the redirect goes through `go env -w` with an absolute
-/// `$PWD` path instead of a plain job env var. Package patterns like `./...`
-/// skip dot-directories, so the cache stays invisible to the build itself.
+/// `$PWD` path instead of a plain job env var. The go tool's `./...` skips
+/// dot-directories, so the cache stays invisible to the build itself — but
+/// not to gosec, which walks the tree on its own (see [`GoAudit`]).
 fn redirect_caches() -> Step {
     Step::run(
         "Redirect Go caches into the workspace",
@@ -187,7 +188,17 @@ impl Rule for GoAudit {
                     "Install gosec",
                     "go install github.com/securego/gosec/v2/cmd/gosec@latest",
                 ),
-                Step::run("Run gosec", "gosec ./..."),
+                // gosec expands `./...` with its own directory walk, which
+                // only skips vendor/ and .git/, so without the exclusion it
+                // also scans every module in the redirected GOMODCACHE —
+                // gosec's own dependencies included, downloaded by the step
+                // above — and fails a clean project on thousands of
+                // third-party findings, long after the job's timeout. The
+                // argument is a regex, hence the escaped dot.
+                Step::run(
+                    "Run gosec",
+                    format!("gosec -exclude-dir='\\{CACHE_DIR}' ./..."),
+                ),
             ])]
     }
 }
@@ -299,6 +310,26 @@ mod tests {
             installs,
             vec!["go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"]
         );
+    }
+
+    #[test]
+    fn test_audit_skips_the_workspace_cache() {
+        // gosec walks dot-directories (only vendor/ and .git/ are excluded by
+        // default), so `gosec ./...` alone scans the module cache that
+        // `go install gosec` just filled — 4.5M lines and 14k findings for
+        // a one-file project
+        let jobs = GoAudit.jobs(&ProjectFacts::default());
+        let scans: Vec<&str> = jobs[0]
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Run { command, .. } if command.starts_with("gosec ") => {
+                    Some(command.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scans, vec![r"gosec -exclude-dir='\.go-cache' ./..."]);
     }
 
     #[test]
