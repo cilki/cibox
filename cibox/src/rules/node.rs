@@ -1,4 +1,5 @@
 use super::{with_versions, Rule};
+use crate::config::Platform;
 use crate::detection::{NodeFacts, NodePackageManager, ProjectFacts};
 use crate::ir::{Job, Stage, Step};
 
@@ -439,9 +440,21 @@ impl Rule for NodeTypecheck {
 /// `*-index.json` per package and bun's holds every package unpacked, and
 /// none of that is formatted to the project's style. On a developer's
 /// machine the cache lives under $HOME, so only CI tripped over it.
+///
+/// It also skips the pipeline files cibox manages. Prettier formats YAML,
+/// and its style (indented block sequences, double quotes) is not the one
+/// cibox writes, so a fresh `cibox update` would otherwise produce a
+/// pipeline whose own fmt job fails on it. Formatting them with prettier
+/// wouldn't help either: the next `cibox update` rewrites the managed jobs
+/// in cibox's style again. Every platform's files are listed, since a rule
+/// doesn't know which platforms it is being generated for.
 fn prettier_check(n: &NodeFacts) -> String {
     let (_, cache_path) = dependency_cache(n);
-    tool(n, &format!("prettier --check . '!{cache_path}**'"))
+    let mut command = format!("prettier --check . '!{cache_path}**'");
+    for path in Platform::all().iter().flat_map(Platform::managed_paths) {
+        command.push_str(&format!(" '!{}'", path.display()));
+    }
+    tool(n, &command)
 }
 
 /// Check formatting with prettier
@@ -873,7 +886,9 @@ mod tests {
             "{commands:?}"
         );
         assert!(
-            commands.contains(&"yarn exec prettier --check . '!.yarn-cache/**'".to_string()),
+            commands
+                .iter()
+                .any(|c| c.starts_with("yarn exec prettier --check . '!.yarn-cache/**'")),
             "{commands:?}"
         );
         for command in &commands {
@@ -892,7 +907,8 @@ mod tests {
         );
         assert!(
             commands
-                .contains(&"./node_modules/.bin/prettier --check . '!.yarn-cache/**'".to_string()),
+                .iter()
+                .any(|c| c.starts_with("./node_modules/.bin/prettier --check . '!.yarn-cache/**'")),
             "{commands:?}"
         );
     }
@@ -925,8 +941,28 @@ mod tests {
                 })
                 .unwrap();
             assert!(
-                check.ends_with(&format!("prettier --check . '!{cache}**'")),
+                check.contains(&format!("prettier --check . '!{cache}**'")),
                 "{lockfile}: {check}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prettier_skips_the_pipelines_cibox_writes() {
+        // Prettier formats YAML in a style cibox doesn't write, so checking
+        // the generated pipelines would fail the job on its first run — and
+        // `cibox update` would undo any reformatting anyway
+        let facts = facts_with(&[
+            ("package.json", r#"{"devDependencies": {"prettier": "^3"}}"#),
+            (".prettierrc", "{}"),
+        ]);
+        let commands = commands(&facts);
+        let check = commands.iter().find(|c| c.contains("prettier")).unwrap();
+        for path in Platform::all().iter().flat_map(Platform::managed_paths) {
+            assert!(
+                check.contains(&format!(" '!{}'", path.display())),
+                "{} is checked: {check}",
+                path.display()
             );
         }
     }
