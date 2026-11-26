@@ -202,6 +202,27 @@ fn poetry_clause(clause: &str) -> Option<String> {
     })
 }
 
+/// Installs an application's `[project]` dependencies, and those of its test
+/// `extra`, without building the project — what `uv sync` does for it. pip
+/// has no way to install a pyproject.toml's dependencies alone, so they are
+/// read with `tomllib` at run time, keeping the pipeline in step with the
+/// file. `tomllib` arrived in Python 3.11; older images get its backport,
+/// `tomli`, which the environment marker skips everywhere else. The extra
+/// is named by the detector from a fixed list, so it is safe to put in the
+/// command as is.
+fn application_install_command(extra: Option<&str>) -> String {
+    let extra = extra
+        .map(|extra| format!(" + project.get('optional-dependencies', {{}}).get('{extra}', [])"))
+        .unwrap_or_default();
+    format!(
+        "pip install \"tomli; python_version < '3.11'\" && python -c \"import sys; \
+         toml = __import__('tomllib' if sys.version_info >= (3, 11) else 'tomli'); \
+         project = toml.load(open('pyproject.toml', 'rb'))['project']; \
+         print('\\n'.join(project.get('dependencies', []){extra}))\" \
+         | pip install -r /dev/stdin"
+    )
+}
+
 /// Install steps appropriate for the project layout.
 ///
 /// The two are not alternatives: a requirements file pins what the project
@@ -250,6 +271,11 @@ fn install_steps(facts: &ProjectFacts) -> Vec<Step> {
         steps.push(Step::run(
             "Install project with Poetry",
             format!("pip install poetry && POETRY_VIRTUALENVS_CREATE=false poetry install --with {group}"),
+        ));
+    } else if py.application {
+        steps.push(Step::run(
+            "Install project dependencies",
+            application_install_command(py.test_extra.as_deref()),
         ));
     } else if py.installable {
         // Quoted: the brackets are a glob pattern to the shell
@@ -451,11 +477,14 @@ mod tests {
 
     const REQUIREMENTS: &str = "pip install -r requirements.txt";
     const PROJECT: &str = "pip install .";
+    const PACKAGE: &str =
+        "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\
+         [project]\nname = \"p\"\n";
 
     #[test]
     fn test_install_steps_follow_the_project_layout() {
         // A package pip can build is installed from the checkout
-        let facts = facts_with(&[("pyproject.toml", "[project]\nname = \"p\"\n")]);
+        let facts = facts_with(&[("pyproject.toml", PACKAGE)]);
         assert_eq!(install_commands(&facts), [PROJECT]);
 
         // A requirements file with no package to build is just read
@@ -465,10 +494,43 @@ mod tests {
         // Both shapes present: the pins are installed, then the project, so
         // the tests can import it
         let facts = facts_with(&[
-            ("pyproject.toml", "[project]\nname = \"p\"\n"),
+            ("pyproject.toml", PACKAGE),
             ("requirements.txt", "requests\n"),
         ]);
         assert_eq!(install_commands(&facts), [REQUIREMENTS, PROJECT]);
+    }
+
+    /// `pip install .` builds an application (`[project]`, no
+    /// `[build-system]`) with setuptools' fallback, which refuses a flat
+    /// layout with several top-level packages — failing the job of a
+    /// project uv would only ever install the dependencies of
+    #[test]
+    fn test_application_installs_only_its_dependencies() {
+        let app = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"six\"]\n";
+        let commands = install_commands(&facts_with(&[("pyproject.toml", app)]));
+        assert_eq!(commands, [application_install_command(None)]);
+        assert!(!commands[0].contains(PROJECT), "{}", commands[0]);
+        assert!(commands[0].contains("project.get('dependencies', [])"));
+
+        // Its test extra comes along in the same install
+        let commands = install_commands(&facts_with(&[(
+            "pyproject.toml",
+            &format!("{app}[project.optional-dependencies]\ntest = [\"pytest-asyncio\"]\n"),
+        )]));
+        assert_eq!(commands, [application_install_command(Some("test"))]);
+        assert!(commands[0].contains("+ project.get('optional-dependencies', {}).get('test', [])"));
+
+        // Packaged after all: uv's switch, or a setup.py beside it
+        let facts = facts_with(&[(
+            "pyproject.toml",
+            &format!("{app}[tool.uv]\npackage = true\n"),
+        )]);
+        assert_eq!(install_commands(&facts), [PROJECT]);
+        let facts = facts_with(&[
+            ("pyproject.toml", app),
+            ("setup.py", "from setuptools import setup\nsetup()\n"),
+        ]);
+        assert_eq!(install_commands(&facts), [PROJECT]);
     }
 
     /// `pip install -r requirements.txt` against a project that has no
@@ -511,7 +573,7 @@ mod tests {
     fn test_test_requirements_are_installed() {
         let facts = facts_with(&[(
             "pyproject.toml",
-            "[project]\nname = \"p\"\n[project.optional-dependencies]\ntest = [\"pytest-asyncio\"]\n",
+            &format!("{PACKAGE}[project.optional-dependencies]\ntest = [\"pytest-asyncio\"]\n"),
         )]);
         assert_eq!(install_commands(&facts), ["pip install '.[test]'"]);
 
