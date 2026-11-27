@@ -173,7 +173,9 @@ fn merge_lf(
     }
 
     match platform {
-        Platform::GitHub | Platform::Gitea => merge_github(file, filter, existing, &parse, scan),
+        Platform::GitHub | Platform::Gitea => {
+            merge_github(platform, file, filter, existing, &parse, scan)
+        }
         Platform::GitLab => merge_gitlab(file, filter, existing, &parse, scan),
         Platform::CircleCI => merge_circleci(file, filter, existing, &parse, scan),
     }
@@ -882,6 +884,7 @@ fn tag_gate(file: &PlannedFile, current: &serde_yaml::Mapping) -> TagGate {
 }
 
 fn merge_github(
+    platform: Platform,
     file: &PlannedFile,
     filter: &JobFilter,
     existing: &str,
@@ -897,6 +900,7 @@ fn merge_github(
         &split.kept(),
         file.kind,
         tag_gate(file, parse.values()?),
+        platform,
     ))?;
     let canonical_jobs = canonical_job_mapping(&canonical);
     let plan = JobsPlan {

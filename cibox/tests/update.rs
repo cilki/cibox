@@ -474,6 +474,59 @@ fn test_no_flags_completes_a_partially_present_platform() {
     assert!(!dir.path().join(".github").exists(), "nothing for GitHub");
 }
 
+/// The step names of one job, in order
+fn step_names(path: &Path, job: &str) -> Vec<String> {
+    read_yaml(path)["jobs"][job]["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// act_runner runs actions/checkout with the job container's node, which
+/// `rust:latest` lacks: a Gitea release workflow written before the setup
+/// step existed gets it in front of the checkout, keeping the user's comment
+#[test]
+fn test_gitea_container_jobs_get_node_before_the_checkout() {
+    let dir = project();
+    let release = dir.path().join(".gitea/workflows/release.yml");
+    fs::create_dir_all(release.parent().unwrap()).unwrap();
+    fs::write(
+        &release,
+        "name: Release\non:\n  push:\n    tags:\n      - v*\npermissions:\n  contents: read\n\
+         jobs:\n  # Publishes the crate\n  rust-release:\n    runs-on: ubuntu-latest\n    \
+         container: rust:latest\n    env:\n      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}\n    \
+         steps:\n      - name: Checkout code\n        uses: actions/checkout@v4\n        with:\n          \
+         persist-credentials: false\n      - name: Publish to crates.io\n        run: cargo publish\n    \
+         timeout-minutes: 15\n",
+    )
+    .unwrap();
+
+    bare_update(dir.path()).arg("--gitea").assert().success();
+    let content = fs::read_to_string(&release).unwrap();
+    assert!(content.contains("# Publishes the crate"), "{content}");
+    let steps = step_names(&release, "rust-release");
+    assert_eq!(steps[..2], ["Set up Node", "Checkout code"], "{content}");
+    assert_eq!(
+        read_yaml(&release)["jobs"]["rust-release"]["container"],
+        "rust:latest"
+    );
+
+    // Settled: a second run changes nothing
+    bare_update(dir.path())
+        .arg("--gitea")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+    assert_eq!(content, fs::read_to_string(&release).unwrap());
+
+    // GitHub's runner brings its own node
+    update(dir.path()).assert().success();
+    let steps = step_names(&dir.path().join(RELEASE_YML), "rust-release");
+    assert!(!steps.iter().any(|s| s == "Set up Node"), "{steps:?}");
+}
+
 /// With nothing on disk, update falls back to the inferred platform
 #[test]
 fn test_no_flags_and_no_pipeline_falls_back_to_inference() {

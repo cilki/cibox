@@ -1,3 +1,4 @@
+use crate::config::Platform;
 use crate::ir::{Job, RunnerOs, Step};
 use crate::platforms::github::models::{
     GitHubDefaults, GitHubJob, GitHubMatrix, GitHubMatrixInclude, GitHubRunDefaults, GitHubStep,
@@ -105,16 +106,27 @@ pub fn tag_gate(on: &serde_yaml::Value) -> TagGate {
     }
 }
 
-pub fn lower_github(jobs: &[Job], kind: WorkflowKind) -> GitHubWorkflow {
-    lower_github_gated(jobs, kind, TagGate::of(kind))
+/// Lower for GitHub Actions or Gitea Actions, which share the workflow
+/// format but not the runner (see [`NODE_SETUP`]).
+pub fn lower_github(jobs: &[Job], kind: WorkflowKind, platform: Platform) -> GitHubWorkflow {
+    lower_github_gated(jobs, kind, TagGate::of(kind), platform)
 }
 
 /// Lower into a file whose triggers are already decided, which is what a
 /// merge has: `gate` says whether they gate the tags-only jobs.
-pub fn lower_github_gated(jobs: &[Job], kind: WorkflowKind, gate: TagGate) -> GitHubWorkflow {
+pub fn lower_github_gated(
+    jobs: &[Job],
+    kind: WorkflowKind,
+    gate: TagGate,
+    platform: Platform,
+) -> GitHubWorkflow {
+    debug_assert!(
+        matches!(platform, Platform::GitHub | Platform::Gitea),
+        "{platform:?} does not use the GitHub Actions format"
+    );
     let lowered = jobs
         .iter()
-        .map(|job| (job.id.clone(), lower_job(job, gate)))
+        .map(|job| (job.id.clone(), lower_job(job, gate, platform)))
         .collect();
 
     let on = match kind {
@@ -179,7 +191,46 @@ fn base_permissions() -> BTreeMap<String, String> {
 /// protect either: checkout fell back to a tarball there.
 const SAFE_DIRECTORY: &str = "if command -v git >/dev/null; then git config --global --add safe.directory \"$GITHUB_WORKSPACE\"; fi";
 
-fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
+/// Installs the latest Node.js LTS into a Gitea job container that has none.
+///
+/// actions/checkout, actions/cache and actions/upload-artifact are JavaScript
+/// actions. GitHub's runner brings its own node into a job container to run
+/// them; Gitea's act_runner execs the container's `node` instead, so a job in
+/// a toolchain image (`rust:latest`, `golang:1`, ...) dies at the checkout
+/// with `exec: "node": executable file not found in $PATH`.
+///
+/// The LTS is the newest release `index.tab` gives a codename in its `lts`
+/// column. awk reads the whole index rather than exiting at the first match,
+/// which would kill curl with SIGPIPE under `pipefail`. Each step is chained
+/// with `&&` rather than relying on `-e`, which leaves failures in an `&&`
+/// list alone, and the tarball is checked against the release's
+/// SHASUMS256.txt. Every image cibox runs here is glibc-based and ships curl.
+const NODE_SETUP: &str = "if ! command -v node >/dev/null; then \
+    case \"$(uname -m)\" in x86_64) arch=x64 ;; aarch64) arch=arm64 ;; \
+    *) echo \"No Node.js build for $(uname -m)\" >&2; exit 1 ;; esac; \
+    version=$(curl -fsSL https://nodejs.org/dist/index.tab \
+    | awk -F '\\t' 'NR > 1 && $10 != \"-\" && !v { v = $1 } END { print v }'); \
+    tarball=\"node-$version-linux-$arch.tar.gz\"; \
+    [ -n \"$version\" ] && \
+    curl -fsSL \"https://nodejs.org/dist/$version/$tarball\" -o \"/tmp/$tarball\" && \
+    (cd /tmp && curl -fsSL \"https://nodejs.org/dist/$version/SHASUMS256.txt\" \
+    | grep \" $tarball\\$\" | sha256sum -c -) && \
+    mkdir -p /usr/local/lib/nodejs && \
+    tar -xzf \"/tmp/$tarball\" -C /usr/local/lib/nodejs --strip-components=1 && \
+    ln -sf /usr/local/lib/nodejs/bin/node /usr/local/bin/node && \
+    rm \"/tmp/$tarball\"; \
+    fi";
+
+/// Whether every image the job runs in already ships node
+fn ships_node(job: &Job) -> bool {
+    let is_node = |image: &str| image.starts_with("node:");
+    match &job.matrix {
+        Some(entries) => entries.iter().all(|e| is_node(&e.image)),
+        None => job.image.as_deref().is_some_and(is_node),
+    }
+}
+
+fn lower_job(job: &Job, gate: TagGate, platform: Platform) -> GitHubJob {
     // Docker-daemon jobs run directly on the host runner
     let container = if job.needs_docker {
         None
@@ -291,6 +342,23 @@ fn lower_job(job: &Job, gate: TagGate) -> GitHubJob {
         });
     }
 
+    // Before the first action, which on Gitea needs the container's own node
+    if platform == Platform::Gitea
+        && container.is_some()
+        && !ships_node(job)
+        && steps.iter().any(|s| s.uses.is_some())
+    {
+        steps.insert(
+            0,
+            GitHubStep {
+                name: "Set up Node".to_string(),
+                uses: None,
+                run: Some(NODE_SETUP.to_string()),
+                with: None,
+            },
+        );
+    }
+
     let mut env: BTreeMap<String, String> = job.env.iter().cloned().collect();
     // A credential reads from the secrets context and only from there. A
     // repository Variable is not a weaker secret, it is not a secret at all:
@@ -371,6 +439,7 @@ mod tests {
         let workflow = lower_github(
             &[Job::new("rust-test", "Cargo test", Stage::Test)],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         assert!(workflow.jobs.contains_key("rust-test"));
     }
@@ -381,6 +450,7 @@ mod tests {
             &[Job::new("gitleaks", "Gitleaks", Stage::Security)
                 .with_steps(vec![Step::checkout_full_history()])],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         let step = &workflow.jobs["gitleaks"].steps[0];
         assert_eq!(step.uses.as_deref(), Some("actions/checkout@v4"));
@@ -399,6 +469,7 @@ mod tests {
                     .with_steps(vec![Step::checkout_full_history()]),
             ],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         for id in ["rust-test", "gitleaks"] {
             let with = workflow.jobs[id].steps[0].with.as_ref().unwrap();
@@ -420,6 +491,7 @@ mod tests {
                     .with_docker(),
             ],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         assert_eq!(
             workflow.jobs["rust-test"].container.as_deref(),
@@ -451,6 +523,7 @@ mod tests {
                     .with_steps(vec![Step::checkout(), Step::run("Push", "docker push x")]),
             ],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         for id in ["go-build", "go-test"] {
             let steps = &workflow.jobs[id].steps;
@@ -478,6 +551,200 @@ mod tests {
         );
     }
 
+    fn node_setup_count(workflow: &GitHubWorkflow, id: &str) -> usize {
+        workflow.jobs[id]
+            .steps
+            .iter()
+            .filter(|s| s.run.as_deref() == Some(NODE_SETUP))
+            .count()
+    }
+
+    /// act_runner runs JavaScript actions with the job container's node, so
+    /// a Gitea container job without one has to install it before checkout
+    #[test]
+    fn test_gitea_container_jobs_set_up_node_before_checkout() {
+        let matrix = vec![
+            MatrixEntry {
+                version: "1.85".to_string(),
+                image: "rust:1.85".to_string(),
+            },
+            MatrixEntry {
+                version: "stable".to_string(),
+                image: "rust:latest".to_string(),
+            },
+        ];
+        let jobs = [
+            Job::new("rust-release", "Cargo publish", Stage::Deploy)
+                .with_image("rust:latest")
+                .with_steps(vec![
+                    Step::checkout(),
+                    Step::run("Publish", "cargo publish"),
+                ]),
+            Job::new("rust-test", "Cargo test", Stage::Test)
+                .with_matrix(matrix)
+                .with_cache("rust-cache", vec!["target/".to_string()])
+                .with_steps(vec![Step::checkout(), Step::run("Test", "cargo test")]),
+        ];
+        let gitea = lower_github(&jobs, WorkflowKind::Ci, Platform::Gitea);
+        for id in ["rust-release", "rust-test"] {
+            let steps = &gitea.jobs[id].steps;
+            assert_eq!(steps[0].run.as_deref(), Some(NODE_SETUP), "{id}");
+            assert_eq!(
+                steps[1].uses.as_deref(),
+                Some("actions/checkout@v4"),
+                "{id}"
+            );
+            assert_eq!(node_setup_count(&gitea, id), 1, "{id}");
+        }
+
+        // GitHub's runner brings its own node
+        let github = lower_github(&jobs, WorkflowKind::Ci, Platform::GitHub);
+        for id in ["rust-release", "rust-test"] {
+            assert_eq!(node_setup_count(&github, id), 0, "{id}");
+        }
+    }
+
+    #[test]
+    fn test_gitea_jobs_that_have_node_are_left_alone() {
+        let node_matrix = vec![
+            MatrixEntry {
+                version: "20".to_string(),
+                image: "node:20".to_string(),
+            },
+            MatrixEntry {
+                version: "22".to_string(),
+                image: "node:22".to_string(),
+            },
+        ];
+        let gitea = lower_github(
+            &[
+                Job::new("node-test", "Node test", Stage::Test)
+                    .with_image("node:22")
+                    .with_steps(vec![Step::checkout()]),
+                Job::new("node-matrix", "Node test", Stage::Test)
+                    .with_matrix(node_matrix)
+                    .with_steps(vec![Step::checkout()]),
+                // The runner's own image provides node on the host
+                Job::new("docker-release", "Docker push", Stage::Deploy)
+                    .with_docker()
+                    .with_steps(vec![Step::checkout()]),
+                Job::new("docker-release-windows", "Docker push", Stage::Deploy)
+                    .on_windows()
+                    .with_steps(vec![Step::checkout()]),
+                // No action to run
+                Job::new("shell-only", "Shell", Stage::Test)
+                    .with_image("rust:latest")
+                    .with_steps(vec![Step::run("Hello", "echo hello")]),
+            ],
+            WorkflowKind::Ci,
+            Platform::Gitea,
+        );
+        for id in [
+            "node-test",
+            "node-matrix",
+            "docker-release",
+            "docker-release-windows",
+            "shell-only",
+        ] {
+            assert_eq!(node_setup_count(&gitea, id), 0, "{id}");
+        }
+    }
+
+    /// One leg without node is enough to need the setup
+    #[test]
+    fn test_gitea_mixed_matrix_sets_up_node() {
+        let gitea = lower_github(
+            &[Job::new("mixed", "Mixed", Stage::Test)
+                .with_matrix(vec![
+                    MatrixEntry {
+                        version: "22".to_string(),
+                        image: "node:22".to_string(),
+                    },
+                    MatrixEntry {
+                        version: "1".to_string(),
+                        image: "golang:1".to_string(),
+                    },
+                ])
+                .with_steps(vec![Step::checkout()])],
+            WorkflowKind::Ci,
+            Platform::Gitea,
+        );
+        assert_eq!(node_setup_count(&gitea, "mixed"), 1);
+    }
+
+    /// Run the setup step with stub `curl`, `uname` and `node`-less PATH, and
+    /// check the version it resolves and the tarball it verifies
+    #[test]
+    fn test_node_setup_picks_the_newest_lts_and_verifies_it() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = dir.path().join("curl.log");
+        let index = "version\tdate\tfiles\tnpm\tv8\tuv\tzlib\topenssl\tmodules\tlts\tsecurity\n\
+                     v27.0.0\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n\
+                     v26.13.1\t-\t-\t-\t-\t-\t-\t-\t-\tLyra\t-\n\
+                     v24.9.0\t-\t-\t-\t-\t-\t-\t-\t-\tKrypton\t-\n";
+        fs::write(dir.path().join("index.tab"), index).unwrap();
+        // curl serves index.tab and a SHASUMS256.txt that no tarball matches,
+        // so the step has to stop at the checksum, before touching /usr/local
+        let curl = format!(
+            "#!/bin/sh\necho \"$@\" >> {log}\n\
+             case \"$2\" in\n\
+             */index.tab) cat {dir}/index.tab ;;\n\
+             */SHASUMS256.txt) echo \"{zeros}  node-v26.13.1-linux-x64.tar.gz\" ;;\n\
+             *) echo tarball > \"$4\" ;;\n\
+             esac\n",
+            log = log.display(),
+            dir = dir.path().display(),
+            zeros = "0".repeat(64),
+        );
+        let stubs = [
+            ("curl", curl.as_str()),
+            ("uname", "#!/bin/sh\necho x86_64\n"),
+        ];
+        for (name, script) in stubs {
+            let path = bin.join(name);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The real tools the step needs, without whatever node the host has
+        for tool in ["awk", "grep", "sha256sum", "cat", "sh", "bash"] {
+            let found = Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .unwrap();
+            let target = String::from_utf8(found.stdout).unwrap();
+            std::os::unix::fs::symlink(target.trim(), bin.join(tool)).unwrap();
+        }
+
+        for shell in [&["-e"][..], &["-eo", "pipefail"][..]] {
+            fs::write(&log, "").unwrap();
+            let output = Command::new("bash")
+                .args(shell)
+                .args(["-c", NODE_SETUP])
+                .env("PATH", &bin)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "{shell:?}: a bad checksum must fail the step"
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("did NOT match"), "{shell:?}: {stderr}");
+            let requested = fs::read_to_string(&log).unwrap();
+            assert!(
+                requested
+                    .contains("https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-x64.tar.gz"),
+                "{shell:?}: {requested}"
+            );
+        }
+        let _ = fs::remove_file("/tmp/node-v26.13.1-linux-x64.tar.gz");
+    }
+
     #[test]
     fn test_secrets_become_job_env() {
         let workflow = lower_github(
@@ -488,6 +755,7 @@ mod tests {
                 ])
                 .with_variables(vec!["DOCKER_USERNAME".to_string()])],
             WorkflowKind::Release,
+            Platform::GitHub,
         );
         let env = workflow.jobs["docker-release"].env.as_ref().unwrap();
         // A credential comes from the secrets context and nowhere else
@@ -517,7 +785,7 @@ mod tests {
 
         let mut checked = 0;
         for kind in [WorkflowKind::Ci, WorkflowKind::Release] {
-            for (id, lowered) in lower_github(&jobs, kind).jobs {
+            for (id, lowered) in lower_github(&jobs, kind, Platform::GitHub).jobs {
                 let job = jobs.iter().find(|j| j.id == id).unwrap();
                 let env = lowered.env.unwrap_or_default();
                 for secret in &job.secrets {
@@ -538,6 +806,7 @@ mod tests {
         let workflow = lower_github(
             &[Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only()],
             WorkflowKind::Release,
+            Platform::GitHub,
         );
         let triggers = &workflow.on;
         assert_eq!(workflow.name, "Release");
@@ -553,6 +822,7 @@ mod tests {
         let workflow = lower_github(
             &[Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only()],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         assert_eq!(
             workflow.jobs["rust-release"].if_expr.as_deref(),
@@ -610,6 +880,7 @@ mod tests {
             &[Job::new("rust-release", "Cargo publish", Stage::Deploy).tags_only()],
             WorkflowKind::Release,
             TagGate::Job,
+            Platform::GitHub,
         );
         assert_eq!(
             workflow.jobs["rust-release"].if_expr.as_deref(),
@@ -620,6 +891,7 @@ mod tests {
             &[Job::new("rust-test", "Cargo test", Stage::Test)],
             WorkflowKind::Ci,
             TagGate::Job,
+            Platform::GitHub,
         );
         assert_eq!(workflow.jobs["rust-test"].if_expr, None);
     }
@@ -633,6 +905,7 @@ mod tests {
                 Job::new("docker-release-linux", "Docker push (linux)", Stage::Deploy),
             ],
             WorkflowKind::Release,
+            Platform::GitHub,
         );
         let windows = &workflow.jobs["docker-release-windows"];
         assert_eq!(windows.runs_on, "windows-latest");
@@ -645,7 +918,11 @@ mod tests {
     #[test]
     fn test_workflow_token_is_read_only_by_default() {
         for kind in [WorkflowKind::Ci, WorkflowKind::Release] {
-            let workflow = lower_github(&[Job::new("rust-test", "Cargo test", Stage::Test)], kind);
+            let workflow = lower_github(
+                &[Job::new("rust-test", "Cargo test", Stage::Test)],
+                kind,
+                Platform::GitHub,
+            );
             assert_eq!(workflow.permissions["contents"], "read", "{kind:?}");
             // Nothing declared, so the job inherits the workflow scopes
             assert_eq!(workflow.jobs["rust-test"].permissions, None, "{kind:?}");
@@ -658,6 +935,7 @@ mod tests {
             &[Job::new("docker-release", "Docker push", Stage::Deploy)
                 .with_permission("packages", "write")],
             WorkflowKind::Release,
+            Platform::GitHub,
         );
         let permissions = workflow.jobs["docker-release"]
             .permissions
@@ -687,6 +965,7 @@ mod tests {
                 .with_cache("rust-cache", vec!["target/".to_string()])
                 .with_matrix(entries)],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         let job = &workflow.jobs["rust-test"];
         assert_eq!(job.name.as_deref(), Some("Cargo test (${{ matrix.version }})"));
@@ -719,6 +998,7 @@ mod tests {
         let workflow = lower_github(
             &[Job::new("rust-test", "Cargo test", Stage::Test).with_image("rust:latest")],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         let yaml = serde_yaml::to_string(&workflow).unwrap();
         assert!(!yaml.contains("strategy"), "{yaml}");
@@ -733,6 +1013,7 @@ mod tests {
                 .with_steps(vec![Step::checkout(), Step::run("Run tests", "cargo test")])
                 .with_cache("rust-cache", vec!["target/".to_string()])],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         let steps = &workflow.jobs["rust-test"].steps;
         assert_eq!(steps[1].uses.as_deref(), Some("actions/cache@v4"));
@@ -748,6 +1029,7 @@ mod tests {
                 .with_steps(vec![Step::checkout(), Step::run("Run tests", "cargo test")])
                 .with_cache("rust-cache", vec!["target/".to_string()])],
             WorkflowKind::Ci,
+            Platform::GitHub,
         );
         let with = workflow.jobs["rust-test"].steps[1].with.as_ref().unwrap();
         let key = with["key"].as_str().unwrap();

@@ -35,8 +35,10 @@ pub use rust::{
 };
 pub use zig::{ZigBuild, ZigFmt, ZigTest};
 
-/// Docker image with all dependencies needed by generated CI jobs
-pub(crate) const CIBOX_IMAGE: &str = "fossable/cibox:latest";
+/// Image for jobs whose tools have no official image of their own: Debian
+/// stable with curl, git and a C/C++ toolchain. Each job installs the rest
+/// itself, with apt-get or from a pinned upstream release.
+pub(crate) const DEBIAN_IMAGE: &str = "buildpack-deps:stable";
 
 /// One opinionated unit of CI configuration
 pub trait Rule {

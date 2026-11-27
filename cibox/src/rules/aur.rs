@@ -2,8 +2,8 @@ use super::Rule;
 use crate::detection::ProjectFacts;
 use crate::ir::{Job, Stage, Step};
 
-/// makepkg only exists on Arch, so this is the one rule that cannot run on
-/// CIBOX_IMAGE; base-devel brings gcc/make/fakeroot/sudo but not git,
+/// makepkg only exists on Arch, so this rule cannot run on DEBIAN_IMAGE;
+/// base-devel brings gcc/make/fakeroot/sudo but not git,
 /// openssh, pacman-contrib, or namcap — those are installed in the first step.
 pub(crate) const IMAGE: &str = "archlinux:base-devel";
 

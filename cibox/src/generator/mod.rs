@@ -138,7 +138,7 @@ pub fn render_file(platform: Platform, file: &PlannedFile) -> Result<String> {
     // Gitea Actions uses the GitHub Actions workflow format
     let mut content = match platform {
         Platform::GitHub | Platform::Gitea => {
-            serde_yaml::to_string(&lower_github(&file.jobs, file.kind))?
+            serde_yaml::to_string(&lower_github(&file.jobs, file.kind, platform))?
         }
         Platform::GitLab => serde_yaml::to_string(&lower_gitlab(&file.jobs))?,
         Platform::CircleCI => serde_yaml::to_string(&lower_circleci(&file.jobs))?,

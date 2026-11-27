@@ -100,19 +100,17 @@ impl AndroidBuild {
     fn steps(&self, layout: &Layout) -> Vec<Step> {
         let mut steps = vec![Step::checkout()];
 
-        // CIBOX_IMAGE ships the JDK; the rust images don't, and native
+        // Neither DEBIAN_IMAGE nor the rust images ship a JDK, and native
         // builds may need extra host libraries on either
-        if layout.rust_dir.is_some() || !self.apt_packages.is_empty() {
-            let mut packages = vec!["default-jdk-headless", "unzip"];
-            packages.extend(self.apt_packages.iter().map(String::as_str));
-            steps.push(Step::run(
-                "Install build tools",
-                format!(
-                    "apt-get update && apt-get install -y --no-install-recommends {}",
-                    packages.join(" ")
-                ),
-            ));
-        }
+        let mut packages = vec!["default-jdk-headless", "unzip"];
+        packages.extend(self.apt_packages.iter().map(String::as_str));
+        steps.push(Step::run(
+            "Install build tools",
+            format!(
+                "apt-get update && apt-get install -y --no-install-recommends {}",
+                packages.join(" ")
+            ),
+        ));
 
         // cmdline-tools unpack as `cmdline-tools/`, but sdkmanager requires
         // the `cmdline-tools/latest/` layout to agree with its own path.
@@ -227,7 +225,7 @@ impl Rule for AndroidBuild {
                     .filter(|t| is_valid_toolchain(t))
                     .unwrap_or(DEFAULT_TOOLCHAIN),
             ),
-            None => super::CIBOX_IMAGE.to_string(),
+            None => super::DEBIAN_IMAGE.to_string(),
         };
 
         let mut cache_paths = vec![format!("{SDK_DIR}/"), format!("{GRADLE_HOME}/")];
@@ -303,6 +301,24 @@ mod tests {
     fn test_accepting_licenses_survives_pipefail() {
         let status = run_sdk_step("#!/bin/sh\nhead -n 3 > /dev/null\n");
         assert!(status.success(), "SDK step failed under pipefail: {status}");
+    }
+
+    /// Without a Rust crate the job runs on DEBIAN_IMAGE, which has no JDK
+    /// for Gradle, so the JDK is installed either way
+    #[test]
+    fn test_plain_gradle_project_installs_the_jdk() {
+        let rule = AndroidBuild {
+            dir: None,
+            apt_packages: Vec::new(),
+            rust_toolchain: None,
+        };
+        let job = &rule.jobs(&ProjectFacts::default())[0];
+        assert_eq!(job.image.as_deref(), Some(super::super::DEBIAN_IMAGE));
+        assert!(job.steps.iter().any(|s| matches!(
+            s,
+            Step::Run { name, command }
+                if name == "Install build tools" && command.contains("default-jdk-headless")
+        )));
     }
 
     #[test]

@@ -63,12 +63,15 @@ To add a rule:
 3. Give it a doc comment on the `CiboxConfig` field — roniker surfaces it in
    the LSP.
 
-Jobs that need tools beyond a language toolchain should run on the
-`fossable/cibox` image (`CIBOX_IMAGE`), built from the `Dockerfile` at the
-repo root — add the tool there. The exception is `aur-release`, which runs on
-`archlinux:base-devel` because makepkg only exists on Arch. `android-build`
-installs the Android SDK at job runtime into a cached directory inside the
-checkout instead — it is multiple GB, far too large for the image — the same
+Jobs run on official upstream images, and cibox builds no image of its own.
+A job whose tools have no official image (cmake, clang-format, zig,
+gitleaks, the JDK for `android-build`) runs on `buildpack-deps:stable`
+(`DEBIAN_IMAGE`: Debian stable with curl, git and a C/C++ toolchain) and
+installs them in a step of its own. It uses apt-get for Debian packages, and
+for anything else downloads a pinned upstream release and checks it against
+its sha256. `aur-release` runs on `archlinux:base-devel`, because makepkg
+only exists on Arch. `android-build` installs the Android SDK at job runtime
+into a cached directory inside the checkout — it is multiple GB — the same
 reasoning that relocates CARGO_HOME into the checkout in the rust rules.
 
 ## Generated pipeline behavior
@@ -105,6 +108,17 @@ is never part of `cibox.ron`.
 | Gitea Actions  | `.gitea/workflows/ci.yml`, `.gitea/workflows/release.yml`   |
 | GitLab CI      | `.gitlab-ci.yml`                                            |
 | CircleCI       | `.circleci/config.yml`                                      |
+
+Gitea Actions reads the GitHub Actions workflow format, so the two get the
+same jobs, with one exception. Gitea's act_runner runs JavaScript actions
+(`actions/checkout`, `actions/cache`, `actions/upload-artifact`) with the
+`node` of the job container. GitHub's runner brings its own node, but the
+toolchain images (`rust:latest`, `golang:1`, ...) have none, so a Gitea job
+would fail at the checkout with `exec: "node": executable file not found in
+$PATH`. Every Gitea job that runs in a container therefore starts with a "Set
+up Node" step. If the image has no `node`, the step installs the latest
+Node.js LTS from nodejs.org, checked against the release's SHASUMS256.txt.
+Jobs on `node:*` images and jobs on the runner host don't get the step.
 
 ### Merging on `cibox update`
 
