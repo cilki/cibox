@@ -221,6 +221,23 @@ const NODE_SETUP: &str = "if ! command -v node >/dev/null; then \
     rm \"/tmp/$tarball\"; \
     fi";
 
+/// Moves the scratch space of a Gitea docker job onto podman's storage.
+///
+/// act_runner runs even a docker job inside a job container, and the `docker`
+/// there may be podman. Since podman 6, `podman build` mounts an overlay over
+/// the build context with its upper directory under `$TMPDIR` (`/var/tmp` by
+/// default), which is on the container's overlayfs root — and the kernel
+/// refuses overlayfs as an upperdir, so every build fails with "mounting an
+/// overlay over build context directory ... invalid argument".
+/// `/var/lib/containers` is podman's root storage, the path a podman-in-a-
+/// container setup puts on host storage (the `quay.io/podman` images declare
+/// it a volume). It can't sit in the checkout instead: an upperdir inside the
+/// lowerdir is rejected as overlapping, and would land in the context too.
+/// A job that can't create it (an unprivileged host runner) keeps its TMPDIR.
+const BUILD_TMPDIR: &str = "if mkdir -p /var/lib/containers/tmp 2>/dev/null; then \
+    echo \"TMPDIR=/var/lib/containers/tmp\" >> \"$GITHUB_ENV\"; \
+    fi";
+
 /// Whether every image the job runs in already ships node
 fn ships_node(job: &Job) -> bool {
     let is_node = |image: &str| image.starts_with("node:");
@@ -354,6 +371,19 @@ fn lower_job(job: &Job, gate: TagGate, platform: Platform) -> GitHubJob {
                 name: "Set up Node".to_string(),
                 uses: None,
                 run: Some(NODE_SETUP.to_string()),
+                with: None,
+            },
+        );
+    }
+
+    // Through $GITHUB_ENV, so it holds for every docker command that follows
+    if platform == Platform::Gitea && job.needs_docker && job.runs_on == RunnerOs::Linux {
+        steps.insert(
+            0,
+            GitHubStep {
+                name: "Set up build scratch space".to_string(),
+                uses: None,
+                run: Some(BUILD_TMPDIR.to_string()),
                 with: None,
             },
         );
@@ -670,6 +700,75 @@ mod tests {
             Platform::Gitea,
         );
         assert_eq!(node_setup_count(&gitea, "mixed"), 1);
+    }
+
+    fn build_tmpdir_count(workflow: &GitHubWorkflow, id: &str) -> usize {
+        workflow.jobs[id]
+            .steps
+            .iter()
+            .filter(|s| s.run.as_deref() == Some(BUILD_TMPDIR))
+            .count()
+    }
+
+    /// act_runner puts docker jobs in a job container too, whose overlayfs
+    /// /var/tmp podman can't overlay the build context from
+    #[test]
+    fn test_gitea_docker_jobs_move_the_scratch_space_first() {
+        let jobs = [
+            Job::new("docker-build", "Docker build", Stage::Build)
+                .with_docker()
+                .with_steps(vec![Step::checkout(), Step::run("Build", "docker build .")]),
+            Job::new("docker-release-windows", "Docker push", Stage::Deploy)
+                .with_docker()
+                .on_windows()
+                .with_steps(vec![Step::checkout()]),
+            Job::new("rust-test", "Cargo test", Stage::Test)
+                .with_image("rust:latest")
+                .with_steps(vec![Step::checkout()]),
+        ];
+        let gitea = lower_github(&jobs, WorkflowKind::Ci, Platform::Gitea);
+        let steps = &gitea.jobs["docker-build"].steps;
+        assert_eq!(steps[0].run.as_deref(), Some(BUILD_TMPDIR));
+        assert_eq!(steps[1].uses.as_deref(), Some("actions/checkout@v4"));
+        assert_eq!(build_tmpdir_count(&gitea, "docker-build"), 1);
+        // Neither a Windows runner nor a job that runs no docker needs it
+        assert_eq!(build_tmpdir_count(&gitea, "docker-release-windows"), 0);
+        assert_eq!(build_tmpdir_count(&gitea, "rust-test"), 0);
+
+        // GitHub runs docker jobs on the runner host itself
+        let github = lower_github(&jobs, WorkflowKind::Ci, Platform::GitHub);
+        assert_eq!(build_tmpdir_count(&github, "docker-build"), 0);
+    }
+
+    /// Run the scratch-space step against a directory of the test's own, and
+    /// against one it can't create
+    #[test]
+    fn test_build_tmpdir_is_only_set_when_it_exists() {
+        use std::fs;
+        use std::path::Path;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join("github_env");
+        let run = |root: &Path| {
+            fs::write(&env_file, "").unwrap();
+            let script = BUILD_TMPDIR.replace("/var/lib/containers", root.to_str().unwrap());
+            let output = Command::new("sh")
+                .args(["-ec", &script])
+                .env("GITHUB_ENV", &env_file)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            fs::read_to_string(&env_file).unwrap()
+        };
+
+        let root = dir.path().join("containers");
+        assert_eq!(run(&root), format!("TMPDIR={}/tmp\n", root.display()));
+        assert!(root.join("tmp").is_dir());
+
+        // A path under a regular file can't be created by anyone
+        let blocked = dir.path().join("github_env").join("containers");
+        assert_eq!(run(&blocked), "");
     }
 
     /// Run the setup step with stub `curl`, `uname` and `node`-less PATH, and

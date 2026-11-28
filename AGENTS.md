@@ -120,6 +120,18 @@ up Node" step. If the image has no `node`, the step installs the latest
 Node.js LTS from nodejs.org, checked against the release's SHASUMS256.txt.
 Jobs on `node:*` images and jobs on the runner host don't get the step.
 
+Docker jobs have a Gitea-only step too. act_runner runs a "host" job inside a
+job container as well, and the `docker` there may be podman. Since podman 6,
+`podman build` overlays the build context with an upper directory under
+`$TMPDIR`, which defaults to `/var/tmp` on the container's overlayfs root. The
+kernel refuses that, so the build fails with `mounting an overlay over build
+context directory ... invalid argument`. Every Linux docker job on Gitea
+therefore starts with a "Set up build scratch space" step, which creates
+`/var/lib/containers/tmp` and exports it as `TMPDIR` through `$GITHUB_ENV`.
+That path is podman's root storage, which podman-in-a-container setups keep on
+host storage (the `quay.io/podman` images declare it a volume). A job that
+can't create it, like an unprivileged host runner, keeps its own `TMPDIR`.
+
 ### Merging on `cibox update`
 
 Merging happens on a lossless YAML tree, so user comments, formatting, and key

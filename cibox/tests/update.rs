@@ -527,6 +527,47 @@ fn test_gitea_container_jobs_get_node_before_the_checkout() {
     assert!(!steps.iter().any(|s| s == "Set up Node"), "{steps:?}");
 }
 
+/// A Gitea docker job runs in act_runner's job container, where a podman
+/// `docker` can't overlay the build context from the container's /var/tmp:
+/// every docker job moves TMPDIR onto podman's storage before anything else
+#[test]
+fn test_gitea_docker_jobs_move_the_build_scratch_space() {
+    let dir = project();
+    bare_update(dir.path()).arg("--gitea").assert().success();
+    let ci = dir.path().join(".gitea/workflows/ci.yml");
+    let release = dir.path().join(".gitea/workflows/release.yml");
+    for (path, job) in [(&ci, "docker-build"), (&release, "docker-release")] {
+        let steps = step_names(path, job);
+        assert_eq!(
+            steps[..2],
+            ["Set up build scratch space", "Checkout code"],
+            "{job}"
+        );
+        let run = read_yaml(path)["jobs"][job]["steps"][0]["run"].clone();
+        assert!(
+            run.as_str()
+                .unwrap()
+                .contains("echo \"TMPDIR=/var/lib/containers/tmp\" >> \"$GITHUB_ENV\""),
+            "{job}: {run:?}"
+        );
+    }
+
+    // Settled: a second run changes nothing
+    bare_update(dir.path())
+        .arg("--gitea")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"));
+
+    // GitHub's docker jobs run on the runner host
+    update(dir.path()).assert().success();
+    let steps = step_names(&dir.path().join(CI_YML), "docker-build");
+    assert!(
+        !steps.iter().any(|s| s == "Set up build scratch space"),
+        "{steps:?}"
+    );
+}
+
 /// With nothing on disk, update falls back to the inferred platform
 #[test]
 fn test_no_flags_and_no_pipeline_falls_back_to_inference() {
